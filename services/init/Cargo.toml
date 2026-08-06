@@ -1,0 +1,16 @@
+[package]
+name = "staros-init"
+description = "The init service — first user-space process (placeholder scaffold)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+staros-abi.workspace = true
+staros-ipc.workspace = true

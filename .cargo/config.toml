@@ -1,0 +1,34 @@
+# Default build target for this workspace is bare-metal aarch64.
+#
+# We use the built-in `aarch64-unknown-none` target rather than a custom JSON
+# spec: the JSON format is gated behind an unstable flag and has churned between
+# nightlies, so the built-in target is the robust choice for a scaffold. A
+# custom `targets/*.json` can be reintroduced later when a chip needs tweaks the
+# built-in target can't express.
+#
+# `build-std` (which rebuilds core/alloc from source for the memory intrinsics
+# via `compiler-builtins-mem`) is applied per-alias below rather than globally:
+# a global `[unstable] build-std` also fires on host-target test builds and
+# collides with the precompiled `std`'s `core` (duplicate lang items).
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+# Link with the kernel layout. The script lives with the arch crate that owns
+# the boot code and the symbols it references (__stack_top, __bss_*).
+rustflags = ["-C", "link-arg=-Tcrates/arch-aarch64/linker.ld"]
+# `cargo run -p kernel` flattens the ELF to an `Image` and boots it through
+# QEMU's ARM64 Linux boot stub — the same protocol a real bootloader uses, and
+# the only path that passes a device tree in x0. See scripts/qemu-run.sh.
+runner = "scripts/qemu-run.sh"
+
+# Convenience aliases.
+#   * kernel builds carry `build-std` here (not globally — see above).
+#   * host-side unit tests for the portable crates use an explicit host target
+#     and deliberately omit `build-std` so they link against the normal `std`.
+[alias]
+kbuild = "build -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
+krun = "run -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
+kclippy = "clippy -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
+# Run the pure-logic tests (abi/fdt/mm/ipc) on the host.
+ktest-host = "test -p staros-abi -p staros-cpio -p staros-fdt -p staros-framebuffer -p staros-videocore -p staros-iommu -p staros-mm -p staros-ipc -p staros-init --target x86_64-unknown-linux-gnu"

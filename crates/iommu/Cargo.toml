@@ -1,0 +1,21 @@
+[package]
+name = "staros-iommu"
+description = "ARM SMMUv3 table/command bit-layout — pure, no-alloc, host-testable"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately no dependencies. This crate is *only* the integer bit-layout of
+# the SMMUv3's in-memory structures (stream-table entries, stage-2 descriptors,
+# commands): pure functions from `(address, attrs)` to the `u64` words the
+# hardware reads. The MMIO poking that *installs* them lives in arch-aarch64;
+# keeping the format here means the load-bearing bit positions are pinned by
+# host tests against the architecture spec, not "verified" only by a QEMU run
+# that (without a bus master to issue a transaction) never even walks them.
+[dependencies]

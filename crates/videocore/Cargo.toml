@@ -1,0 +1,18 @@
+[package]
+name = "staros-videocore"
+description = "Raspberry Pi VideoCore property-mailbox messages — zero-allocation, host-testable"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately dependency-free, same discipline as `fdt`/`cpio`/`framebuffer`:
+# this builds and parses the VideoCore property-tag message *format* as ordinary
+# host-testable code. The kernel's arch layer supplies the MMIO doorbell that
+# actually hands the buffer to the GPU; none of that lives here.
+[dependencies]

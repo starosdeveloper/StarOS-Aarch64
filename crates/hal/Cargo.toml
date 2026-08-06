@@ -1,0 +1,15 @@
+[package]
+name = "staros-hal"
+description = "Hardware abstraction traits — the boundary drivers program against"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+staros-abi.workspace = true

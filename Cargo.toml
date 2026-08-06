@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/abi",
+    "crates/hal",
+    "crates/cpio",
+    "crates/fdt",
+    "crates/framebuffer",
+    "crates/videocore",
+    "crates/iommu",
+    "crates/mm",
+    "crates/ipc",
+    "crates/arch-aarch64",
+    "crates/drivers",
+    "crates/kernel",
+    "services/init",
+]
+
+# ---------------------------------------------------------------------------
+# Shared metadata. Individual crates inherit these with `field.workspace = true`
+# so versioning and licensing stay in exactly one place.
+# ---------------------------------------------------------------------------
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+authors = ["STAR OS Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/staros/kernel"
+rust-version = "1.90"
+
+# ---------------------------------------------------------------------------
+# Internal crates are addressed by path so the dependency graph is explicit and
+# every crate can be swapped/tested in isolation. This is the deliberate
+# opposite of the old single-crate design where every module could reach into
+# every other module through one giant `crate::` namespace.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+staros-abi = { path = "crates/abi" }
+staros-hal = { path = "crates/hal" }
+staros-cpio = { path = "crates/cpio" }
+staros-fdt = { path = "crates/fdt" }
+staros-framebuffer = { path = "crates/framebuffer" }
+staros-videocore = { path = "crates/videocore" }
+staros-iommu = { path = "crates/iommu" }
+staros-mm = { path = "crates/mm" }
+staros-ipc = { path = "crates/ipc" }
+staros-arch-aarch64 = { path = "crates/arch-aarch64" }
+staros-drivers = { path = "crates/drivers" }
+
+# Lints applied workspace-wide. Kernel code lives and dies by `unsafe`
+# discipline, so we make the compiler enforce the hygiene the old tree only
+# asked for in prose.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs = "warn"
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+
+# ---------------------------------------------------------------------------
+# Build profiles. `panic = "abort"` everywhere: a kernel has nothing to unwind
+# into.
+# ---------------------------------------------------------------------------
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
+strip = true

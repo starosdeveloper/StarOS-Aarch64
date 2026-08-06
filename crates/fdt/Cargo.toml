@@ -1,0 +1,17 @@
+[package]
+name = "staros-fdt"
+description = "Flattened Device Tree (DTB) parser — zero-allocation, host-testable"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately no dependencies: the FDT blob is the first thing the kernel
+# touches, before the heap or any allocator exists, and this parser must be
+# usable at that point (and testable on the host without any of it).
+[dependencies]

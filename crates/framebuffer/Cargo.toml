@@ -1,0 +1,14 @@
+[package]
+name = "staros-framebuffer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A pure, dependency-free, host-testable text console over a linear framebuffer.
+# Same discipline as `fdt`/`cpio`/`iommu`: all the format/scroll logic is ordinary
+# code with host tests; the kernel supplies the raw MMIO bytes at runtime.
+
+[lints]
+workspace = true

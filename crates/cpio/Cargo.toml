@@ -1,0 +1,19 @@
+[package]
+name = "staros-cpio"
+description = "CPIO 'newc' (initramfs) archive reader — zero-allocation, host-testable"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately no dependencies. An initramfs is the first *filesystem* the system
+# sees, unpacked by a user-space process out of a read-only blob the bootloader
+# left in RAM. This parser is that process's whole "filesystem driver": it must be
+# `no_std`, allocate nothing (it borrows straight out of the mapped archive), and
+# never panic on a malformed image (a truncated field just ends iteration).
+[dependencies]

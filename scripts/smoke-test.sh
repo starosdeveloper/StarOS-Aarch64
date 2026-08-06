@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Boot the kernel across a matrix of QEMU machines and assert on its output.
+#
+# The host tests (`cargo ktest-host`) cover the portable logic; this covers the
+# thing they can't — that the whole image actually *boots* and runs end to end on
+# each shape of machine we claim to support. It builds one image, boots it under
+# every config, and checks that the expected lines appear (and that failure
+# signals do not), then exits non-zero if any assertion failed. That is what
+# turns "it still works on GICv3, right?" from a manual grep into a gate.
+#
+# Each run is fed a newline on stdin so every EL0 task (including the UART-RX
+# driver, which otherwise blocks forever waiting for input) finishes — only then
+# does the pool return whole and the `every frame returned` check mean something.
+#
+# Deliberately no global `pkill`: a stray QEMU from a timed-out run once
+# destabilised a host here, and `pkill -9` made it worse. Instead each run is
+# bounded by `timeout -k` (SIGTERM, then SIGKILL after a grace), so a hang is
+# contained to its own config without reaching for a blunt instrument.
+#
+# Usage: smoke-test.sh [--quick]   (--quick skips the slow 8-core run)
+
+set -uo pipefail # NOT -e: run the whole matrix, then report, even if one fails.
+
+QUICK=0
+[ "${1:-}" = "--quick" ] && QUICK=1
+
+cd "$(dirname "$0")/.."
+LOGDIR="$(mktemp -d)"
+
+# --- colours (only if stdout is a terminal) ----------------------------------
+if [ -t 1 ]; then
+    R='\e[31m'; G='\e[32m'; Y='\e[33m'; B='\e[1m'; Z='\e[0m'
+else
+    R=''; G=''; Y=''; B=''; Z=''
+fi
+say() { printf '%b\n' "$*"; }
+
+# --- build the image once ----------------------------------------------------
+say "${B}building kernel image…${Z}"
+cargo kbuild >/dev/null 2>&1 || { say "${R}build failed${Z}"; cargo kbuild; exit 1; }
+
+ELF="target/aarch64-unknown-none/debug/kernel"
+objcopy="$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-objcopy 2>/dev/null | head -1 || true)"
+[ -z "$objcopy" ] && objcopy="$(command -v llvm-objcopy || command -v aarch64-linux-gnu-objcopy || true)"
+[ -z "$objcopy" ] && { say "${R}no llvm-objcopy (rustup component add llvm-tools)${Z}"; exit 1; }
+IMAGE="$LOGDIR/kernel.img"
+"$objcopy" -O binary "$ELF" "$IMAGE"
+say "  image: $(wc -c <"$IMAGE") bytes"
+
+# --- build an initramfs to exercise the CPIO/initramfs path (2.4) ------------
+# A real `cpio -o -H newc` archive with a known file; the smoke test asserts the
+# kernel's bootstrap process unpacks it and reads that file's contents back. The
+# greeting string is fixed so the assertion can match it verbatim.
+INITRAMFS=""
+GREETING="hello from the initramfs"
+if command -v cpio >/dev/null 2>&1; then
+    IRDIR="$LOGDIR/initramfs"
+    mkdir -p "$IRDIR"
+    printf '%s\n' "$GREETING" >"$IRDIR/greeting.txt"
+    printf 'STAR OS 0.2.0\n'  >"$IRDIR/version"
+    INITRAMFS="$LOGDIR/initramfs.cpio"
+    ( cd "$IRDIR" && printf '%s\n' greeting.txt version | cpio -o -H newc --reproducible 2>/dev/null ) >"$INITRAMFS"
+    say "  initramfs: $(wc -c <"$INITRAMFS") bytes (2 files)"
+else
+    say "  ${Y}cpio not found — skipping the initramfs assertions${Z}"
+fi
+say ""
+
+# --- assertion helpers (operate on the current run's $LOG) -------------------
+PASS=0; FAIL=0
+declare -a FAILED_CONFIGS
+CURRENT=""; LOG=""
+
+have()   { grep -qa -F -- "$2" "$1"; }
+req()    { if have "$LOG" "$1"; then PASS=$((PASS+1)); say "    ${G}✓${Z} $1";
+           else FAIL=$((FAIL+1)); say "    ${R}✗ MISSING: $1${Z}"; FAILED_CONFIGS+=("$CURRENT"); fi; }
+forbid() { if have "$LOG" "$1"; then FAIL=$((FAIL+1)); say "    ${R}✗ PRESENT (must be absent): $1${Z}"; FAILED_CONFIGS+=("$CURRENT");
+           else PASS=$((PASS+1)); say "    ${G}✓${Z} absent: $1"; fi; }
+
+# run <name> <timeout-seconds> -- <qemu args...>
+# Runs the image, then applies the assertions common to every machine. Config-
+# specific assertions follow the call.
+run() {
+    CURRENT="$1"; local to="$2"; shift 3 # drop name, timeout, and the "--"
+    LOG="$LOGDIR/$CURRENT.log"
+    say "${B}▶ $CURRENT${Z}  (timeout ${to}s)"
+    local t0 t1 rc
+    t0=$(date +%s)
+    printf '\n' | timeout -k 5 "$to" qemu-system-aarch64 -nographic -kernel "$IMAGE" "$@" >"$LOG" 2>&1
+    rc=$?
+    t1=$(date +%s)
+    say "  exit=$rc in $((t1-t0))s  (log: $LOG)"
+    if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
+        FAIL=$((FAIL+1)); FAILED_CONFIGS+=("$CURRENT")
+        say "    ${R}✗ TIMED OUT — no clean shutdown within ${to}s${Z}"
+        return
+    fi
+    # Assertions every healthy boot must satisfy, whatever the machine:
+    req "shutting down (PSCI SYSTEM_OFF)"          # reached the end, no hang/crash
+    req "every frame returned"                     # no frame leak after teardown
+    req "isolated, kernel continues"               # the canary EL0 fault was contained
+    forbid "LEAKED"                                # the reclaim check did not fail
+    forbid "did not initialise"                    # no half-configured device
+}
+
+# ---------------------------------------------------------------------------
+# The matrix: axes are EL1/EL2 entry (virt vs virtualization=on), GICv2/v3,
+# 1/4/8 cores, IOMMU present/absent, and a small-RAM run to exercise the memory
+# map. `-cpu max` gives GICv3 + an SMMU; `cortex-a72` is our GICv2 baseline.
+# ---------------------------------------------------------------------------
+
+# Single core, so the bootstrap process's byte-at-a-time output stays contiguous
+# and the initramfs greeting can be matched verbatim. Pass the archive if we built
+# one; otherwise this is the plain no-initramfs run.
+if [ -n "$INITRAMFS" ]; then
+    run gicv2-el1-smp1 90 -- -M virt,gic-version=2 -cpu cortex-a72 -smp 1 -m 512M -initrd "$INITRAMFS"
+    req "unpacked the initramfs in user space: 2 files, no storage driver"
+    req "read 'greeting.txt' from the initramfs: $GREETING"
+else
+    run gicv2-el1-smp1 90 -- -M virt,gic-version=2 -cpu cortex-a72 -smp 1 -m 512M
+    req "no initramfs on this machine"
+fi
+req "entered at EL1, running at EL1"
+req "interrupt controller: GICv2 online"
+req "no IOMMU on this machine"
+req "privileged access never (PAN): not implemented on this CPU"  # cortex-a72 has no PAN
+
+run gicv2-el2-smp4 90 -- -M virt,gic-version=2,virtualization=on -cpu cortex-a72 -smp 4 -m 256M
+req "entered at EL2, running at EL1"
+req "interrupt controller: GICv2 online"
+req "no increments lost"
+req "every core signalled"                   # wake IPI (SGI) reached every secondary
+
+run gicv3-el2-smp4 90 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 2G
+req "entered at EL2, running at EL1"
+req "interrupt controller: GICv3 online"
+req "no increments lost"
+req "every core signalled"                   # wake IPI (SGI) reached every secondary
+req "privileged access never (PAN): enabled" # -cpu max implements FEAT_PAN; the whole
+                                             # user-copy demo runs under it via LDTR/STTR
+
+run gicv3-el2-smp4-128m 90 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 128M
+req "interrupt controller: GICv3 online"     # smallest RAM: the memory-map path
+req "no increments lost"
+
+# Framebuffer console over ramfb. Asserts the fw_cfg round-trip succeeded (the
+# kernel found etc/ramfb, wrote the config, and QEMU accepted it) and that the
+# never-freed pixel buffer was accounted for (every frame still returns). The
+# pixels themselves are proven separately, live, by the QMP screendump path; here
+# we only need the cheap serial gate so a broken fw_cfg driver fails CI.
+run ramfb-el2-smp4 90 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M -device ramfb
+req "framebuffer: ramfb 640x480 online"
+# The single-core font self-test runs before SMP/tasks, so it must appear on a
+# machine with a framebuffer — and proves the line-atomic DebugWrite path is wired.
+req "[selftest] SINGLE THREAD TEST PASSED"
+
+run smmu-el2-smp4 120 -- -M virt,gic-version=3,virtualization=on,iommu=smmuv3 -cpu max -smp 4 -m 2G -device edu
+req "iommu: SMMUv3 at"
+req "ENABLED"
+req "bound the DMA buffer to StreamID"       # 2.3 enforcement path
+req "translation enforced"                   # end-to-end: a real bus master (edu) is
+                                             # translated to its mapped page, aborted elsewhere
+req "no increments lost"
+
+if [ "$QUICK" -eq 0 ]; then
+    run smmu-el2-smp8 200 -- -M virt,gic-version=3,virtualization=on,iommu=smmuv3 -cpu max -smp 8 -m 2G
+    req "bound the DMA buffer to StreamID"
+    req "8 cores x 20000 locked increments = 160000 (expected 160000) — no increments lost"
+else
+    say "\n${Y}(--quick: skipping the 8-core run)${Z}"
+fi
+
+# --- summary -----------------------------------------------------------------
+say ""
+say "${B}────────────────────────────────────────${Z}"
+if [ $FAIL -eq 0 ]; then
+    say "${G}${B}SMOKE TEST PASSED${Z} — $PASS assertions across the matrix"
+    exit 0
+else
+    # De-duplicate the failing config names.
+    uniq_failed="$(printf '%s\n' "${FAILED_CONFIGS[@]}" | sort -u | tr '\n' ' ')"
+    say "${R}${B}SMOKE TEST FAILED${Z} — $FAIL failed, $PASS passed"
+    say "${R}  failing configs: ${uniq_failed}${Z}"
+    say "  logs are under: $LOGDIR"
+    exit 1
+fi
