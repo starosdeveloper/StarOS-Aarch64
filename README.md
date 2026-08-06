@@ -1,8 +1,12 @@
 # STAR OS Kernel — v0.2 (rewrite)
 
 A `no_std` **microkernel for aarch64**, built as a clean multi-crate Cargo
-workspace. This replaces the monolithic single-crate design in `../kernel-old`
-(kept only as a cautionary reference — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
+workspace. It replaces an earlier monolithic single-crate design that has since
+been deleted; what that prototype taught is written down in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+The x86_64 port lives in [`../kernel-pc`](../kernel-pc) and shares the portable
+crates in this tree by path — not by copy.
 
 Everything below runs today: EL2→EL1 entry, Linux/arm64 boot protocol, device
 tree instead of hard-coded addresses, TTBR1 split with 4 KiB page tables, GICv2

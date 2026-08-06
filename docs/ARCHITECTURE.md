@@ -1,7 +1,10 @@
 # STAR OS Kernel — Architecture (v0.2)
 
-This is a ground-up rewrite of the STAR OS kernel. The `../kernel-old` tree is
-kept only as a reference for **what not to do**.
+This is a ground-up rewrite of the STAR OS kernel. The previous tree
+(`kernel-old`) has been deleted — it was a failed prototype, and keeping a
+54,000-line cautionary example on disk is not the same as learning from it. What
+was worth keeping is the diagnosis below: every principle in the next section
+exists because of a specific thing that went wrong there.
 
 ## What went wrong in the old design
 
