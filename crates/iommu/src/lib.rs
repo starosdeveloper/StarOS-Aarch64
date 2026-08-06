@@ -26,6 +26,8 @@
 pub const STE_DWORDS: usize = 8;
 /// One command is 16 bytes = two doublewords.
 pub const CMD_DWORDS: usize = 2;
+/// One event record is 32 bytes = four doublewords.
+pub const EVT_DWORDS: usize = 4;
 
 // --- STE.Config (bits [3:1] of dword0) ---------------------------------------
 /// `Config = 0b110`: stage-1 bypass, **stage-2 translate**. With `V = 1` this is
@@ -42,6 +44,15 @@ const S2SL0_LEVEL0: u64 = 0b10;
 // Cacheability/shareability of the stage-2 table walk itself.
 const S2_XR0_WB: u64 = 0b01; // Normal WB cacheable
 const S2SH0_INNER: u64 = 0b11; // inner shareable
+
+/// `STE.S2R` (dword2 bit 58) — **record** stage-2 faults in the event queue.
+///
+/// Aborting and *reporting* are separate switches. With `S2R` clear the SMMU still
+/// terminates a forbidden transaction, but writes no event record: the fault log
+/// stays empty and an abort is only visible as an absence. This bit is what makes a
+/// blocked DMA legible (StreamID, address, reason). `S2S` (bit 57, *stall*) stays
+/// clear — we terminate faulting transactions rather than stalling the device.
+const STE_S2R: u64 = 1 << 58;
 
 /// Parameters of the stage-2 translation regime an STE points at. Fixed for our
 /// use (4 KiB granule, 40-bit IPA, level-0 start) but named so the STE builder
@@ -93,7 +104,8 @@ pub fn stage2_ste(s2ttb: u64, regime: Stage2Regime) -> [u64; STE_DWORDS] {
         | (S2SH0_INNER << 44)                // S2SH0    [45:44]
         | (S2TG_4K << 46)                    // S2TG     [47:46]
         | (regime.ps << 48)                  // S2PS     [50:48]
-        | (1 << 51); // S2AA64 [51] = AArch64 stage-2 descriptor format
+        | (1 << 51)  // S2AA64 [51] = AArch64 stage-2 descriptor format
+        | STE_S2R; // S2R      [58] = record stage-2 faults in the event queue
 
     // dword3: S2TTB. The field is bits [51:4] holding table-base bits [51:4]; a
     // 4 KiB-aligned base has zero low bits, so it drops straight in.
@@ -174,6 +186,145 @@ pub const fn cmd_sync() -> [u64; CMD_DWORDS] {
     [CMD_SYNC, 0]
 }
 
+// --- Event records (the SMMU's fault log) ------------------------------------
+//
+// When the SMMU aborts a transaction it does not merely drop it: it writes a
+// 32-byte record into the event queue saying *which* stream faulted, at *which*
+// address, and *why*. Without reading that queue an abort is only observable
+// indirectly (a buffer that stayed untouched); with it, a fault is a named
+// record — the difference between "DMA didn't land" and "StreamID 0x8 faulted on
+// IOVA 0x202000, stage-2 translation, write". On a real board this is the
+// difference between debugging and guessing.
+//
+// Layout below follows the SMMUv3 spec (IHI 0070, "Event queue recorded event
+// types"); field positions match Linux's `EVTQ_*` masks in `arm-smmu-v3.c`.
+
+/// Recorded event types we name. The numeric code is what lands in the record;
+/// anything outside this list is reported as its raw code.
+///
+/// `C_*` are *configuration* errors (the kernel programmed something the SMMU
+/// rejected); `F_*` are *faults* raised by a device transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EventKind {
+    /// `0x01 F_UUT` — unsupported upstream transaction.
+    Uut,
+    /// `0x02 C_BAD_STREAMID` — StreamID outside the configured table.
+    BadStreamId,
+    /// `0x03 F_STE_FETCH` — external abort fetching the STE.
+    SteFetch,
+    /// `0x04 C_BAD_STE` — the STE itself is malformed.
+    BadSte,
+    /// `0x06 F_STREAM_DISABLED` — the stream's entry is invalid (default-deny).
+    StreamDisabled,
+    /// `0x0b F_WALK_EABT` — external abort during a translation-table walk.
+    WalkEabt,
+    /// `0x10 F_TRANSLATION` — no valid mapping for the address. The ordinary
+    /// "device reached outside its buffer" fault.
+    Translation,
+    /// `0x11 F_ADDR_SIZE` — address outside the configured input size.
+    AddrSize,
+    /// `0x12 F_ACCESS` — access flag was clear.
+    Access,
+    /// `0x13 F_PERMISSION` — mapped, but not with the permissions asked for.
+    Permission,
+    /// Any other code, kept raw rather than guessed at.
+    Other(u8),
+}
+
+impl EventKind {
+    /// Decode the event-type field.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            0x01 => Self::Uut,
+            0x02 => Self::BadStreamId,
+            0x03 => Self::SteFetch,
+            0x04 => Self::BadSte,
+            0x06 => Self::StreamDisabled,
+            0x0b => Self::WalkEabt,
+            0x10 => Self::Translation,
+            0x11 => Self::AddrSize,
+            0x12 => Self::Access,
+            0x13 => Self::Permission,
+            other => Self::Other(other),
+        }
+    }
+
+    /// A short name for a boot log. `Other` reports as `"unknown"`; print the raw
+    /// [`EventRecord::code`] alongside it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Uut => "F_UUT",
+            Self::BadStreamId => "C_BAD_STREAMID",
+            Self::SteFetch => "F_STE_FETCH",
+            Self::BadSte => "C_BAD_STE",
+            Self::StreamDisabled => "F_STREAM_DISABLED",
+            Self::WalkEabt => "F_WALK_EABT",
+            Self::Translation => "F_TRANSLATION",
+            Self::AddrSize => "F_ADDR_SIZE",
+            Self::Access => "F_ACCESS",
+            Self::Permission => "F_PERMISSION",
+            Self::Other(_) => "unknown",
+        }
+    }
+}
+
+/// One decoded entry from the event queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventRecord {
+    /// Raw event-type code, kept even when [`kind`](Self::kind) names it.
+    pub code: u8,
+    /// What the code means.
+    pub kind: EventKind,
+    /// The StreamID whose transaction faulted — *which device*.
+    pub streamid: u32,
+    /// The address the device emitted (the input address of the failed
+    /// translation). For a stage-2-only stream this is the IOVA.
+    pub address: u64,
+    /// Stage-2 input address recorded separately by the SMMU (`IPA`, bits
+    /// [51:12] of dword 3, already shifted back to an address). Zero when the
+    /// record carries no IPA.
+    pub ipa: u64,
+    /// Was the faulting access a **read**? (`RnW`) — false means a write.
+    pub read: bool,
+    /// Did the fault occur at **stage 2**? (`S2`) — our streams are stage-2 only,
+    /// so a translation fault from a bound stream should have this set.
+    pub stage2: bool,
+    /// Was the access to **privileged** memory (`PnU` = privileged, not user)?
+    pub privileged: bool,
+    /// Was it an **instruction** fetch (`InD`)? Data buffers are mapped XN, so a
+    /// set bit here means a device tried to execute.
+    pub instruction: bool,
+}
+
+/// Decode one 32-byte event record.
+///
+/// Returns `None` for an all-zero record — the queue is zeroed at bring-up, so a
+/// zero record is an empty slot, never a real event (event code 0 is reserved).
+#[must_use]
+pub fn parse_event(rec: &[u64; EVT_DWORDS]) -> Option<EventRecord> {
+    if rec.iter().all(|&w| w == 0) {
+        return None;
+    }
+    let code = (rec[0] & 0xff) as u8;
+    if code == 0 {
+        return None;
+    }
+    Some(EventRecord {
+        code,
+        kind: EventKind::from_code(code),
+        streamid: (rec[0] >> 32) as u32,
+        address: rec[2],
+        ipa: (rec[3] >> 12) << 12, // IPA field is [51:12] of dword 3
+        read: rec[1] & (1 << 35) != 0,   // RnW
+        stage2: rec[1] & (1 << 39) != 0, // S2
+        privileged: rec[1] & (1 << 33) != 0, // PnU
+        instruction: rec[1] & (1 << 34) != 0, // InD
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +352,8 @@ mod tests {
         assert_eq!(field(ste[2], 46, 47), 0b00, "S2TG = 4 KiB (STE encoding)");
         assert_eq!(field(ste[2], 48, 50), 0b100, "S2PS = 44-bit");
         assert_eq!(field(ste[2], 51, 51), 1, "S2AA64");
+        assert_eq!(field(ste[2], 57, 57), 0, "S2S = terminate, do not stall");
+        assert_eq!(field(ste[2], 58, 58), 1, "S2R = record faults in the event queue");
 
         // dword3: S2TTB = the table base, aligned.
         assert_eq!(ste[3], s2ttb, "S2TTB");
@@ -260,5 +413,87 @@ mod tests {
         let c = cmd_sync();
         assert_eq!(field(c[0], 0, 7), 0x46, "opcode CMD_SYNC");
         assert_eq!(field(c[0], 12, 15), 0, "CS = 0 (poll CONS instead)");
+    }
+
+    // --- event records --------------------------------------------------------
+
+    /// Build the record the SMMU would write for a stage-2 translation fault on a
+    /// device *write* — exactly the shape our `edu` blocked path must produce.
+    fn translation_fault(streamid: u32, iova: u64) -> [u64; EVT_DWORDS] {
+        [
+            0x10 | (u64::from(streamid) << 32), // F_TRANSLATION + SID
+            1 << 39,                            // S2 set, RnW clear (a write)
+            iova,                               // input address
+            iova & !0xfff,                      // IPA field [51:12]
+        ]
+    }
+
+    #[test]
+    fn parses_a_stage2_write_translation_fault() {
+        let e = parse_event(&translation_fault(0x8, 0x0020_2000)).expect("a real record");
+        assert_eq!(e.code, 0x10);
+        assert_eq!(e.kind, EventKind::Translation);
+        assert_eq!(e.kind.name(), "F_TRANSLATION");
+        assert_eq!(e.streamid, 0x8);
+        assert_eq!(e.address, 0x0020_2000);
+        assert_eq!(e.ipa, 0x0020_2000);
+        assert!(e.stage2, "S2");
+        assert!(!e.read, "a write, so RnW is clear");
+        assert!(!e.instruction);
+    }
+
+    #[test]
+    fn read_and_write_are_distinguished() {
+        let mut rec = translation_fault(1, 0x1000);
+        assert!(!parse_event(&rec).unwrap().read);
+        rec[1] |= 1 << 35; // RnW
+        assert!(parse_event(&rec).unwrap().read);
+    }
+
+    #[test]
+    fn streamid_comes_from_the_high_half_not_the_code() {
+        // A high StreamID must not bleed into the event code, and vice versa.
+        let e = parse_event(&translation_fault(0xffff_0001, 0)).unwrap();
+        assert_eq!(e.streamid, 0xffff_0001);
+        assert_eq!(e.code, 0x10);
+    }
+
+    #[test]
+    fn an_empty_slot_is_not_an_event() {
+        assert_eq!(parse_event(&[0; EVT_DWORDS]), None);
+        // A record whose only content is elsewhere still has no type: not an event.
+        assert_eq!(parse_event(&[0, 0, 0xdead_beef, 0]), None);
+    }
+
+    #[test]
+    fn every_named_code_round_trips_and_the_rest_stay_raw() {
+        for code in [0x01u8, 0x02, 0x03, 0x04, 0x06, 0x0b, 0x10, 0x11, 0x12, 0x13] {
+            let kind = EventKind::from_code(code);
+            assert_ne!(kind, EventKind::Other(code), "code {code:#x} should be named");
+            assert_ne!(kind.name(), "unknown");
+        }
+        // An unassigned code is preserved rather than guessed at.
+        assert_eq!(EventKind::from_code(0x7f), EventKind::Other(0x7f));
+        assert_eq!(EventKind::from_code(0x7f).name(), "unknown");
+    }
+
+    #[test]
+    fn ipa_field_ignores_the_low_bits_the_spec_reserves() {
+        // Bits [11:0] of dword 3 are not part of the IPA; they must not leak in.
+        let rec = [0x10, 1 << 39, 0, 0x4_8123_4fff];
+        assert_eq!(parse_event(&rec).unwrap().ipa, 0x4_8123_4000);
+    }
+
+    #[test]
+    fn parser_never_panics_on_arbitrary_bit_patterns() {
+        // Every single-bit record, plus all-ones: decoding is total.
+        for bit in 0..256u32 {
+            let mut rec = [0u64; EVT_DWORDS];
+            rec[(bit / 64) as usize] = 1u64 << (bit % 64);
+            let _ = parse_event(&rec);
+        }
+        let all_ones = parse_event(&[u64::MAX; EVT_DWORDS]).unwrap();
+        assert_eq!(all_ones.code, 0xff);
+        assert_eq!(all_ones.kind, EventKind::Other(0xff));
     }
 }

@@ -22,6 +22,7 @@ staros-fdt.workspace = true
 staros-framebuffer.workspace = true
 staros-mm.workspace = true
 staros-ipc.workspace = true
+staros-iommu.workspace = true
 staros-drivers.workspace = true
 # The arch backend. When more architectures land this becomes a cfg-selected
 # dependency; today aarch64 is the only target.

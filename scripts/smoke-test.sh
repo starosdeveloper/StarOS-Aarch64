@@ -160,6 +160,13 @@ req "ENABLED"
 req "bound the DMA buffer to StreamID"       # 2.3 enforcement path
 req "translation enforced"                   # end-to-end: a real bus master (edu) is
                                              # translated to its mapped page, aborted elsewhere
+# The SMMU's own account of the abort. Without STE.S2R the hardware still blocks the
+# transaction but records nothing, and this line disappears while every other
+# assertion above still passes — which is exactly why it is asserted separately.
+req "iommu: fault record - F_TRANSLATION"
+req "fault records drained"
+forbid "UNEXPECTED"                          # a fault from another stream/address
+forbid "event queue silent"
 req "no increments lost"
 
 if [ "$QUICK" -eq 0 ]; then

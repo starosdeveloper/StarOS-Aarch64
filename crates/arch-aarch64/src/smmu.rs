@@ -254,6 +254,8 @@ pub unsafe fn init(base_phys: u64, bufs: Buffers) -> KResult<(SmmuConfig, Smmu)>
         strtab_phys: bufs.strtab.phys,
         cmdq_phys: bufs.cmdq.phys,
         cmdq_prod: 0,
+        eventq_phys: bufs.eventq.phys,
+        eventq_cons: 0,
     };
     Ok((config, handle))
 }
@@ -273,6 +275,11 @@ pub struct Smmu {
     /// write index and the next bit is the wrap flag, which is exactly the
     /// `CMDQ_PROD` register layout for a queue of `2^CMDQ_LOG2` entries.
     cmdq_prod: u32,
+    /// Physical base of the event queue — the SMMU's fault log.
+    eventq_phys: u64,
+    /// Our consumer index into the event queue, same index+wrap layout as the
+    /// command queue's. The SMMU produces; we consume and publish this back.
+    eventq_cons: u32,
 }
 
 /// Entries in the command queue (`1 << CMDQ_LOG2`).
@@ -280,6 +287,10 @@ const CMDQ_ENTRIES: u32 = 1 << CMDQ_LOG2;
 /// Mask selecting index + wrap bit — the field the `CMDQ_PROD`/`CMDQ_CONS`
 /// registers hold.
 const CMDQ_PROD_MASK: u32 = (CMDQ_ENTRIES << 1) - 1;
+
+/// Entries in the event queue, and the index+wrap mask its registers hold.
+const EVENTQ_ENTRIES: u32 = 1 << EVENTQ_LOG2;
+const EVENTQ_PROD_MASK: u32 = (EVENTQ_ENTRIES << 1) - 1;
 
 /// Stage-2 walk parameters for the identity tables we build: 4 KiB granule, four
 /// levels, leaf at level 3. Matches [`fmt::Stage2Regime::stage2`].
@@ -457,6 +468,53 @@ impl Smmu {
             core::hint::spin_loop();
         }
         false
+    }
+
+    /// Take the next recorded event, or `None` when the queue is empty.
+    ///
+    /// When the SMMU aborts a transaction it writes a 32-byte record saying which
+    /// stream faulted, at which address, and why. Reading it turns "the DMA did not
+    /// land" into a named fault — the only way to tell a translation fault from a
+    /// malformed STE, a disabled stream, or a device that never issued the
+    /// transaction at all. Decoding lives in [`fmt::parse_event`] (host-tested); this
+    /// does the queue mechanics: compare our consumer index against the SMMU's
+    /// producer, read the slot, publish the advance back to `EVENTQ_CONS`.
+    ///
+    /// `None` means the queue is empty — with one degenerate exception: a slot the
+    /// SMMU published but left with a zero event type is consumed and reported as
+    /// empty too. That combination is not architecturally possible (type 0 is
+    /// reserved), so a drain loop that stops on `None` cannot spin or skip a real
+    /// record.
+    ///
+    /// # Safety
+    /// `self` must describe a brought-up SMMU whose event queue is the buffer passed
+    /// to [`init`]. Not re-entrant: the caller holds the kernel's SMMU lock.
+    pub unsafe fn next_event(&mut self) -> Option<fmt::EventRecord> {
+        // SAFETY: reading the producer register of our SMMU.
+        let prod = unsafe { r32(self.base, EVENTQ_PROD) } & EVENTQ_PROD_MASK;
+        if prod == self.eventq_cons & EVENTQ_PROD_MASK {
+            return None; // producer has not moved past us: nothing recorded
+        }
+        // The SMMU wrote the record with its own accesses; order our reads after
+        // them (on a coherent SMMU this is all that is needed, and QEMU's is).
+        dsb_ish();
+
+        let slot = (self.eventq_cons & (EVENTQ_ENTRIES - 1)) as usize;
+        let base = phys_to_virt(self.eventq_phys) as *const u64;
+        let mut rec = [0u64; fmt::EVT_DWORDS];
+        for (i, w) in rec.iter_mut().enumerate() {
+            // SAFETY: `slot < EVENTQ_ENTRIES`, so all four doublewords are inside
+            // the queue buffer, which is mapped in the linear map.
+            *w = unsafe { read_volatile(base.add(slot * fmt::EVT_DWORDS + i)) };
+        }
+
+        // Consume the slot whether or not it decodes: leaving it would wedge the
+        // queue on one unrecognised record.
+        self.eventq_cons = self.eventq_cons.wrapping_add(1);
+        // SAFETY: writing our consumer index back to our SMMU.
+        unsafe { w32(self.base, EVENTQ_CONS, self.eventq_cons & EVENTQ_PROD_MASK) };
+
+        fmt::parse_event(&rec)
     }
 
     /// Has the SMMU latched a global error? `GERROR != GERRORN` means an active,

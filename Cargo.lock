@@ -12,6 +12,7 @@ dependencies = [
  "staros-fdt",
  "staros-framebuffer",
  "staros-hal",
+ "staros-iommu",
  "staros-ipc",
  "staros-mm",
 ]

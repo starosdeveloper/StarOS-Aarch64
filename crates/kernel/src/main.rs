@@ -427,6 +427,14 @@ fn smmu_dma_test(console: &mut Pl011, fdt: Fdt<'_>) {
         };
     }
 
+    // Read the SMMU's own account of what happened. Until now the abort was proven
+    // only by absence — the sentinel page stayed zero — which cannot distinguish
+    // "the SMMU blocked it" from "the device never issued the transaction". The
+    // event queue records *why*: the faulting StreamID, the address it emitted, and
+    // the fault type. This is also the diagnostic that will matter on real hardware,
+    // where there is no sentinel to inspect.
+    let faulted = drain_smmu_events(console, sid, forbidden_iova);
+
     // Return the buffer frames so the teardown `every frame returned` check stays
     // honest; the stage-2 table is reclaimed at shutdown by `iommu::reclaim`.
     mem::with(|f| f.free_pages(buf));
@@ -443,6 +451,62 @@ fn smmu_dma_test(console: &mut Pl011, fdt: Fdt<'_>) {
             "iommu: edu DMA test INCONCLUSIVE (bound={bound} allowed={allowed} blocked={blocked})",
         );
     }
+    if !faulted {
+        // Not a failure of enforcement (the sentinel already proved that), but the
+        // fault log is the diagnostic we will depend on when there is no sentinel.
+        let _ = writeln!(
+            console,
+            "iommu: no fault record for the blocked access - event queue silent",
+        );
+    }
+}
+
+/// Drain the SMMU event queue and report whether the blocked access is among the
+/// records: a fault for `sid` on the page of `want_addr`.
+///
+/// One forbidden DMA burst produces *many* records — `edu` copies in 4-byte beats and
+/// each beat faults separately — so printing every record would bury the log in a
+/// hundred near-identical lines. The first record is printed in full (that is the
+/// diagnostic: type, stream, address, direction, stage) and the rest are counted.
+/// Anything that does *not* match the expected fault is printed in full regardless,
+/// because an unexpected fault is exactly what you want to see.
+fn drain_smmu_events(console: &mut Pl011, sid: u32, want_addr: u64) -> bool {
+    let page = |a: u64| a & !0xfff;
+    let (mut matched, mut total) = (0u32, 0u32);
+    // Bounded by the queue's own capacity: a wedged queue must not hang boot.
+    for _ in 0..(1u32 << 8) {
+        let Some(e) = iommu::next_event() else { break };
+        total += 1;
+        let expected = e.streamid == sid
+            && (page(e.address) == page(want_addr) || page(e.ipa) == page(want_addr));
+        if expected {
+            matched += 1;
+        }
+        // Print the first record of the expected fault, and every unexpected one.
+        if !expected || matched == 1 {
+            let _ = writeln!(
+                console,
+                "iommu: fault record - {} (code {:#04x}) StreamID {:#x} at {:#x} (IPA {:#x}), \
+                 {}, stage{}{}",
+                e.kind.name(),
+                e.code,
+                e.streamid,
+                e.address,
+                e.ipa,
+                if e.read { "read" } else { "write" },
+                if e.stage2 { "2" } else { "1" },
+                if expected { "" } else { " - UNEXPECTED" },
+            );
+        }
+    }
+    if total > 1 {
+        let _ = writeln!(
+            console,
+            "iommu: {total} fault records drained ({matched} for the blocked page) - \
+             one burst faults per beat",
+        );
+    }
+    matched > 0
 }
 
 /// Ask the machine for a framebuffer, trying each source the tree advertises.

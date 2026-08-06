@@ -719,6 +719,18 @@ Done:
   40-bit IPA / 44-bit OAS), and `edu`'s 28-bit DMA mask made an identity map
   impossible (fixed → non-identity IOVA→PA mapping).
 
+- **The SMMU's fault log is read, so an abort is legible.** `Smmu::next_event`
+  drains the event queue and `staros_iommu::parse_event` decodes the 32-byte
+  record — fault type, StreamID, faulting address/IPA, read-vs-write, stage —
+  with host tests over the layout (including a total-decoding sweep). Adding it
+  immediately exposed a third real STE defect the bit-tests could not: the queue
+  came back **empty**, because aborting and *recording* are separate switches and
+  `STE.S2R` (dword2 bit 58) was clear. With it set, the blocked `edu` write
+  reports `F_TRANSLATION, StreamID 0x10, 0x202000, write, stage2` — 64 records,
+  one per 4-byte beat of the burst, folded to one printed line plus a count. The
+  smoke test asserts the record separately from the sentinel, so a regression that
+  re-clears `S2R` fails CI while every other IOMMU assertion still passes.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not
@@ -736,7 +748,5 @@ Not yet implemented:
   contention test.
 - Demand paging: the stack is `USER_STACK_PAGES` mapped up front and a fault below
   it is a fault, not a request for more.
-- The `edu` end-to-end IOMMU proof does not yet read the SMMU **event queue** for
-  the fault record (the guest-error log plus the untouched sentinel already prove
-  the abort); the ECAM enumerator is bus-0, single-function, no bridges.
+- The ECAM enumerator is bus-0, single-function, no bridges.
 - A second arch backend to validate the HAL boundary.

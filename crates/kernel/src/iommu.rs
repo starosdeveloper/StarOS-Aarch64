@@ -69,6 +69,18 @@ pub fn bind_at(streamid: u32, iova: u64, buf_phys: u64, buf_pages: usize) -> KRe
     Ok(())
 }
 
+/// Take the next fault record the SMMU logged, or `None` if it logged nothing (or
+/// there is no SMMU).
+///
+/// This is what makes an abort *legible*: the record names the StreamID, the address
+/// the device emitted, and the reason. Callers drain in a loop until `None`.
+pub fn next_event() -> Option<staros_iommu::EventRecord> {
+    let mut guard = SMMU.lock();
+    let smmu = guard.as_mut()?;
+    // SAFETY: the installed SMMU, and the lock makes this call non-re-entrant.
+    unsafe { smmu.next_event() }
+}
+
 /// Free every bound stream's stage-2 table, returning those frames to the pool.
 /// Call once at shutdown, before the frame-reclaim check.
 pub fn reclaim() {
