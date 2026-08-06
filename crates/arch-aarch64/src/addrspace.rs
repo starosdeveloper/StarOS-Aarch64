@@ -89,9 +89,22 @@ pub const USER_INITRD_VA: u64 = 0x9_0000_0000;
 
 /// Top of the user stack (grows down); [`USER_STACK_PAGES`] sit just below it.
 pub const USER_STACK_TOP: u64 = 0x8_0000_0000;
-/// How many pages of stack a fresh space gets. The stack does not grow on demand
-/// yet — a fault below this is a fault, not a request for more.
-pub const USER_STACK_PAGES: u64 = 2;
+
+/// How many stack pages a fresh space is given up front. One is enough to enter
+/// EL0 and take the first fault; the rest arrive on demand.
+///
+/// Mapping the whole stack eagerly costs every process its maximum stack whether
+/// or not it uses it — the arithmetic that matters on a phone with dozens of
+/// processes, not on a demo with seven.
+pub const USER_STACK_PAGES: u64 = 1;
+
+/// How far the stack may grow downward, in pages. Beyond this a fault is a fault:
+/// the region below [`USER_STACK_LIMIT`] is a guard the kernel never fills, so
+/// runaway recursion dies instead of quietly eating the frame pool.
+pub const USER_STACK_MAX_PAGES: u64 = 64; // 256 KiB
+
+/// The lowest address the stack may ever reach. Below it lies the guard region.
+pub const USER_STACK_LIMIT: u64 = USER_STACK_TOP - USER_STACK_MAX_PAGES * PAGE_4K;
 
 /// ELF `p_flags` bit: segment is executable.
 const PF_X: u32 = 1;
@@ -215,6 +228,54 @@ impl AddressSpace {
             return None;
         }
         Some(frame)
+    }
+
+    /// Grow the stack to cover a faulting address, if that address is a legitimate
+    /// stack access. Returns `true` when a page was mapped and the faulting
+    /// instruction should be retried.
+    ///
+    /// This is what turns "the stack is `USER_STACK_PAGES` and a fault below it is
+    /// fatal" into a stack that costs what it uses. Three cases are deliberately
+    /// *not* growth, and each returns `false` so the task still dies:
+    ///
+    /// - the address is outside `[USER_STACK_LIMIT, USER_STACK_TOP)` — some other
+    ///   region faulted, or the stack ran past its limit into the guard;
+    /// - the page is already mapped — then the fault was about *permissions*, not
+    ///   absence, and mapping another page would paper over a real bug;
+    /// - the frame pool is exhausted — memory pressure must not look like a
+    ///   successful growth.
+    ///
+    /// # Safety
+    /// Same preconditions as [`new`](AddressSpace::new). Runs against the *active*
+    /// space, from the fault handler of the very task that faulted: it only adds a
+    /// previously-absent page and then invalidates that one VA.
+    pub unsafe fn grow_stack<A: FrameAllocator>(&self, alloc: &mut A, far: u64) -> bool {
+        let va = far & !(PAGE_4K - 1);
+        if !(USER_STACK_LIMIT..USER_STACK_TOP).contains(&va) {
+            return false;
+        }
+        // SAFETY: forwarded — this space is live (we are running in it).
+        if unsafe { self.lookup(va) }.is_some() {
+            return false; // present already: a permission fault, not a growth request
+        }
+        // SAFETY: forwarded from this function's contract.
+        if unsafe { self.map_fresh(alloc, va) }.is_none() {
+            return false;
+        }
+        // Publish the descriptor and invalidate just this VA, as `map_anon` does —
+        // the faulting instruction is about to be retried against it.
+        // SAFETY: `va >> 12` is the page number operand `TLBI VAAE1IS` expects.
+        unsafe {
+            asm!(
+                "dsb ish",
+                "tlbi vaae1is, {v}",
+                "dsb ish",
+                "isb",
+                v = in(reg) va >> 12,
+                options(nostack, preserves_flags),
+            );
+        }
+        true
     }
 
     /// Map one fresh, zero-filled, read/write page at the next free anonymous-heap

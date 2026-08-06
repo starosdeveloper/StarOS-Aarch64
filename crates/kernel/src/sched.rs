@@ -972,6 +972,43 @@ pub fn map_anon_current() -> isize {
     va.map_or(KError::OutOfResources.as_raw(), |v| v as isize)
 }
 
+/// Try to satisfy a fault at `far` by growing the current task's stack.
+///
+/// Returns `true` if a page was mapped and the faulting instruction should be
+/// retried. Everything that decides *whether* an address is stack growth lives in
+/// [`AddressSpace::grow_stack`]; this only finds the current task's space and
+/// counts the successful growths (so the boot log can prove pages really arrived
+/// on demand rather than being mapped up front).
+pub fn grow_stack_current(far: u64) -> bool {
+    let space = {
+        let sched = SCHED.lock();
+        match sched.tasks[sched.current[me()]].space {
+            Some(s) => s,
+            None => return false,
+        }
+    };
+    // SAFETY: at EL1 in the faulting task's own (active) space, whose tables are
+    // reachable through the linear map with the frame pool mapped writable;
+    // `grow_stack` only adds a previously-absent page and invalidates that VA.
+    let grew = crate::mem::with(|frames| unsafe { space.grow_stack(frames, far) });
+    if grew {
+        STACK_PAGES_GROWN.fetch_add(1, Ordering::Relaxed);
+    }
+    // Nothing to persist: `grow_stack` mutates the page tables, not the handle
+    // (unlike `map_anon`, which bumps the heap cursor).
+    grew
+}
+
+/// How many stack pages have been mapped on demand across all tasks.
+static STACK_PAGES_GROWN: AtomicU64 = AtomicU64::new(0);
+
+/// Stack pages mapped on demand so far — zero would mean demand paging never
+/// actually happened and every stack was big enough up front.
+#[must_use]
+pub fn stack_pages_grown() -> u64 {
+    STACK_PAGES_GROWN.load(Ordering::Relaxed)
+}
+
 /// The `x30`/`bl` target the task trampoline jumps to when a task's entry
 /// function returns. Ends the task.
 #[no_mangle]

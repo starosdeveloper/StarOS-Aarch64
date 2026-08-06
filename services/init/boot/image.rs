@@ -336,7 +336,7 @@ extern "C" fn _start() -> ! {
         // it, which lands in a *different* leaf table than the code we are running.
         "adrp x3, {big}",
         "add x3, x3, :lo12:{big}",
-        "movz x4, #0x28, lsl #16",   // + 2.5 MiB
+        "movz x4, #0x24, lsl #16",   // + 2.25 MiB (past the 2 MiB L2 boundary)
         "add x3, x3, x4",
         "ldr x5, [x3]",              // the loader must have zero-filled this tail
         "cbnz x5, .Lmt_exit",        // not zero -> exit quietly (no report)
@@ -402,11 +402,16 @@ extern "C" fn _start() -> ! {
         ".Lspawner:",
         "cmp w19, #6",
         "b.ne .Lstorm_send",         // id != 6 -> the IPC storm roles, then the child
-        // Six children. The kernel starts this demo with seven tasks of its own,
-        // so these push the total to thirteen — well past the old `MAX_TASKS = 8`,
-        // where `Spawn` returned failure. Each child announces itself, so the
-        // kernel's own `sched::task_count` (printed at the end) is the proof.
-        "mov w20, #6",               // children to create
+        // Three children. The kernel already starts twelve tasks of its own, so the
+        // total lands at fifteen — well past the old `MAX_TASKS = 8`, where `Spawn`
+        // returned failure. Each child announces itself, so the kernel's own
+        // `sched::task_count` (printed at the end) is the proof.
+        //
+        // Three rather than six because every spawned child is another 3 MiB
+        // address space, and the 128 MiB machine in the smoke matrix has to hold
+        // all of them at once. The count proves the table grew; it does not need to
+        // prove it twice.
+        "mov w20, #3",               // children to create
         ".Lsp_loop:",
         "mov x0, #8",                // child id (they all run the same code)
         "mov x8, #11",               // Syscall::Spawn
@@ -455,7 +460,7 @@ extern "C" fn _start() -> ! {
         // assembly, and either line is decisive.
         ".Lstorm_recv:",
         "cmp w19, #10",
-        "b.ne .Lchild",              // id != 10 -> a spawned child (id 8)
+        "b.ne .Lstackgrow",          // id != 10 -> the stack grower, then the child
         "mov x22, xzr",              // messages received
         "mov x23, xzr",              // running sum of sequence numbers
         "mov w24, #{storm_total}",   // how many to expect
@@ -480,6 +485,59 @@ extern "C" fn _start() -> ! {
         "svc #0",
         ".Lsr_bad:",
         "adr x2, 13f",               // storm MISMATCH string
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+
+        // ============ stack grower (id 11) ============
+        // Walks the stack pointer down one page at a time, writing a marker into
+        // each page as it goes. Only ONE stack page is mapped when a task starts, so
+        // every step past the first takes a translation fault that the kernel turns
+        // into a mapped page and retries — this task exists to make that happen and
+        // then prove the pages are real by walking back up and reading the markers
+        // (a fault handler that mapped the wrong page, or the same page twice, fails
+        // the read-back rather than passing quietly).
+        //
+        // Then it deliberately runs past the limit: the final store lands in the
+        // guard region, which the kernel refuses to grow into, and the task is
+        // killed. That kill is the point — a stack that grows without bound would
+        // eat the frame pool instead.
+        ".Lstackgrow:",
+        "cmp w19, #11",
+        "b.ne .Lchild",              // id != 11 -> a spawned child (id 8)
+        "mov x25, sp",               // remember the top so we can restore it
+        "mov w20, #{stack_pages}",   // pages to walk down
+        "mov x21, sp",
+        "mov x22, #0x1000",
+        ".Lsg_down:",
+        "sub x21, x21, x22",         // one page lower
+        "mov sp, x21",               // move the real stack pointer with it
+        "str x20, [x21]",            // fault -> kernel maps this page -> retry lands here
+        "subs w20, w20, #1",
+        "b.ne .Lsg_down",
+        // Walk back up and check every marker survived.
+        "mov w20, #1",
+        ".Lsg_up:",
+        "ldr x0, [x21]",
+        "cmp x0, x20",
+        "b.ne .Lsg_bad",
+        "add x21, x21, x22",
+        "add w20, w20, #1",
+        "cmp w20, #{stack_pages}",
+        "b.le .Lsg_up",
+        "mov sp, x25",               // back on the original stack
+        "adr x2, 14f",               // stack-growth OK string
+        "bl .Lputs",
+        // Now overrun the limit on purpose: one store far below where growth stops.
+        // The kernel must refuse and kill us; nothing after this line runs.
+        "movz x0, #{stack_overrun_hi}, lsl #16",
+        "sub x21, x25, x0",
+        "str x20, [x21]",            // guard region -> fault -> task killed
+        "mov x8, #4",                // Syscall::Exit (not reached)
+        "svc #0",
+        ".Lsg_bad:",
+        "mov sp, x25",
+        "adr x2, 15f",               // stack-growth MISMATCH string
         "bl .Lputs",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
@@ -520,9 +578,9 @@ extern "C" fn _start() -> ! {
         "2:",
         ".asciz \"\\n[driver] newline received; user-space IRQ driver exiting\\n\"",
         "3:",
-        ".asciz \"[memtest] 3 MiB .bss reaches 2.5 MiB in; grew heap by 4096 pages (16 MiB), all written and read back\\n\"",
+        ".asciz \"[memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew heap by 4096 pages (16 MiB), all written and read back\\n\"",
         "4:",
-        ".asciz \"[parent] spawned 6 children via the Spawn syscall - 17 tasks total, old table held 8\\n\"",
+        ".asciz \"[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8\\n\"",
         "5:",
         ".asciz \"[child] hello - I was created at runtime, not by the kernel\\n\"",
         "6:",
@@ -537,6 +595,10 @@ extern "C" fn _start() -> ! {
         ".asciz \"[ipc-storm] receiver drained every message from 3 concurrent senders, sequence sum exact - no message lost or duplicated\\n\"",
         "13:",
         ".asciz \"[ipc-storm] SEQUENCE SUM MISMATCH - the endpoint lost or duplicated a message under contention\\n\"",
+        "14:",
+        ".asciz \"[stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand\\n\"",
+        "15:",
+        ".asciz \"[stack] MARKER MISMATCH - a demand-mapped stack page was wrong\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,
@@ -544,8 +606,24 @@ extern "C" fn _start() -> ! {
         storm_total = const (STORM_MSGS * STORM_SENDERS),
         storm_sum_lo = const (STORM_SUM & 0xffff),
         storm_sum_hi = const (STORM_SUM >> 16),
+        stack_pages = const STACK_WALK_PAGES,
+        stack_overrun_hi = const (STACK_OVERRUN_BYTES >> 16),
     )
 }
+
+/// How many pages the stack grower walks down. Comfortably inside the kernel's
+/// `USER_STACK_MAX_PAGES` (64) so the walk itself always succeeds — the overrun
+/// that follows is what tests the limit.
+pub const STACK_WALK_PAGES: u32 = 40;
+
+/// How far below the initial stack pointer the deliberate overrun reaches: past
+/// the 64-page growth limit, into the guard region the kernel never fills.
+///
+/// A single `movz ..., lsl #16` builds it, so it must be a whole multiple of
+/// 65536 — checked here rather than discovered as a wrong address at runtime.
+pub const STACK_OVERRUN_BYTES: u32 = 80 * 4096;
+const _: () = assert!(STACK_OVERRUN_BYTES.is_multiple_of(1 << 16));
+const _: () = assert!((STACK_OVERRUN_BYTES >> 16) <= 0xffff);
 
 /// How many messages each storm sender pushes into the shared endpoint.
 ///
@@ -564,7 +642,7 @@ pub const STORM_SENDERS: u32 = 3;
 /// keeps the count right and moves the sum.
 pub const STORM_SUM: u32 = STORM_SENDERS * STORM_MSGS * (STORM_MSGS + 1) / 2;
 
-/// Three megabytes of `.bss`, which exists to make this image *large*.
+/// Two and a half megabytes of `.bss`, which exists to make this image *large*.
 ///
 /// It costs nothing in the file (`memsz > filesz`; the loader zero-fills the
 /// tail) but it makes the writable segment span more than one 2 MiB level-2
@@ -573,8 +651,13 @@ pub const STORM_SUM: u32 = STORM_SENDERS * STORM_MSGS * (STORM_MSGS + 1) / 2;
 /// an address space's fixed 32-frame ownership list could not track its 768
 /// frames. The memtest task reads and writes the far end to prove it is really
 /// there — and every task's teardown has to give all of it back.
+/// Sized at 2.5 MiB rather than 3: every one of the dozen boot processes carries a
+/// private copy, and the 128 MiB machine in the smoke matrix has only 32 MiB of
+/// frames to hold them all. What the test needs is a writable segment that spans
+/// more than one 2 MiB level-2 entry — 2.5 MiB does that with room to reach past
+/// the boundary and back.
 #[no_mangle]
-static mut BIG_BSS: [u8; 3 * 1024 * 1024] = [0; 3 * 1024 * 1024];
+static mut BIG_BSS: [u8; 5 * 512 * 1024] = [0; 5 * 512 * 1024];
 
 /// An initialized byte in the writable data segment (`.data`). The server reads
 /// it to prove the ELF loader copied the R-W `PT_LOAD` segment's file image into

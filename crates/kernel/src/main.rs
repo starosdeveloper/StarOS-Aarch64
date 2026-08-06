@@ -942,6 +942,9 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // a different program entirely, and 8 is what the spawner's children run.
     const STORM_SENDER_ID: u8 = 9;
     const STORM_RECV_ID: u8 = 10;
+    // 11 walks its stack down page by page, forcing the kernel to grow it on
+    // demand, then overruns the limit on purpose to prove the guard holds.
+    const STACKGROW_ID: u8 = 11;
     // SAFETY: MMU is on with the frame pool mapped writable in the kernel's linear
     // map, so each freshly allocated frame is writable at `phys_to_virt(frame)`;
     // frames are uniquely owned by these calls.
@@ -956,6 +959,7 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         storm_b_space,
         storm_c_space,
         storm_rx_space,
+        stackgrow_space,
     ] = mem::with(|frames| unsafe {
         let mut spaces = [
             AddressSpace::new(frames).expect("client addrspace"),
@@ -968,6 +972,7 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
             AddressSpace::new(frames).expect("storm sender b addrspace"),
             AddressSpace::new(frames).expect("storm sender c addrspace"),
             AddressSpace::new(frames).expect("storm receiver addrspace"),
+            AddressSpace::new(frames).expect("stack grower addrspace"),
         ];
         for (i, space) in spaces.iter_mut().enumerate() {
             if !load_segments(space, frames, &image) {
@@ -977,7 +982,8 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
             space.write_id(match i {
                 0..=5 => i as u8 + 1,           // ids 1..=6
                 6..=8 => STORM_SENDER_ID,       // three senders run the same role
-                _ => STORM_RECV_ID,
+                9 => STORM_RECV_ID,
+                _ => STACKGROW_ID,
             });
         }
         Some(spaces)
@@ -1151,6 +1157,13 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     sched::spawn_user(user_task_entry, storm_a_space, storm_a_caps);
     sched::spawn_user(user_task_entry, storm_b_space, storm_b_caps);
     sched::spawn_user(user_task_entry, storm_c_space, storm_c_caps);
+    // Granted nothing: growing a stack needs no capability, and neither does
+    // running off the end of one.
+    sched::spawn_user(
+        user_task_entry,
+        stackgrow_space,
+        cap::empty_caps().expect("stack grower caps"),
+    );
     // Runs the tasks (each starts with IRQs enabled) until they exit — including
     // any the spawner creates at runtime via `Spawn`.
     sched::start();
@@ -1183,6 +1196,19 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         console,
         "task teardown: reaped {reaped} dead-task kernel stacks ({} KiB returned to the heap)",
         reaped_bytes / 1024,
+    );
+
+    // Stack pages that arrived because a task touched them, not because the kernel
+    // guessed. Zero here would mean every stack was already big enough up front —
+    // i.e. demand paging never ran — so the number is the claim, not the feature.
+    let grown = sched::stack_pages_grown();
+    let _ = writeln!(
+        console,
+        "user stacks: {grown} page(s) mapped on demand ({} KiB), {} mapped up front per task, \
+         limit {} KiB",
+        grown * PAGE_SIZE as u64 / 1024,
+        addrspace::USER_STACK_PAGES,
+        addrspace::USER_STACK_MAX_PAGES * PAGE_SIZE as u64 / 1024,
     );
 
     // Which cores were actually preempted, and how often. This is the only thing
@@ -1391,17 +1417,39 @@ fn check_dynamic_tables(console: &mut Pl011) {
     );
 }
 
-/// Handle a fault taken from EL0: report it and terminate the offending task,
-/// then schedule another. Bound to the arch trap by link name, like `kmain` — a
-/// user task that faults must not take the kernel down with it. Never returns.
+/// Handle a fault taken from EL0. Bound to the arch trap by link name, like
+/// `kmain` — a user task that faults must not take the kernel down with it.
+///
+/// Two outcomes. A data abort just below the task's stack is not an error at all
+/// but the *mechanism* by which a stack grows: the kernel maps a page and returns
+/// `true`, and the faulting instruction is retried. Anything else terminates the
+/// task and schedules another, in which case this never returns.
 #[no_mangle]
-pub extern "Rust" fn staros_user_fault(far: u64, esr: u64) -> ! {
+pub extern "Rust" fn staros_user_fault(far: u64, esr: u64) -> bool {
     let ec = (esr >> 26) & 0x3f;
+    // Data abort from a lower EL. Only a *translation* fault (DFSC 0b0001xx) can be
+    // stack growth: a permission or alignment abort on a mapped page is a real bug,
+    // and growing the stack for it would hide it.
+    const EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
+    let dfsc = esr & 0x3f;
+    let translation_fault = (0b000100..=0b000111).contains(&dfsc);
+    if ec == EC_DATA_ABORT_LOWER_EL && translation_fault && sched::grow_stack_current(far) {
+        return true;
+    }
     // SAFETY: single-core; brief console access to report the isolated fault.
     let mut console = unsafe { Pl011::qemu_virt() };
+    // Name the guard region specially. A fault just below `USER_STACK_LIMIT` is not
+    // a wild pointer but a stack that ran past the limit — the exact case the guard
+    // exists to catch, and worth distinguishing in a log where every other kill
+    // looks the same.
+    let guard = (addrspace::USER_STACK_LIMIT.saturating_sub(1024 * 1024)
+        ..addrspace::USER_STACK_LIMIT)
+        .contains(&far);
+    let what = if guard { " — stack guard: growth limit reached" } else { "" };
     let _ = writeln!(
         console,
-        "[fault] task {} killed: EL0 fault at {far:#x} (ec {ec:#04x}) — isolated, kernel continues",
+        "[fault] task {} killed: EL0 fault at {far:#x} (ec {ec:#04x}){what} — isolated, \
+         kernel continues",
         sched::current_id(),
     );
     // Tear the task down exactly as `Exit` would and switch to the next runnable

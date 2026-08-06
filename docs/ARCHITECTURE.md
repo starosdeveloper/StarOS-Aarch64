@@ -745,6 +745,20 @@ Done:
   `SEQUENCE SUM MISMATCH`; on `-smp 1` the same test passes but the verdict honestly
   reads `endpoint exercised on one core`.
 
+- **Demand-paged user stacks.** A process starts with **one** mapped stack page
+  and grows to 64 (256 KiB) as it touches them. The EL0 fault path now has two
+  outcomes rather than one: `staros_user_fault` returns `bool`, and a *translation*
+  abort (`ESR.DFSC = 0b0001xx`) inside `[USER_STACK_LIMIT, USER_STACK_TOP)` maps a
+  page and retries the instruction — `ELR_EL1` is untouched, so the access is
+  resumed, not skipped. Three cases deliberately are **not** growth and still kill
+  the task: an address outside that range, a page that is already mapped (then the
+  fault was about permissions, and growing would hide a real bug), and an exhausted
+  frame pool. Below `USER_STACK_LIMIT` is a guard the kernel never fills, so
+  runaway recursion dies instead of eating the pool. An EL0 task walks 40 pages
+  down, reads every marker back, then overruns on purpose — the log shows
+  `40 page(s) mapped on demand` and `stack guard: growth limit reached`, and every
+  frame still comes back at teardown.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not
@@ -757,7 +771,5 @@ Not yet implemented:
 - No load balancing: tasks stay where they are picked, and there is no work
   stealing. Cross-core TLB shootdown for unmapping uses the broadcast `tlbi ...is`
   variants (hardware agrees), which is enough for what unmaps today.
-- Demand paging: the stack is `USER_STACK_PAGES` mapped up front and a fault below
-  it is a fault, not a request for more.
 - The ECAM enumerator is bus-0, single-function, no bridges.
 - A second arch backend to validate the HAL boundary.

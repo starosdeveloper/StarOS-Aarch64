@@ -107,6 +107,14 @@ run() {
     # every machine in the matrix, single-core included.
     req "[ipc-storm] receiver drained every message"
     forbid "SEQUENCE SUM MISMATCH"
+    # Demand-paged stacks: a task starts with ONE mapped stack page, walks 40 pages
+    # down (each step a translation fault the kernel resolves and retries), reads
+    # every marker back, then overruns the limit on purpose. Both halves are
+    # asserted: the growth must work and the guard must still stop it.
+    req "[stack] walked 40 pages down a stack that started with one mapped"
+    forbid "MARKER MISMATCH"
+    req "stack guard: growth limit reached"
+    req "page(s) mapped on demand"
 }
 
 # ---------------------------------------------------------------------------

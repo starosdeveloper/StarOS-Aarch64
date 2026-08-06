@@ -88,11 +88,15 @@ extern "Rust" {
     fn staros_irq_epilogue();
 
     /// The kernel-provided handler for a fault taken from EL0 (a user task
-    /// touched memory it may not, executed a bad instruction, etc.). Unlike a
-    /// kernel fault, this is *not* fatal to the system: the kernel terminates the
-    /// offending task and schedules another, so it never returns. `far`/`esr` are
-    /// the fault address and syndrome for diagnostics.
-    fn staros_user_fault(far: u64, esr: u64) -> !;
+    /// touched memory it may not, executed a bad instruction, etc.). `far`/`esr`
+    /// are the fault address and syndrome.
+    ///
+    /// Returns `true` if the kernel *resolved* the fault — today that means it grew
+    /// the task's stack to cover the address — in which case the faulting
+    /// instruction is retried. Otherwise the kernel terminates the offending task
+    /// and schedules another, and this does not return at all: unlike a kernel
+    /// fault, a user fault is never fatal to the system.
+    fn staros_user_fault(far: u64, esr: u64) -> bool;
 }
 
 /// Unmask IRQs at the PSTATE level (`DAIF.I`). Interrupts only reach the core
@@ -304,13 +308,21 @@ fn handle_sync(frame: &mut TrapFrame, kind: u64) {
         frame.regs[0] = ret as u64;
         return;
     }
-    // A non-SVC synchronous exception taken from EL0 is a faulting user task:
-    // isolate it. The kernel kills the task and switches away, so this never
-    // returns to the trampoline. A fault from the kernel itself stays fatal.
+    // A non-SVC synchronous exception taken from EL0 is a faulting user task. The
+    // kernel gets first refusal: a touch just below the stack is a *request* for
+    // another page, and answering it means returning here so the trampoline `eret`s
+    // and the instruction runs again against the now-mapped address. Anything the
+    // kernel does not resolve kills that task and switches away, so the call does
+    // not return. A fault from the kernel itself stays fatal.
     if (KIND_LOWER_EL_FIRST..=KIND_LOWER_EL_LAST).contains(&kind) {
-        // SAFETY: provided by the linked kernel; terminates the current task and
-        // schedules another, never returning here.
-        unsafe { staros_user_fault(frame.far, frame.esr) }
+        // SAFETY: provided by the linked kernel; either resolves the fault or
+        // terminates the current task and schedules another, never returning here.
+        if unsafe { staros_user_fault(frame.far, frame.esr) } {
+            // `ELR_EL1` is untouched, so the `eret` retries the faulting
+            // instruction — this is a resumed fault, not a skipped one.
+            return;
+        }
+        unreachable!("staros_user_fault returned false instead of terminating the task");
     }
     fatal(frame, kind);
 }
