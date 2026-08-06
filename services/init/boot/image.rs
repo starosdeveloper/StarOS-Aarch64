@@ -401,7 +401,7 @@ extern "C" fn _start() -> ! {
         // child's address space from the same image and schedules it.
         ".Lspawner:",
         "cmp w19, #6",
-        "b.ne .Lchild",              // id != 6 -> a spawned child (id 8)
+        "b.ne .Lstorm_send",         // id != 6 -> the IPC storm roles, then the child
         // Six children. The kernel starts this demo with seven tasks of its own,
         // so these push the total to thirteen — well past the old `MAX_TASKS = 8`,
         // where `Spawn` returned failure. Each child announces itself, so the
@@ -414,6 +414,72 @@ extern "C" fn _start() -> ! {
         "subs w20, w20, #1",         // x19/x20 are callee-saved across `svc`
         "b.ne .Lsp_loop",
         "adr x2, 4f",                // spawner report string
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+
+        // ============ IPC storm sender (id 9) ============
+        // Three of these run at once, each sending STORM_MSGS messages into ONE
+        // endpoint whose ring holds two. The point is contention: with three
+        // senders and a two-slot ring, most sends block and wake, on whichever
+        // cores the scheduler happens to be using. Each message carries its
+        // sequence number in words[0], so the receiver can check the *sum* — a lost
+        // or duplicated message cannot balance.
+        ".Lstorm_send:",
+        "cmp w19, #9",
+        "b.ne .Lstorm_recv",         // id != 9 -> the receiver
+        "mov w20, #{storm_msgs}",    // messages left to send
+        "mov x21, #1",               // sequence number, 1..=STORM_MSGS
+        ".Lst_loop:",
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #9",
+        "str x0, [x11]",             // msg.tag = 9 (storm)
+        "str x21, [x11, #8]",        // msg.words[0] = sequence number
+        "mov x0, #1",                // handle 1 = the storm endpoint (send)
+        "mov x1, x11",
+        "mov x8, #1",                // Syscall::Send (blocks whenever the ring is full)
+        "svc #0",
+        "add x21, x21, #1",
+        "subs w20, w20, #1",
+        "b.ne .Lst_loop",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+
+        // ============ IPC storm receiver (id 10) ============
+        // Drains exactly STORM_SENDERS * STORM_MSGS messages and checks the total.
+        // The expected sum is fixed at build time (see STORM_SUM): senders each
+        // count 1..=STORM_MSGS, so the sum is senders * msgs * (msgs+1) / 2.
+        // Reporting only "OK" or "MISMATCH" keeps this printable from naked
+        // assembly, and either line is decisive.
+        ".Lstorm_recv:",
+        "cmp w19, #10",
+        "b.ne .Lchild",              // id != 10 -> a spawned child (id 8)
+        "mov x22, xzr",              // messages received
+        "mov x23, xzr",              // running sum of sequence numbers
+        "mov w24, #{storm_total}",   // how many to expect
+        ".Lsr_loop:",
+        "mov x0, #1",                // handle 1 = the storm endpoint (recv)
+        "mov x1, x11",
+        "mov x8, #2",                // Syscall::Recv (blocks until a sender arrives)
+        "svc #0",
+        "ldr x0, [x11, #8]",         // msg.words[0] = sequence number
+        "add x23, x23, x0",
+        "add x22, x22, #1",
+        "cmp w22, w24",
+        "b.lo .Lsr_loop",
+        // Every message arrived. Does the arithmetic agree?
+        "movz x1, #{storm_sum_lo}",
+        "movk x1, #{storm_sum_hi}, lsl #16",
+        "cmp x23, x1",
+        "b.ne .Lsr_bad",
+        "adr x2, 12f",               // storm OK string
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+        ".Lsr_bad:",
+        "adr x2, 13f",               // storm MISMATCH string
         "bl .Lputs",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
@@ -456,7 +522,7 @@ extern "C" fn _start() -> ! {
         "3:",
         ".asciz \"[memtest] 3 MiB .bss reaches 2.5 MiB in; grew heap by 4096 pages (16 MiB), all written and read back\\n\"",
         "4:",
-        ".asciz \"[parent] spawned 6 children via the Spawn syscall - 13 tasks total, old table held 8\\n\"",
+        ".asciz \"[parent] spawned 6 children via the Spawn syscall - 17 tasks total, old table held 8\\n\"",
         "5:",
         ".asciz \"[child] hello - I was created at runtime, not by the kernel\\n\"",
         "6:",
@@ -467,11 +533,36 @@ extern "C" fn _start() -> ! {
         ".asciz \"[client] read from shared memory: \"",
         "11:",
         ".asciz \"[memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back\\n\"",
+        "12:",
+        ".asciz \"[ipc-storm] receiver drained every message from 3 concurrent senders, sequence sum exact - no message lost or duplicated\\n\"",
+        "13:",
+        ".asciz \"[ipc-storm] SEQUENCE SUM MISMATCH - the endpoint lost or duplicated a message under contention\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,
+        storm_msgs = const STORM_MSGS,
+        storm_total = const (STORM_MSGS * STORM_SENDERS),
+        storm_sum_lo = const (STORM_SUM & 0xffff),
+        storm_sum_hi = const (STORM_SUM >> 16),
     )
 }
+
+/// How many messages each storm sender pushes into the shared endpoint.
+///
+/// Large enough that the two-slot ring blocks the senders repeatedly (that is the
+/// contention being tested) and small enough that the run stays quick under TCG.
+pub const STORM_MSGS: u32 = 64;
+
+/// How many senders hammer the endpoint at once. Three fits the endpoint's
+/// four-deep sender wait queue with room to spare, and needs more than one core to
+/// overlap.
+pub const STORM_SENDERS: u32 = 3;
+
+/// The sum the receiver must see: each sender counts `1..=STORM_MSGS`, so the total
+/// is `senders * msgs * (msgs + 1) / 2`. Checking the *sum* rather than the count
+/// alone is what catches duplication: a message delivered twice and another lost
+/// keeps the count right and moves the sum.
+pub const STORM_SUM: u32 = STORM_SENDERS * STORM_MSGS * (STORM_MSGS + 1) / 2;
 
 /// Three megabytes of `.bss`, which exists to make this image *large*.
 ///

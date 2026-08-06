@@ -937,28 +937,51 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // to the last one, and the buddy tree coalesced them all.
     let free_run_before = mem::with(|frames| frames.largest_free_run());
 
+    // Ids 1..=6 are the original demo roles; 9 is a storm sender (three of them
+    // run at once) and 10 the storm receiver. Id 7 is the device manager, which is
+    // a different program entirely, and 8 is what the spawner's children run.
+    const STORM_SENDER_ID: u8 = 9;
+    const STORM_RECV_ID: u8 = 10;
     // SAFETY: MMU is on with the frame pool mapped writable in the kernel's linear
     // map, so each freshly allocated frame is writable at `phys_to_virt(frame)`;
     // frames are uniquely owned by these calls.
-    let [client_space, server_space, driver_space, canary_space, memtest_space, spawner_space] =
-        mem::with(|frames| unsafe {
-            let mut spaces = [
-                AddressSpace::new(frames).expect("client addrspace"),
-                AddressSpace::new(frames).expect("server addrspace"),
-                AddressSpace::new(frames).expect("driver addrspace"),
-                AddressSpace::new(frames).expect("canary addrspace"),
-                AddressSpace::new(frames).expect("memtest addrspace"),
-                AddressSpace::new(frames).expect("spawner addrspace"),
-            ];
-            for (i, space) in spaces.iter_mut().enumerate() {
-                if !load_segments(space, frames, &image) {
-                    return None;
-                }
-                space.set_entry(image.entry());
-                space.write_id(i as u8 + 1); // ids 1..=6
+    let [
+        client_space,
+        server_space,
+        driver_space,
+        canary_space,
+        memtest_space,
+        spawner_space,
+        storm_a_space,
+        storm_b_space,
+        storm_c_space,
+        storm_rx_space,
+    ] = mem::with(|frames| unsafe {
+        let mut spaces = [
+            AddressSpace::new(frames).expect("client addrspace"),
+            AddressSpace::new(frames).expect("server addrspace"),
+            AddressSpace::new(frames).expect("driver addrspace"),
+            AddressSpace::new(frames).expect("canary addrspace"),
+            AddressSpace::new(frames).expect("memtest addrspace"),
+            AddressSpace::new(frames).expect("spawner addrspace"),
+            AddressSpace::new(frames).expect("storm sender a addrspace"),
+            AddressSpace::new(frames).expect("storm sender b addrspace"),
+            AddressSpace::new(frames).expect("storm sender c addrspace"),
+            AddressSpace::new(frames).expect("storm receiver addrspace"),
+        ];
+        for (i, space) in spaces.iter_mut().enumerate() {
+            if !load_segments(space, frames, &image) {
+                return None;
             }
-            Some(spaces)
-        })
+            space.set_entry(image.entry());
+            space.write_id(match i {
+                0..=5 => i as u8 + 1,           // ids 1..=6
+                6..=8 => STORM_SENDER_ID,       // three senders run the same role
+                _ => STORM_RECV_ID,
+            });
+        }
+        Some(spaces)
+    })
     .unwrap_or_else(|| {
         let _ = writeln!(console, "failed to load init image segments");
         halt()
@@ -1032,6 +1055,8 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     let ep1 = obj::create(obj::Object::Endpoint { id: 1 }).expect("ep1 object");
     let ep_drv = obj::create(obj::Object::Endpoint { id: 2 }).expect("ep_drv object");
     let ep_srv = obj::create(obj::Object::Endpoint { id: 3 }).expect("ep_srv object");
+    // The contention endpoint: three senders and one receiver, all on it at once.
+    let ep_storm = obj::create(obj::Object::Endpoint { id: ipc::STORM_EP }).expect("ep_storm object");
 
     // The *only* device policy the kernel still holds: the authority to mint. It
     // pre-mints no UART objects at all now — the device manager (id 7) reads the
@@ -1093,6 +1118,20 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     cap::install(&mut devicemgr_caps, cap::Cap::Endpoint { obj: ep_drv, send: true, recv: false });
     cap::install(&mut devicemgr_caps, cap::Cap::Endpoint { obj: ep_srv, send: true, recv: false });
 
+    // The storm tasks: each sender gets send-only, the receiver recv-only, on the
+    // one shared endpoint — handle 1 in every case, which is what the role code in
+    // `image.rs` is written against. Nothing else is granted: a task that can only
+    // send cannot drain the ring it is contending for.
+    let storm_send_caps = || {
+        let mut caps = cap::empty_caps().expect("storm sender caps");
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_storm, send: true, recv: false });
+        caps
+    };
+    let (storm_a_caps, storm_b_caps, storm_c_caps) =
+        (storm_send_caps(), storm_send_caps(), storm_send_caps());
+    let mut storm_rx_caps = cap::empty_caps().expect("storm receiver caps");
+    cap::install(&mut storm_rx_caps, cap::Cap::Endpoint { obj: ep_storm, send: false, recv: true });
+
     // Remember the client's root table frame; after the tasks exit, teardown
     // returns it to the buddy allocator, and the next allocation should hand that
     // very frame back — visible proof the space was reclaimed, not leaked.
@@ -1105,6 +1144,13 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     sched::spawn_user(user_task_entry, memtest_space, memtest_caps);
     sched::spawn_user(user_task_entry, spawner_space, spawner_caps);
     sched::spawn_user(user_task_entry, devicemgr_space, devicemgr_caps);
+    // The receiver goes in first so it is already blocked in `Recv` when the
+    // senders start: the wake path is then part of what is being tested, not an
+    // artefact of ordering.
+    sched::spawn_user(user_task_entry, storm_rx_space, storm_rx_caps);
+    sched::spawn_user(user_task_entry, storm_a_space, storm_a_caps);
+    sched::spawn_user(user_task_entry, storm_b_space, storm_b_caps);
+    sched::spawn_user(user_task_entry, storm_c_space, storm_c_caps);
     // Runs the tasks (each starts with IRQs enabled) until they exit — including
     // any the spawner creates at runtime via `Spawn`.
     sched::start();
@@ -1152,6 +1198,38 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         }
     }
     let _ = writeln!(console, "preemption: timer ticks per core —{ticks}");
+
+    // The IPC contention test's other half. The receiver already reported that the
+    // *arithmetic* held (no message lost or duplicated); this says the traffic was
+    // genuinely spread across cores rather than serialised on one — the difference
+    // between exercising an endpoint and exercising it concurrently. `race_test`
+    // makes the same claim for the kernel's lock; this makes it for the endpoint's
+    // ring, wait queues, and block/wake path.
+    let (sends, recvs, send_cores, recv_cores) = ipc::storm_stats();
+    let mut spread = alloc::string::String::new();
+    for cpu in 0..staros_arch_aarch64::boot::MAX_CPUS {
+        if sends[cpu] > 0 || recvs[cpu] > 0 {
+            let _ = core::fmt::Write::write_fmt(
+                &mut spread,
+                format_args!(" cpu{cpu}={}s/{}r", sends[cpu], recvs[cpu]),
+            );
+        }
+    }
+    let total_sends: u64 = sends.iter().sum();
+    let total_recvs: u64 = recvs.iter().sum();
+    // On a single-core machine the traffic is necessarily serialised and that is not
+    // a failure — the arithmetic check still applies. The verdict only claims
+    // concurrency where there were cores to be concurrent on.
+    let verdict = if smp::online_count() > 1 && send_cores > 1 {
+        "endpoint contended across cores"
+    } else {
+        "endpoint exercised on one core"
+    };
+    let _ = writeln!(
+        console,
+        "ipc storm: {total_sends} sends / {total_recvs} recvs on one endpoint —{spread} \
+         ({send_cores} core(s) sending, {recv_cores} receiving) — {verdict}",
+    );
 
     // Every address space has been torn down. Two questions, and the second is the
     // one that matters.

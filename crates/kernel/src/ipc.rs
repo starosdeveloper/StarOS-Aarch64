@@ -19,7 +19,10 @@
 //! syscalls (see [`crate::syscall`]) adapt the user ABI onto these two functions.
 
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use staros_abi::error::KError;
+use staros_arch_aarch64::boot;
 use staros_ipc::Message;
 
 use crate::cap::Cap;
@@ -28,8 +31,17 @@ use crate::sync::SpinLock;
 
 /// Number of endpoints the kernel exposes. Two carry the client<->server request
 /// and reply; two more carry the device manager's grants to the driver and the
-/// server. A real system allocates them dynamically.
-const NUM_ENDPOINTS: usize = 4;
+/// server; the last is the contention endpoint several senders hammer at once. A
+/// real system allocates them dynamically.
+const NUM_ENDPOINTS: usize = 5;
+
+/// The endpoint the IPC contention test uses (see [`storm_stats`]).
+///
+/// Two things are special about it, both for the same reason — it is hammered
+/// hundreds of times by several tasks at once, where the others carry a handful of
+/// messages each. It does not log blocked sends (that would bury the console), and
+/// it is the only endpoint whose traffic is counted per core.
+pub const STORM_EP: usize = 4;
 /// Capacity of an endpoint's pending-message ring. Deliberately tiny so the
 /// blocking-send path is exercised (the demo client sends three requests into a
 /// two-slot ring) rather than hidden behind a large buffer.
@@ -154,6 +166,41 @@ impl Endpoint {
 static IPC: SpinLock<[Endpoint; NUM_ENDPOINTS]> =
     SpinLock::new([const { Endpoint::new() }; NUM_ENDPOINTS]);
 
+/// Sends and receives on [`STORM_EP`], counted by the core that executed them.
+///
+/// `smp::race_test` proves the kernel's *lock* excludes across cores on a counter
+/// in kernel memory. It says nothing about IPC: the endpoint has its own ring,
+/// its own wait queues, and a block/wake path that runs a context switch in the
+/// middle. These counters are what make the contention real rather than assumed —
+/// if the senders ran one after another on one core, or the receiver only ever ran
+/// where the senders did, the per-core spread shows it and the test says so.
+static STORM_SENDS: [AtomicU64; boot::MAX_CPUS] = [const { AtomicU64::new(0) }; boot::MAX_CPUS];
+static STORM_RECVS: [AtomicU64; boot::MAX_CPUS] = [const { AtomicU64::new(0) }; boot::MAX_CPUS];
+
+/// Record one storm operation against the core currently executing it.
+fn count(table: &[AtomicU64; boot::MAX_CPUS]) {
+    let cpu = boot::cpu_id() as usize;
+    if cpu < boot::MAX_CPUS {
+        table[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-core `(sends, receives)` on the contention endpoint, plus how many distinct
+/// cores took part in each direction.
+#[must_use]
+pub fn storm_stats() -> ([u64; boot::MAX_CPUS], [u64; boot::MAX_CPUS], u32, u32) {
+    let mut sends = [0u64; boot::MAX_CPUS];
+    let mut recvs = [0u64; boot::MAX_CPUS];
+    let (mut send_cores, mut recv_cores) = (0, 0);
+    for cpu in 0..boot::MAX_CPUS {
+        sends[cpu] = STORM_SENDS[cpu].load(Ordering::Relaxed);
+        recvs[cpu] = STORM_RECVS[cpu].load(Ordering::Relaxed);
+        send_cores += u32::from(sends[cpu] > 0);
+        recv_cores += u32::from(recvs[cpu] > 0);
+    }
+    (sends, recvs, send_cores, recv_cores)
+}
+
 /// Send `km` to endpoint `ep`. Delivers straight to a blocked receiver, else
 /// buffers it, else — if the ring is full — blocks the caller until a receiver
 /// drains a slot. Returns `0` on success (possibly after blocking) or a negative
@@ -163,6 +210,12 @@ pub fn send(ep: usize, km: KMessage) -> isize {
         return KError::InvalidArgument.as_raw();
     }
     let me = sched::current_id();
+    if ep == STORM_EP {
+        // Count on the core that is *entering* the send: after a blocking send the
+        // task may resume elsewhere, and the question this answers is which core
+        // ran the operation, not which one finished it.
+        count(&STORM_SENDS);
+    }
 
     // Decide what to do under a short borrow, then act after dropping it — the
     // block path performs a context switch that must not alias the endpoint.
@@ -194,9 +247,16 @@ pub fn send(ep: usize, km: KMessage) -> isize {
         }
         Action::Buffered => 0,
         Action::Block => {
-            log(format_args!("[ipc] task {me} send blocked: ep{ep} ring full"));
+            // The storm endpoint blocks hundreds of times by design; logging each
+            // one would drown every other line in the boot output. Its evidence is
+            // the per-core tally, not a narrative.
+            if ep != STORM_EP {
+                log(format_args!("[ipc] task {me} send blocked: ep{ep} ring full"));
+            }
             sched::block_current();
-            log(format_args!("[ipc] task {me} send resumed"));
+            if ep != STORM_EP {
+                log(format_args!("[ipc] task {me} send resumed"));
+            }
             0
         }
         Action::Full => KError::OutOfResources.as_raw(),
@@ -211,6 +271,9 @@ pub fn recv(ep: usize) -> Result<KMessage, KError> {
         return Err(KError::InvalidArgument);
     }
     let me = sched::current_id();
+    if ep == STORM_EP {
+        count(&STORM_RECVS);
+    }
 
     enum Action {
         Got(KMessage),

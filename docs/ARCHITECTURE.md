@@ -731,6 +731,20 @@ Done:
   smoke test asserts the record separately from the sentinel, so a regression that
   re-clears `S2R` fails CI while every other IOMMU assertion still passes.
 
+- **IPC under cross-core contention.** `race_test` proves the kernel's *lock*
+  excludes on a counter in kernel memory; it says nothing about an endpoint, which
+  has its own ring, two wait queues, and a block/wake path with a context switch in
+  the middle. Four EL0 tasks now test that directly: three senders push 64 messages
+  each into one two-slot endpoint while a fourth drains it. Each message carries its
+  sequence number, and the receiver checks the **sum** (`3 × 64 × 65 / 2 = 6240`) —
+  a duplicate plus a loss keeps the count right and moves the sum, so counting alone
+  would not do. The kernel tallies the traffic per core and prints the spread, which
+  is what separates "the endpoint works" from "the endpoint works while contended":
+  a typical 4-core run reports all 192 sends and 192 receives spread over four cores.
+  Falsified two ways — dropping the payload of a blocked sender prints
+  `SEQUENCE SUM MISMATCH`; on `-smp 1` the same test passes but the verdict honestly
+  reads `endpoint exercised on one core`.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not
@@ -743,9 +757,6 @@ Not yet implemented:
 - No load balancing: tasks stay where they are picked, and there is no work
   stealing. Cross-core TLB shootdown for unmapping uses the broadcast `tlbi ...is`
   variants (hardware agrees), which is enough for what unmaps today.
-- The race test counts in the kernel rather than over IPC. The IPC path across
-  cores works and the demo exercises it, but there is no dedicated IPC-level
-  contention test.
 - Demand paging: the stack is `USER_STACK_PAGES` mapped up front and a fault below
   it is a fault, not a request for more.
 - The ECAM enumerator is bus-0, single-function, no bridges.

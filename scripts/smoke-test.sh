@@ -101,6 +101,12 @@ run() {
     req "isolated, kernel continues"               # the canary EL0 fault was contained
     forbid "LEAKED"                                # the reclaim check did not fail
     forbid "did not initialise"                    # no half-configured device
+    # IPC under contention: three senders and one receiver on a two-slot endpoint.
+    # The receiver checks the sum of every sequence number it drained, so a message
+    # lost or duplicated by the ring/wait-queue path prints MISMATCH instead — on
+    # every machine in the matrix, single-core included.
+    req "[ipc-storm] receiver drained every message"
+    forbid "SEQUENCE SUM MISMATCH"
 }
 
 # ---------------------------------------------------------------------------
@@ -136,6 +142,10 @@ req "entered at EL2, running at EL1"
 req "interrupt controller: GICv3 online"
 req "no increments lost"
 req "every core signalled"                   # wake IPI (SGI) reached every secondary
+# The IPC storm's other half: the messages were not merely correct, they were sent
+# from more than one core. race_test makes this claim for the kernel's lock; this
+# makes it for the endpoint's ring and block/wake path.
+req "endpoint contended across cores"
 req "privileged access never (PAN): enabled" # -cpu max implements FEAT_PAN; the whole
                                              # user-copy demo runs under it via LDTR/STTR
 
