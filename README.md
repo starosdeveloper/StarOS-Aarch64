@@ -116,7 +116,9 @@ Phases 1 and 2 of [`docs/ROADMAP-PIXEL.md`](docs/ROADMAP-PIXEL.md) are closed an
 verified live in QEMU. Phase 3 is the watershed — first real hardware, a
 **Raspberry Pi 5** — and its software groundwork is already in the tree (FDT,
 framebuffer console, VideoCore mailbox, GICv2, PSCI/SMP). What remains there
-needs the board, not more code.
+needs the board, not more code: `./scripts/pi5-sdcard.sh <mounted-boot-part>`
+stages a card, and [`docs/PI5-BRINGUP.md`](docs/PI5-BRINGUP.md) is the checklist
+— what to verify before the first boot, and how to read each failure mode.
 
 Design rationale, the SMP/IPC/IOMMU write-ups, and an honest "not yet
 implemented" list live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
