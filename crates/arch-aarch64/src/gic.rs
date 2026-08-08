@@ -31,7 +31,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use staros_abi::error::{KError, KResult};
-use staros_hal::InterruptController;
+use staros_hal::{AcknowledgingController, InterruptController};
 
 /// Distributor MMIO base on QEMU `virt`. Only a fallback for when there is no
 /// device tree to ask; a real machine reports its own.
@@ -299,19 +299,21 @@ impl InterruptController for Gic {
         }
     }
 
-    fn acknowledge(&self) -> Option<u32> {
-        match self {
-            Self::Unconfigured => None,
-            Self::V2(g) => g.acknowledge(),
-            Self::V3(g) => g.acknowledge(),
-        }
-    }
-
     fn end_of_interrupt(&self, irq: u32) {
         match self {
             Self::Unconfigured => {}
             Self::V2(g) => g.end_of_interrupt(irq),
             Self::V3(g) => g.end_of_interrupt(irq),
+        }
+    }
+}
+
+impl AcknowledgingController for Gic {
+    fn acknowledge(&self) -> Option<u32> {
+        match self {
+            Self::Unconfigured => None,
+            Self::V2(g) => g.acknowledge(),
+            Self::V3(g) => g.acknowledge(),
         }
     }
 }
@@ -505,6 +507,12 @@ impl InterruptController for Gicv2 {
         Ok(())
     }
 
+    fn end_of_interrupt(&self, irq: u32) {
+        self.gicc_write(GICC_EOIR, irq & INTID_MASK_V2);
+    }
+}
+
+impl AcknowledgingController for Gicv2 {
     fn acknowledge(&self) -> Option<u32> {
         let intid = self.gicc_read(GICC_IAR) & INTID_MASK_V2;
         if intid == SPURIOUS_INTID {
@@ -512,10 +520,6 @@ impl InterruptController for Gicv2 {
         } else {
             Some(intid)
         }
-    }
-
-    fn end_of_interrupt(&self, irq: u32) {
-        self.gicc_write(GICC_EOIR, irq & INTID_MASK_V2);
     }
 }
 
@@ -746,6 +750,20 @@ impl InterruptController for Gicv3 {
         Ok(())
     }
 
+    fn end_of_interrupt(&self, irq: u32) {
+        // SAFETY: writing ICC_EOIR1_EL1 with a previously acknowledged id drops
+        // the running priority and deactivates it (EOImode = 0).
+        unsafe {
+            asm!(
+                "msr icc_eoir1_el1, {v}",
+                v = in(reg) u64::from(irq & INTID_MASK_V3),
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+impl AcknowledgingController for Gicv3 {
     fn acknowledge(&self) -> Option<u32> {
         let iar: u64;
         // SAFETY: reading ICC_IAR1_EL1 acknowledges the highest-priority pending
@@ -759,18 +777,6 @@ impl InterruptController for Gicv3 {
             None
         } else {
             Some(intid)
-        }
-    }
-
-    fn end_of_interrupt(&self, irq: u32) {
-        // SAFETY: writing ICC_EOIR1_EL1 with a previously acknowledged id drops
-        // the running priority and deactivates it (EOImode = 0).
-        unsafe {
-            asm!(
-                "msr icc_eoir1_el1, {v}",
-                v = in(reg) u64::from(irq & INTID_MASK_V3),
-                options(nostack, preserves_flags),
-            );
         }
     }
 }

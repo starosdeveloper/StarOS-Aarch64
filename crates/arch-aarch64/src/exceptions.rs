@@ -12,7 +12,11 @@
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
 
-use staros_hal::InterruptController;
+// `AcknowledgingController` is the half of the interrupt-controller interface a
+// GIC has and an x86 APIC does not: asking the controller *which* interrupt
+// fired. See its documentation in `staros_hal` — the split happened when the
+// second architecture arrived and could not implement it.
+use staros_hal::{AcknowledgingController, InterruptController};
 
 use crate::halt;
 use crate::uart::Pl011;
