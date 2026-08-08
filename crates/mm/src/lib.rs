@@ -15,7 +15,10 @@
 extern crate alloc;
 
 pub mod heap;
+pub mod pool;
 pub mod region;
+
+pub use pool::FramePool;
 
 use staros_abi::error::{KError, KResult};
 
@@ -174,6 +177,23 @@ impl BuddyFrameAllocator {
     #[must_use]
     pub const fn frames(&self) -> usize {
         self.frames
+    }
+
+    /// Physical address of frame 0.
+    #[must_use]
+    pub const fn base(&self) -> PhysAddr {
+        PhysAddr(self.base)
+    }
+
+    /// Whether `frame` lies within this tree's range.
+    ///
+    /// [`FramePool`](crate::pool::FramePool) needs it to route a `free` to the
+    /// tree that owns the address. `free_pages` already ignores an address outside
+    /// its range, so asking first is not about safety — it is about not stopping at
+    /// the first tree and dropping the frame on the floor.
+    #[must_use]
+    pub const fn contains(&self, frame: PhysAddr) -> bool {
+        frame.0 >= self.base && frame.0 < self.base + self.frames * PAGE_SIZE
     }
 
     /// The longest run of contiguous free frames, which the root node tracks by

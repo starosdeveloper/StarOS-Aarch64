@@ -24,7 +24,7 @@ use staros_fdt::Fdt;
 use staros_framebuffer::{Console as FbConsole, Framebuffer, PixelFormat, Rgb};
 use staros_hal::InterruptController;
 use staros_mm::region::{self, Region};
-use staros_mm::{BuddyFrameAllocator, FrameAllocator, PhysAddr, PAGE_SIZE};
+use staros_mm::{FrameAllocator, FramePool, PhysAddr, PAGE_SIZE};
 
 /// The `init` boot image: a separately-compiled EL0 program, produced by
 /// `build.rs` as a real AArch64 **ELF64** executable. The kernel parses it and
@@ -182,7 +182,12 @@ fn survey_memory(fdt: &Fdt<'_>, dtb: u64) -> Option<MemoryMap> {
 /// # Safety
 /// Call once, after `mmu::init` has mapped `map.free` as writable Normal memory.
 unsafe fn init_memory(console: &mut Pl011, map: &MemoryMap) {
-    let tree = BuddyFrameAllocator::metadata_bytes(map.free.len() as usize) as u64;
+    // Sized from `FramePool`, which decomposes the run into powers of two rather
+    // than rounding it down to one — so the bill is a little under twice the frame
+    // count, not a little under twice a *rounded-down* frame count. On a region
+    // that is already a power of two the two agree, which is why this machine
+    // never noticed the difference.
+    let tree = FramePool::metadata_bytes(map.free.len() as usize) as u64;
     // Slack for everything else on the heap. Generous: unused heap is far
     // cheaper than an allocation failure in a kernel with nowhere to fail to.
     let heap_len = (tree + KERNEL_HEAP_SLACK).next_multiple_of(PAGE_SIZE as u64);

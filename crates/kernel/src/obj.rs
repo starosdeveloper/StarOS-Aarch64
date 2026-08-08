@@ -86,7 +86,7 @@ pub struct ObjectRef {
 
 use alloc::vec::Vec;
 
-use staros_mm::{BuddyFrameAllocator, PhysAddr};
+use staros_mm::{FramePool, PhysAddr};
 
 use crate::sync::SpinLock;
 
@@ -185,9 +185,9 @@ pub fn revoke(r: ObjectRef) -> bool {
 /// returned" check honest for shared and DMA buffers.
 ///
 /// Both kinds were allocated as one contiguous run (a shared page is a run of
-/// one), so [`BuddyFrameAllocator::free_pages`] on the base reclaims each whole —
-/// it recovers the block's size from the tree.
-pub fn free_reclaimable(frames: &mut BuddyFrameAllocator) {
+/// one), so `free_pages` on the base reclaims each whole — the allocator recovers
+/// the block's size from the tree that owns it.
+pub fn free_reclaimable(frames: &mut FramePool) {
     let mut slots = OBJECTS.lock();
     for slot in slots.iter_mut() {
         let base = match slot.object {
