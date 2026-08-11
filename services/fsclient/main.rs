@@ -250,14 +250,32 @@ extern "C" fn main() -> ! {
     // fault. If it ever returns, the file contents printed above prove nothing —
     // they could have come from a mapping this process was quietly given.
     puts("[fsclient] the archive is at 0x900000000 in fssrv; touching it here must fault\n");
-    // SAFETY: deliberately unsound. Nothing is mapped at this address in our space,
-    // and the kernel's fault handler kills this task — which is the observation.
-    let stolen = unsafe { (USER_INITRD_VA as *const u8).read_volatile() };
+    let stolen = prove_isolation();
     let mut line = Line::new();
     line.str("[fsclient] I READ THE ARCHIVE DIRECTLY - the file server was never needed, first byte ");
     line.dec(u64::from(stolen));
     line.flush();
     exit();
+}
+
+/// Reach for the server's archive, three calls deep.
+///
+/// The depth is the point. The kernel's fault report walks the `x29` chain, and a
+/// chain is only worth printing if there is more than one frame in it — a fault
+/// raised straight from `main` proves the handler prints *an* address, not that it
+/// follows the stack. These two functions are `#[inline(never)]` because at
+/// `-Copt-level=2` the compiler would otherwise flatten them into `main` and the
+/// backtrace would silently shrink back to what it was.
+#[inline(never)]
+fn prove_isolation() -> u8 {
+    touch_archive()
+}
+
+#[inline(never)]
+fn touch_archive() -> u8 {
+    // SAFETY: deliberately unsound. Nothing is mapped at this address in our space,
+    // and the kernel's fault handler kills this task — which is the observation.
+    unsafe { (USER_INITRD_VA as *const u8).read_volatile() }
 }
 
 /// Send one request and wait for its reply.

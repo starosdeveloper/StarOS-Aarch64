@@ -13,7 +13,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use console::klog;
-use core::fmt::Write;
+use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
 use staros_abi::error::KError;
@@ -1832,7 +1832,7 @@ fn check_dynamic_tables(console: &mut Pl011) {
 /// `true`, and the faulting instruction is retried. Anything else terminates the
 /// task and schedules another, in which case this never returns.
 #[no_mangle]
-pub extern "Rust" fn staros_user_fault(far: u64, esr: u64) -> bool {
+pub extern "Rust" fn staros_user_fault(far: u64, esr: u64, pc: u64, fp: u64, lr: u64) -> bool {
     let ec = (esr >> 26) & 0x3f;
     // Data abort from a lower EL. Only a *translation* fault (DFSC 0b0001xx) can be
     // stack growth: a permission or alignment abort on a mapped page is a real bug,
@@ -1861,9 +1861,103 @@ pub extern "Rust" fn staros_user_fault(far: u64, esr: u64) -> bool {
          kernel continues",
         sched::current_id(),
     );
+    // And where it was. An address is enough while every EL0 program is one file
+    // written here; it stops being enough the moment the code in EL0 came from
+    // somewhere else, which is what the C and C++ runtime brings. `scripts/symbolize.sh`
+    // turns these numbers back into function names on the host.
+    let mut frames = [0u64; MAX_BACKTRACE];
+    let depth = user_backtrace(pc, lr, fp, &mut frames);
+    klog!("[fault]   backtrace ({depth} frames, x29 chain): {}", Backtrace(&frames[..depth]));
     // Tear the task down exactly as `Exit` would and switch to the next runnable
     // one. The faulting instruction is never retried.
     sched::exit()
+}
+
+/// How far the fault handler will walk a frame chain. Deep enough to cross a few
+/// library layers, bounded because the chain comes out of the faulting task's own
+/// memory and a corrupt stack is exactly the case this runs in.
+const MAX_BACKTRACE: usize = 16;
+
+/// Collect return addresses from the faulting task's frame-pointer chain.
+///
+/// On AArch64 a function built with frame pointers stores `{caller fp, return
+/// address}` at `[x29]`, so the chain is a linked list up the stack. Everything
+/// here is a *guess being checked*: the addresses come from the memory of a task
+/// that has just proved it does not respect its own address space.
+///
+/// Four conditions end the walk, and each one has a failure it prevents: a null or
+/// misaligned `fp` (uninitialised or clobbered), a frame the task itself may not
+/// read (validated through its own page tables, never a range check), a frame that
+/// does not move *up* the stack (a corrupt chain that would otherwise loop
+/// forever), and the depth bound.
+fn user_backtrace(pc: u64, lr: u64, mut fp: u64, out: &mut [u64; MAX_BACKTRACE]) -> usize {
+    // The faulting instruction and the address the current function would have
+    // returned to. Both come from registers, so they are true even when the stack
+    // is unreadable — which is the case where a backtrace is worth most.
+    out[0] = pc;
+    let mut n = 1;
+    if plausible_user_pc(lr) {
+        out[n] = lr;
+        n += 1;
+    }
+    let mut previous = 0u64;
+    while n < MAX_BACKTRACE {
+        if fp == 0 || !fp.is_multiple_of(16) || fp <= previous {
+            break;
+        }
+        if !sched::current_range_ok(fp, 16, false) {
+            break;
+        }
+        let mut record = [0u8; 16];
+        // SAFETY: the walk above confirmed both words are mapped and EL0-readable in
+        // the faulting task's own space, which is still the active one; the read is
+        // unprivileged (PAN-safe) like every other look into user memory.
+        unsafe { staros_arch_aarch64::usercopy::copy_from_user(&mut record, fp) };
+        previous = fp;
+        fp = u64::from_le_bytes(record[..8].try_into().unwrap_or([0; 8]));
+        let ret = u64::from_le_bytes(record[8..].try_into().unwrap_or([0; 8]));
+        if !plausible_user_pc(ret) {
+            break;
+        }
+        // The first frame record holds the same return address the link register
+        // does — `lr` has not been clobbered yet in the faulting function. Printing
+        // it twice makes a two-deep stack look three-deep, which is exactly the kind
+        // of small lie that costs an hour later.
+        if ret != out[n - 1] {
+            out[n] = ret;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Could this be an address in the faulting task's own code?
+///
+/// The link register of a task that has not called anything yet holds whatever the
+/// kernel left in it — a `TTBR1` address, which printed in a user backtrace reads
+/// as "the fault came from the kernel" and is a lie. A return address is code, and
+/// EL0 code lives in the image window; a number from anywhere else is a corrupt
+/// chain, not a caller. (When EL0 gains code outside the image — a JIT, a loaded
+/// library — this bound is the thing to widen, and it will announce itself as a
+/// backtrace that stops one frame in.)
+fn plausible_user_pc(addr: u64) -> bool {
+    (addrspace::USER_BASE..addrspace::USER_IMAGE_END).contains(&addr)
+}
+
+/// The collected addresses, printed as one line so the report cannot be spliced by
+/// another core mid-backtrace.
+struct Backtrace<'a>(&'a [u64]);
+
+impl fmt::Display for Backtrace<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, addr) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, " ")?;
+            }
+            write!(f, "{addr:#x}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Kernel-side entry for a user task. The scheduler has already installed this

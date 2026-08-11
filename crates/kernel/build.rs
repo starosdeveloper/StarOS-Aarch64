@@ -88,11 +88,66 @@ fn main() {
     // against that same artefact rather than compiling a second copy — and takes
     // its path as an argument, so the ordering these two lines encode is visible
     // instead of being an implicit "must run after".
-    let cpio_rlib = build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld);
-    build_displaysrv(&manifest_dir, &out_dir, &rustc, &image_ld);
-    build_inputsrv(&manifest_dir, &out_dir, &rustc, &image_ld);
-    build_fssrv(&manifest_dir, &out_dir, &rustc, &image_ld, &cpio_rlib);
-    build_fsclient(&manifest_dir, &out_dir, &rustc, &image_ld);
+    // Every service below is compiled *unstripped* to `<name>.debug.elf` and then
+    // stripped into the `<name>.elf` the kernel embeds. Two files rather than one
+    // because the two consumers want opposite things: the image wants no symbol
+    // table, and `scripts/symbolize.sh` wants nothing else — an address in a fault
+    // backtrace is only a name if something on the host still knows the names.
+    let objcopy = llvm_objcopy();
+    let cpio_rlib = build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
+    build_displaysrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
+    build_inputsrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
+    build_fssrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy, &cpio_rlib);
+    build_fsclient(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
+}
+
+/// Flags every EL0 service is built with.
+///
+/// `-Cforce-frame-pointers=yes` is not an optimization setting but a debugging
+/// contract: the kernel's fault handler walks the `x29` chain to print a backtrace,
+/// and a program compiled without frame pointers gives it one frame and then
+/// garbage. It costs a register and a couple of instructions per call, which is the
+/// cheapest debugging tool in this tree.
+/// `-Cdebuginfo=2` costs nothing in the image — the copy the kernel embeds is
+/// stripped — and buys gdb the call-frame information it needs to unwind. Without
+/// it gdb has symbols but no CFI, falls back on guessing from the prologue, and
+/// reports a caller frame that belongs to the kernel: a wrong answer that looks
+/// like a right one.
+const SERVICE_FLAGS: &[&str] =
+    &["-Copt-level=2", "-Cpanic=abort", "-Cforce-frame-pointers=yes", "-Cdebuginfo=2"];
+
+/// The `llvm-objcopy` that ships with the Rust toolchain, or a cross binutils if
+/// someone has one. Same search as `scripts/qemu-run.sh`, for the same reason:
+/// no extra dependency to install.
+fn llvm_objcopy() -> PathBuf {
+    let sysroot = Command::new(env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .expect("failed to ask rustc for its sysroot");
+    let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_string();
+    let lib = Path::new(&sysroot).join("lib/rustlib");
+    if let Ok(entries) = std::fs::read_dir(&lib) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("bin/llvm-objcopy");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("llvm-objcopy")
+}
+
+/// Strip `debug_elf` into `elf`, and fail the build if the tool is missing rather
+/// than embedding an unstripped image and wondering later why the kernel grew.
+fn strip_to(objcopy: &Path, debug_elf: &Path, elf: &Path) {
+    let status = Command::new(objcopy)
+        .arg("--strip-all")
+        .arg(debug_elf)
+        .arg(elf)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", objcopy.display()));
+    assert!(status.success(), "{} failed on {}", objcopy.display(), debug_elf.display());
 }
 
 /// Build the `fssrv` EL0 program and publish its ELF path.
@@ -101,30 +156,37 @@ fn main() {
 /// archive parser belongs in exactly one place, host-tested, and a server that
 /// re-implemented the header arithmetic would be the second place for the same bug
 /// to live.
-fn build_fssrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path, cpio_rlib: &Path) {
+fn build_fssrv(
+    manifest_dir: &str,
+    out_dir: &str,
+    rustc: &str,
+    image_ld: &Path,
+    objcopy: &Path,
+    cpio_rlib: &Path,
+) {
     let src = canonical(&Path::new(manifest_dir).join("../../services/fssrv/main.rs"));
     println!("cargo:rerun-if-changed={}", src.display());
 
+    let debug_elf = Path::new(out_dir).join("fssrv.debug.elf");
     let elf = Path::new(out_dir).join("fssrv.elf");
     let status = Command::new(rustc)
         .args(["--edition", "2021"])
         .args(["--target", "aarch64-unknown-none"])
         .args(["--crate-name", "staros_fssrv"])
         .args(["--crate-type", "bin"])
-        .arg("-Copt-level=2")
-        .arg("-Cpanic=abort")
-        .arg("-Cstrip=symbols")
+        .args(SERVICE_FLAGS)
         .arg("--extern")
         .arg(format!("staros_cpio={}", cpio_rlib.display()))
         .arg(format!("-Clink-arg=-T{}", image_ld.display()))
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")
         .arg("-o")
-        .arg(&elf)
+        .arg(&debug_elf)
         .arg(&src)
         .status()
         .expect("failed to spawn rustc for fssrv");
     assert!(status.success(), "rustc failed to build fssrv");
+    strip_to(objcopy, &debug_elf, &elf);
 
     const MAX_FSSRV_BYTES: u64 = 128 * 1024;
     let size = std::fs::metadata(&elf)
@@ -143,28 +205,28 @@ fn build_fssrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path, 
 /// One `rustc` step and no crate of ours: the whole program is syscalls and a
 /// message protocol, which is the point — a client of the file server needs
 /// nothing that knows what a CPIO archive is.
-fn build_fsclient(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) {
+fn build_fsclient(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path, objcopy: &Path) {
     let src = canonical(&Path::new(manifest_dir).join("../../services/fsclient/main.rs"));
     println!("cargo:rerun-if-changed={}", src.display());
 
+    let debug_elf = Path::new(out_dir).join("fsclient.debug.elf");
     let elf = Path::new(out_dir).join("fsclient.elf");
     let status = Command::new(rustc)
         .args(["--edition", "2021"])
         .args(["--target", "aarch64-unknown-none"])
         .args(["--crate-name", "staros_fsclient"])
         .args(["--crate-type", "bin"])
-        .arg("-Copt-level=2")
-        .arg("-Cpanic=abort")
-        .arg("-Cstrip=symbols")
+        .args(SERVICE_FLAGS)
         .arg(format!("-Clink-arg=-T{}", image_ld.display()))
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")
         .arg("-o")
-        .arg(&elf)
+        .arg(&debug_elf)
         .arg(&src)
         .status()
         .expect("failed to spawn rustc for fsclient");
     assert!(status.success(), "rustc failed to build fsclient");
+    strip_to(objcopy, &debug_elf, &elf);
 
     const MAX_FSCLIENT_BYTES: u64 = 64 * 1024;
     let size = std::fs::metadata(&elf)
@@ -184,7 +246,7 @@ fn build_fsclient(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Pat
 /// against it. The layout arithmetic it needs is the *whole* reason that crate
 /// exists — a driver that computed its own ring offsets would be the one place
 /// the mistake could not be host-tested.
-fn build_inputsrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) {
+fn build_inputsrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path, objcopy: &Path) {
     let virtio_src = canonical(&Path::new(manifest_dir).join("../virtio/src/lib.rs"));
     let src = canonical(&Path::new(manifest_dir).join("../../services/inputsrv/main.rs"));
     println!("cargo:rerun-if-changed={}", virtio_src.display());
@@ -205,26 +267,26 @@ fn build_inputsrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Pat
         .expect("failed to spawn rustc for the virtio rlib");
     assert!(status.success(), "rustc failed to build the virtio rlib");
 
+    let debug_elf = Path::new(out_dir).join("inputsrv.debug.elf");
     let elf = Path::new(out_dir).join("inputsrv.elf");
     let status = Command::new(rustc)
         .args(["--edition", "2021"])
         .args(["--target", "aarch64-unknown-none"])
         .args(["--crate-name", "staros_inputsrv"])
         .args(["--crate-type", "bin"])
-        .arg("-Copt-level=2")
-        .arg("-Cpanic=abort")
-        .arg("-Cstrip=symbols")
+        .args(SERVICE_FLAGS)
         .arg("--extern")
         .arg(format!("staros_virtio={}", virtio_rlib.display()))
         .arg(format!("-Clink-arg=-T{}", image_ld.display()))
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")
         .arg("-o")
-        .arg(&elf)
+        .arg(&debug_elf)
         .arg(&src)
         .status()
         .expect("failed to spawn rustc for inputsrv");
     assert!(status.success(), "rustc failed to build inputsrv");
+    strip_to(objcopy, &debug_elf, &elf);
 
     const MAX_INPUTSRV_BYTES: u64 = 64 * 1024;
     let size = std::fs::metadata(&elf)
@@ -243,28 +305,34 @@ fn build_inputsrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Pat
 /// One `rustc` step: unlike `devicemgr` it links against no crate of ours. It owns
 /// the screen and speaks a message protocol, and both of those are plain
 /// arithmetic over slices the kernel already handed it.
-fn build_displaysrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) {
+fn build_displaysrv(
+    manifest_dir: &str,
+    out_dir: &str,
+    rustc: &str,
+    image_ld: &Path,
+    objcopy: &Path,
+) {
     let src = canonical(&Path::new(manifest_dir).join("../../services/displaysrv/main.rs"));
     println!("cargo:rerun-if-changed={}", src.display());
 
+    let debug_elf = Path::new(out_dir).join("displaysrv.debug.elf");
     let elf = Path::new(out_dir).join("displaysrv.elf");
     let status = Command::new(rustc)
         .args(["--edition", "2021"])
         .args(["--target", "aarch64-unknown-none"])
         .args(["--crate-name", "staros_displaysrv"])
         .args(["--crate-type", "bin"])
-        .arg("-Copt-level=2")
-        .arg("-Cpanic=abort")
-        .arg("-Cstrip=symbols")
+        .args(SERVICE_FLAGS)
         .arg(format!("-Clink-arg=-T{}", image_ld.display()))
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")
         .arg("-o")
-        .arg(&elf)
+        .arg(&debug_elf)
         .arg(&src)
         .status()
         .expect("failed to spawn rustc for displaysrv");
     assert!(status.success(), "rustc failed to build displaysrv");
+    strip_to(objcopy, &debug_elf, &elf);
 
     const MAX_DISPLAYSRV_BYTES: u64 = 64 * 1024;
     let size = std::fs::metadata(&elf)
@@ -287,7 +355,13 @@ fn build_displaysrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &P
 /// intrinsics are never referenced and the pre-compiled `core` is enough.
 /// Returns the path to the `cpio` rlib it built, which the file server links
 /// against too.
-fn build_devicemgr(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) -> PathBuf {
+fn build_devicemgr(
+    manifest_dir: &str,
+    out_dir: &str,
+    rustc: &str,
+    image_ld: &Path,
+    objcopy: &Path,
+) -> PathBuf {
     let fdt_src = canonical(&Path::new(manifest_dir).join("../fdt/src/lib.rs"));
     let cpio_src = canonical(&Path::new(manifest_dir).join("../cpio/src/lib.rs"));
     let dm_src = canonical(&Path::new(manifest_dir).join("../../services/devicemgr/main.rs"));
@@ -328,19 +402,19 @@ fn build_devicemgr(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Pa
 
     // Step 2: devicemgr → ELF, linked at USER_BASE with the same script as init
     // (its own address space, so the shared link address is fine).
+    // Stripping matters most here: unstripped, the `fdt`/`cpio` symbol data balloons
+    // the ELF to hundreds of KiB the kernel would `include_bytes!` verbatim. The
+    // loadable segments are unaffected — the kernel maps those, not the symbol
+    // tables — so the unstripped copy beside it costs nothing at runtime and is
+    // what turns a backtrace back into names.
+    let dm_debug_elf = Path::new(out_dir).join("devicemgr.debug.elf");
     let dm_elf = Path::new(out_dir).join("devicemgr.elf");
     let status = Command::new(rustc)
         .args(["--edition", "2021"])
         .args(["--target", "aarch64-unknown-none"])
         .args(["--crate-name", "staros_devicemgr"])
         .args(["--crate-type", "bin"])
-        .arg("-Copt-level=2")
-        .arg("-Cpanic=abort")
-        // Strip symbols and debug info: unstripped, the `fdt`/`cpio` debug data
-        // balloons the ELF to hundreds of KiB the kernel would `include_bytes!`
-        // verbatim. The loadable segments are unaffected — the kernel maps those,
-        // not the symbol tables.
-        .arg("-Cstrip=symbols")
+        .args(SERVICE_FLAGS)
         .arg("--extern")
         .arg(format!("staros_fdt={}", fdt_rlib.display()))
         .arg("--extern")
@@ -349,11 +423,12 @@ fn build_devicemgr(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Pa
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")
         .arg("-o")
-        .arg(&dm_elf)
+        .arg(&dm_debug_elf)
         .arg(&dm_src)
         .status()
         .expect("failed to spawn rustc for devicemgr");
     assert!(status.success(), "rustc failed to build devicemgr");
+    strip_to(objcopy, &dm_debug_elf, &dm_elf);
 
     // A parsing program is larger than a naked `_start`, but must still be a
     // handful of pages, not the debug-padded ~700 KiB an unstripped link produces

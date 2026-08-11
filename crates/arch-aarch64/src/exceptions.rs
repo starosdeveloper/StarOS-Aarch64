@@ -100,7 +100,13 @@ extern "Rust" {
     /// instruction is retried. Otherwise the kernel terminates the offending task
     /// and schedules another, and this does not return at all: unlike a kernel
     /// fault, a user fault is never fatal to the system.
-    fn staros_user_fault(far: u64, esr: u64) -> bool;
+    ///
+    /// `pc`, `fp` and `lr` are the faulting instruction (`ELR_EL1`) and the frame
+    /// pointer and link register the task held. They are here so the kernel can
+    /// print a backtrace: an address on its own is enough while every EL0 program
+    /// is one file long, and stops being enough the moment the code in EL0 was
+    /// written by somebody else.
+    fn staros_user_fault(far: u64, esr: u64, pc: u64, fp: u64, lr: u64) -> bool;
 }
 
 /// Unmask IRQs at the PSTATE level (`DAIF.I`). Interrupts only reach the core
@@ -321,7 +327,9 @@ fn handle_sync(frame: &mut TrapFrame, kind: u64) {
     if (KIND_LOWER_EL_FIRST..=KIND_LOWER_EL_LAST).contains(&kind) {
         // SAFETY: provided by the linked kernel; either resolves the fault or
         // terminates the current task and schedules another, never returning here.
-        if unsafe { staros_user_fault(frame.far, frame.esr) } {
+        if unsafe {
+            staros_user_fault(frame.far, frame.esr, frame.elr, frame.regs[29], frame.regs[30])
+        } {
             // `ELR_EL1` is untouched, so the `eret` retries the faulting
             // instruction — this is a resumed fault, not a skipped one.
             return;
