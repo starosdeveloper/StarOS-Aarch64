@@ -42,7 +42,9 @@ use core::panic::PanicInfo;
 /// that actually reach them.
 ///
 /// Syscall numbers (must match `staros_abi::syscall::Syscall`):
-/// Send=1, Recv=2, MapMemory=3, Exit=4, DebugPutc=5, Revoke=6, DebugWrite=19.
+/// Send=1, Recv=2, MapMemory=3, Exit=4, DebugPutc=5, Revoke=6, DebugWrite=19,
+/// ClockNow=20, SleepUntil=21, NotifyCreate=22, NotifySignal=23, WaitAny=24,
+/// SpawnThread=25.
 /// Whole lines are printed with `DebugWrite` via the `.Lputs` helper (one atomic
 /// syscall per line); `DebugPutc` is kept only for the odd lone byte. The
 /// per-process id lives at
@@ -57,20 +59,105 @@ extern "C" fn _start() -> ! {
         "ldrb w19, [x9]",            // w19 = process id
         "sub sp, sp, #64",           // reserve a Message buffer on the user stack
         "mov x11, sp",               // x11 = &msg
+        "sub sp, sp, #16",           // and a small array for WaitAny handles
+        "mov x14, sp",               // x14 = &handles[0]
         "cmp w19, #1",
         "b.ne 4f",                   // id != 1 -> server
 
         // ================= client (id 1) =================
+        // First, the monotonic clock. This task holds no capabilities at all yet,
+        // which is the point: reading the time is not a privilege. Two `ClockNow`
+        // reads with a spin between them must come back non-zero and strictly
+        // increasing — the three failures that matter are a clock that never
+        // started (zero), one the kernel refused (a negative error, which compares
+        // as a huge unsigned and so also fails the "strictly later" test), and one
+        // that stands still.
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "mov x26, x0",               // x26 = first reading
+        "movz x28, #0x4000",         // a short spin, so the readings straddle work
+        ".Lcl_spin:",
+        "subs x28, x28, #1",
+        "b.ne .Lcl_spin",
+        "mov x8, #20",               // Syscall::ClockNow again
+        "svc #0",
+        "mov x27, x0",               // x27 = second reading
+        "cbz x26, .Lcl_clock_bad",   // zero: the clock never started
+        "cmp x27, x26",
+        "b.ls .Lcl_clock_bad",       // not strictly later: stopped, or an error
+        "adr x2, 16f",
+        "bl .Lputs",
+        "b .Lcl_clock_done",
+        ".Lcl_clock_bad:",
+        "adr x2, 17f",
+        "bl .Lputs",
+        ".Lcl_clock_done:",
+
+        // Sleep against an ABSOLUTE deadline 20 ms out, and check the result from
+        // both sides. Waking early would mean the deadline was not honoured;
+        // waking after a whole 100 ms tick period would mean the kernel never
+        // shortened its timer and simply rounded the sleep up to the next tick —
+        // which is the difference between a usable frame deadline and a useless
+        // one. Both bounds are checked here because only one of them fails
+        // visibly.
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "mov x26, x0",               // t0
+        "movz x24, #0x2D00",         // 20_000_000 ns
+        "movk x24, #0x0131, lsl #16",
+        "add x0, x26, x24",          // absolute deadline = now + 20 ms
+        "mov x8, #21",               // Syscall::SleepUntil
+        "svc #0",
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "sub x25, x0, x26",          // elapsed
+        "cmp x25, x24",
+        "b.lo .Lcl_sleep_bad",       // woke BEFORE the deadline
+        // Only the lower bound is checked here, and deliberately so. An upper bound
+        // measured from EL0 times the whole round trip — park, wake, be *scheduled*,
+        // read the clock — so on a loaded four-core run it fails for reasons that
+        // have nothing to do with the timer. Whether the sleep itself was tight is
+        // the kernel's `worst overshoot` line, which measures the wake-up alone.
+        // A deadline already in the past must return at once rather than park. The
+        // kernel counts these separately, and the count is what proves the path was
+        // taken — from here it is indistinguishable from a very short sleep.
+        "mov x0, #1",                // 1 ns after boot: long gone
+        "mov x8, #21",               // Syscall::SleepUntil
+        "svc #0",
+        "adr x2, 20f",
+        "bl .Lputs",
+        "b .Lcl_sleep_done",
+        ".Lcl_sleep_bad:",
+        "adr x2, 21f",
+        "bl .Lputs",
+        ".Lcl_sleep_done:",
+
+
         // The client holds *no* device authority. It asks the server for the
         // UART by sending a request, then tries to use the capability the server
         // delegates back — and discovers the server has already revoked it.
         //
-        // Build a request message: tag = 1, no payload, no capability.
+        // Two notifications of our own. The first is a source nothing will ever
+        // signal — it is there to prove `WaitAny` reports *which* one fired, not
+        // merely that something did. The second is delegated to the server below,
+        // so the wake-up comes from another task entirely.
+        "mov x8, #22",               // Syscall::NotifyCreate
+        "svc #0",
+        "mov x12, x0",               // x12 = silent notification handle
+        "mov x8, #22",               // Syscall::NotifyCreate
+        "svc #0",
+        "mov x13, x0",               // x13 = notification the server will signal
+        "str w12, [x14]",            // handles[0] = the silent one
+        "str w13, [x14, #4]",        // handles[1] = the server's
+
+        // Build a request message: tag = 1, no payload, carrying the notification
+        // capability the server should signal.
         "stp xzr, xzr, [x11]",
         "stp xzr, xzr, [x11, #16]",
         "stp xzr, xzr, [x11, #32]",
         "mov x0, #1",
         "str x0, [x11]",             // msg.tag = 1
+        "str w13, [x11, #40]",       // msg.cap = our notification, delegated
         // Send it three times on ep0 (handle 1). The ring holds 2, so the 3rd
         // Send blocks until the server drains a slot — exercising blocking send
         // and handing the CPU to the server, which runs to completion (reply +
@@ -105,7 +192,10 @@ extern "C" fn _start() -> ! {
         "mov x0, x22",
         "mov x8, #15",               // Syscall::MapShared
         "svc #0",
-        "mov x23, x0",               // x23 = shared VA in our space
+        // The server left its marker on the second page of a two-page buffer, so
+        // that is where we read it from — proving both pages of one shared object
+        // arrived in this space, at our own address.
+        "add x23, x0, #4096",        // x23 = second page of our mapping
         "adr x2, 10f",               // "[client] read from shared memory: "
         "bl .Lputs",
         "mov x2, x23",               // the NUL-terminated bytes the server left there
@@ -113,6 +203,172 @@ extern "C" fn _start() -> ! {
         "mov w0, #0x0a",             // trailing newline (a lone byte: DebugPutc is fine)
         "mov x8, #5",                // Syscall::DebugPutc
         "svc #0",
+        "adr x2, 19f",               // and say which page those bytes came from
+        "bl .Lputs",
+
+        // Wait on BOTH notifications with a two-second deadline. Only the second
+        // is ever signalled, and it is signalled by the *server* — so this both
+        // parks against a cross-task wake-up and checks that the index reported is
+        // the one that actually fired rather than the first in the list.
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "movz x24, #0x9400",         // 2_000_000_000 ns
+        "movk x24, #0x7735, lsl #16",
+        "add x2, x0, x24",           // deadline = now + 2 s
+        "mov x0, x14",               // &handles[0]
+        "mov x1, #2",                // two of them
+        "mov x8, #24",               // Syscall::WaitAny
+        "svc #0",
+        "cmp x0, #1",
+        "b.ne .Lcl_wait_bad",        // must be index 1, the server's notification
+
+        // And a wait that must time out — on BOTH handles again, 20 ms. Two things
+        // at once: the deadline is honoured when nothing fires, and the signal the
+        // wait above returned was really *consumed*. A kernel that reported
+        // readiness without decrementing the count would answer this one instantly
+        // with index 1 instead of timing out.
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "movz x24, #0x2D00",         // 20_000_000 ns
+        "movk x24, #0x0131, lsl #16",
+        "add x2, x0, x24",
+        "mov x0, x14",
+        "mov x1, #2",
+        "mov x8, #24",               // Syscall::WaitAny
+        "svc #0",
+        "cmp x0, #0",
+        "b.ge .Lcl_wait_bad",        // returned an index?! nothing signalled it
+
+        // The wait above parked and timed out — which means we were registered as
+        // that notification's waiter and then left. Signal it now: nobody is
+        // waiting, so the signal must be *counted* and handed to the next wait. If
+        // the timed-out wait failed to deregister, the notification still thinks we
+        // are waiting, hands this signal to a task that is not listening, and it
+        // vanishes — leaving the wait below to time out instead of returning 0.
+        "mov x0, x12",
+        "mov x8, #23",               // Syscall::NotifySignal (our own, silent one)
+        "svc #0",
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "movz x24, #0x2D00",         // 20_000_000 ns
+        "movk x24, #0x0131, lsl #16",
+        "add x2, x0, x24",
+        "mov x0, x14",
+        "mov x1, #1",
+        "mov x8, #24",               // Syscall::WaitAny
+        "svc #0",
+        "cmp x0, #0",
+        "b.ne .Lcl_wait_bad",        // must be index 0, from the pending signal
+
+        // Last: a stale registration must not poison the *next* block. Signal the
+        // notification once more with nobody waiting — if the waits above left us
+        // registered, the kernel hands this wake to a task that is not listening,
+        // which arms its "a wakeup arrived before you parked" flag. The sleep below
+        // would then return instantly instead of sleeping, and the damage would
+        // land somewhere with no obvious connection to notifications at all.
+        "mov x0, x12",
+        "mov x8, #23",               // Syscall::NotifySignal
+        "svc #0",
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "mov x26, x0",
+        "movz x24, #0x2D00",         // 20_000_000 ns
+        "movk x24, #0x0131, lsl #16",
+        "add x0, x26, x24",
+        "mov x8, #21",               // Syscall::SleepUntil
+        "svc #0",
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "sub x25, x0, x26",
+        "cmp x25, x24",
+        "b.lo .Lcl_wait_bad",        // did not sleep: a stale wakeup was consumed
+        "adr x2, 22f",
+        "bl .Lputs",
+        "b .Lcl_wait_done",
+        ".Lcl_wait_bad:",
+        "adr x2, 23f",
+        "bl .Lputs",
+        ".Lcl_wait_done:",
+
+        // ---- a thread in this very address space ----
+        // One page of our own heap is all the two of us need to talk: threads share
+        // every page, so an address means the same thing on both sides. That is the
+        // whole difference from `Spawn`, where the child gets its own space and this
+        // pointer would name a different frame.
+        "mov x0, #1",
+        "mov x8, #10",               // Syscall::MapAnon
+        "svc #0",
+        "mov x15, x0",               // x15 = the shared page
+        "str xzr, [x15]",            // where the thread will leave its marker
+        "str xzr, [x15, #16]",       // and the thread pointer it saw
+        // A notification of its own. The earlier one still carries the signal the
+        // stale-registration check left pending, and waiting on that would return
+        // instantly — the thread would look finished before it had started.
+        "mov x8, #22",               // Syscall::NotifyCreate
+        "svc #0",
+        "mov x13, x0",               // x13 = the thread's notification
+        "str w13, [x14]",            // handles[0] = it
+        "str w13, [x15, #8]",        // and tell the thread which one to signal
+        "adr x0, .Lthread",          // EL0 entry for the thread
+        "mov x1, #4",                // four pages of stack, its own
+        "movz x2, #0x5A5A",          // its thread pointer (TPIDR_EL0)
+        "mov x3, x15",               // argument: the shared page
+        "mov x8, #25",               // Syscall::SpawnThread
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lcl_thread_bad",      // could not create it
+        // Wait for it to finish, with a deadline so a thread that never runs is a
+        // failure rather than a hang.
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "movz x24, #0x9400",         // 2_000_000_000 ns
+        "movk x24, #0x7735, lsl #16",
+        "add x2, x0, x24",
+        "mov x0, x14",               // handles[0] = the silent notification
+        "mov x1, #1",
+        "mov x8, #24",               // Syscall::WaitAny
+        "svc #0",
+        "cmp x0, #0",
+        "b.ne .Lcl_thread_bad",      // timed out: the thread never signalled
+        // It wrote through *our* page, at the address we gave it.
+        "ldr x20, [x15]",
+        "movz x24, #0xF00D",
+        "cmp x20, x24",
+        "b.ne .Lcl_thread_bad",
+        // And it ran with its own thread pointer, not ours. Ours was never set, so
+        // the two must differ — that difference is what makes `thread_local` work,
+        // and it only holds if the register rides in the saved context.
+        "ldr x20, [x15, #16]",       // TPIDR_EL0 as the thread saw it
+        "movz x24, #0x5A5A",
+        "cmp x20, x24",
+        "b.ne .Lcl_thread_bad",
+        "mrs x21, tpidr_el0",        // and as WE see it, back on this thread
+        "cmp x21, x20",
+        "b.eq .Lcl_thread_bad",      // same value: the register is not per-thread
+        // The thread has exited. Our address space must have survived it — the last
+        // one out tears it down, not the first. Proving that needs the freed frames
+        // to be *reused*: claim 64 fresh pages, write through them, then read our
+        // original marker back. If the thread's exit had destroyed the space, its
+        // page tables would now be in the allocator's pool, handed straight back out
+        // here, and this either faults or reads something that is no longer ours.
+        "mov x0, #64",
+        "mov x8, #10",               // Syscall::MapAnon
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lcl_thread_bad",
+        "movz x24, #0xBEEF",
+        "str x24, [x0]",             // touch the new memory (needs live tables)
+        "ldr x20, [x15]",            // and our marker must still be there
+        "movz x24, #0xF00D",
+        "cmp x20, x24",
+        "b.ne .Lcl_thread_bad",
+        "adr x2, 24f",
+        "bl .Lputs",
+        "b .Lcl_thread_done",
+        ".Lcl_thread_bad:",
+        "adr x2, 25f",
+        "bl .Lputs",
+        ".Lcl_thread_done:",
         // Try to use the delegated capability. By now the server has revoked the
         // UART *object* globally, so this MapMemory is denied by the kernel even
         // though the client still holds a handle to it — cross-task revocation.
@@ -148,11 +404,14 @@ extern "C" fn _start() -> ! {
         "mov x8, #2",                // Syscall::Recv
         "svc #0",
         "ldr w23, [x11, #40]",       // w23 = handle of the delegated UART device cap
-        // Receive the client's request on ep0 (handle 1).
+        // Receive the client's request on ep0 (handle 1). It carries a
+        // notification capability the client is waiting on — the kernel installs a
+        // copy in our table and writes its handle into msg.cap.
         "mov x0, #1",
         "mov x1, x11",
         "mov x8, #2",                // Syscall::Recv
         "svc #0",
+        "ldr w27, [x11, #40]",       // w27 = the client's notification, delegated
         // Build the reply: tag = 2, words[0] = '>', cap = our UART handle (w23).
         "stp xzr, xzr, [x11]",
         "stp xzr, xzr, [x11, #16]",
@@ -172,13 +431,18 @@ extern "C" fn _start() -> ! {
         // delegate it to the client on ep1. The client will read these very bytes
         // from its OWN mapping of the same physical page — payload by reference,
         // not copied through six message words.
+        "mov x0, #2",                // two pages, not one
         "mov x8, #14",               // Syscall::CreateShared
         "svc #0",
         "mov x25, x0",               // x25 = shared capability handle
         "mov x0, x25",
         "mov x8, #15",               // Syscall::MapShared
         "svc #0",
-        "mov x26, x0",               // x26 = shared VA in our space
+        // Write the marker into the SECOND page. Both halves of the buffer have to
+        // survive the round trip: the object is described by one (phys, pages)
+        // pair, and a mapping that honoured only the first page would leave this
+        // store faulting here and the client reading nothing.
+        "add x26, x0, #4096",        // x26 = second page of the shared buffer
         "adr x2, 9f",                // marker string to place in shared memory
         ".Lsrv_shwrite:",
         "ldrb w0, [x2], #1",
@@ -219,6 +483,12 @@ extern "C" fn _start() -> ! {
         "strb w0, [x10]",            // MMIO via our own UART capability
         "b 2b",
         "3:",
+        // Wake the client. It is parked in `WaitAny` on two notifications, and
+        // this is the one it was given — so the wake-up crosses tasks, and the
+        // index it reports has to be ours rather than the silent one.
+        "mov x0, x27",
+        "mov x8, #23",               // Syscall::NotifySignal
+        "svc #0",
         // Revoke the UART *object* globally. Every capability to it — including
         // the copy we just delegated to the client — stops resolving at once.
         "mov x0, x23",
@@ -344,22 +614,63 @@ extern "C" fn _start() -> ! {
         "ldr x2, [x3]",
         "cmp x1, x2",
         "b.ne .Lmt_exit",            // mismatch -> exit quietly (no report)
-        // (b) Grow the heap by far more pages than a fixed frame list ever held,
-        // touching every one. Each MapAnon may make the kernel build new tables.
-        "movz x23, #0x1000",         // target: 4096 pages = 16 MiB
-        "mov x24, xzr",              // pages mapped so far
+        // (b) Grow the heap by far more pages than a fixed frame list ever held.
+        // Sixteen mebibytes, in EIGHT calls of 1024 pages rather than the 4096
+        // single-page calls this used to take — the point of the multi-page
+        // `MapAnon`. Each call may make the kernel build new tables.
+        //
+        // Every run is checked at BOTH ends: a marker into the first page and into
+        // the last page of the same run, both read back. A kernel that honoured
+        // the count only for the first page would pass a check of the first page
+        // and fault (or read rubbish) at the last.
+        "mov w23, #8",               // runs to make
+        "movz x26, #0x400",          // pages per run (1024 = 4 MiB)
+        "mov x27, xzr",              // VA the previous run ended at
         ".Lmt_grow:",
+        "mov x0, x26",               // pages
         "mov x8, #10",               // Syscall::MapAnon
         "svc #0",
         "cmp x0, #0",
         "b.lt .Lmt_exit",            // pool exhausted -> exit quietly (no report)
-        "str x1, [x0]",              // write the fresh page
-        "ldr x2, [x0]",              // read it back
+        "str x1, [x0]",              // marker into the FIRST page of the run
+        "ldr x2, [x0]",
         "cmp x1, x2",
         "b.ne .Lmt_exit",
-        "add x24, x24, #1",
-        "cmp x24, x23",
-        "b.lo .Lmt_grow",
+        "lsl x3, x26, #12",          // run length in bytes
+        "add x4, x0, x3",
+        "sub x4, x4, #8",            // last word of the LAST page of the run
+        // Fresh anonymous memory is zero-filled, and that has to hold for the far
+        // end of a run as much as for its first page — a page recycled from a dead
+        // task must not arrive carrying what it last held.
+        "ldr x2, [x4]",              // faults here if the count was ignored
+        "cbnz x2, .Lmt_exit",        // not zeroed -> exit quietly (no report)
+        "str x1, [x4]",
+        "ldr x2, [x4]",
+        "cmp x1, x2",
+        "b.ne .Lmt_exit",
+        // Runs must be handed out back to back, with no gap and no overlap: the
+        // heap cursor has to move by exactly what was mapped. Skip the check on
+        // the first run, which has no predecessor.
+        "cbz x27, .Lmt_first",
+        "cmp x0, x27",
+        "b.ne .Lmt_exit",            // gap or overlap -> exit quietly (no report)
+        ".Lmt_first:",
+        "add x27, x0, x3",           // where this run ends = where the next starts
+        "subs w23, w23, #1",
+        "b.ne .Lmt_grow",
+        // A zero-page request must be refused, not quietly rounded up to one. This
+        // is the one case where a wrong answer is invisible in normal use.
+        "mov x0, xzr",
+        "mov x8, #10",               // Syscall::MapAnon(0)
+        "svc #0",
+        "cmp x0, #0",
+        "b.ge .Lmt_exit",            // accepted?! say nothing and leave
+        "adr x2, 18f",
+        "bl .Lputs",
+        // `.Lputs` clobbers x0/x1/x8/x9, and the DMA half below still needs the
+        // magic value. Rebuild it rather than reserving another register.
+        "movz x1, #0xBEEF",
+        "movk x1, #0xDEAD, lsl #16",
         // (c) DMA buffer: ask for 4 physically-contiguous, non-cacheable pages,
         // then write a marker into the FIRST and LAST page and read both back.
         // Success proves all four pages are mapped (so the run really is
@@ -387,6 +698,18 @@ extern "C" fn _start() -> ! {
         "b.ne .Lmt_exit",
         "adr x2, 11f",               // DMA report string
         "bl .Lputs",
+        // Sleep 100 ms before the final report. This task finishes last, so for
+        // that stretch the only thing left in the system is asleep — which is the
+        // one arrangement that can tell a scheduler counting `Sleeping` as work
+        // from one that does not. A scheduler that treats sleep as "nothing left
+        // to do" ends the run here and the line below is never printed.
+        "mov x8, #20",               // Syscall::ClockNow
+        "svc #0",
+        "movz x24, #0xE100",         // 100_000_000 ns
+        "movk x24, #0x05F5, lsl #16",
+        "add x0, x0, x24",
+        "mov x8, #21",               // Syscall::SleepUntil
+        "svc #0",
         // Report success over the unprivileged debug console (no capability).
         // Only reached if every page above checked out.
         "adr x2, 3f",
@@ -551,6 +874,31 @@ extern "C" fn _start() -> ! {
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
 
+        // -------- the thread body (entered from SpawnThread) --------
+        // Reached at EL0 with x0 = the argument its creator passed, on a stack the
+        // kernel mapped for it alone, with its own TPIDR_EL0. It shares everything
+        // else — including the page x0 points at, which is how it reports back.
+        ".Lthread:",
+        "mov x19, x0",               // x19 = the shared page
+        "mrs x1, tpidr_el0",         // the thread pointer we were given
+        // Use the stack before trusting it. A thread handed the *bottom* of its
+        // stack region instead of the top faults on this first push, into the page
+        // below — and without a push nothing here would ever touch the stack, so
+        // the mistake would pass unnoticed.
+        "str x1, [sp, #-16]!",
+        "ldr x3, [sp], #16",
+        "cmp x1, x3",
+        "b.ne .Lthread_exit",        // stack did not hold: report nothing
+        "str x1, [x19, #16]",
+        "movz x2, #0xF00D",
+        "str x2, [x19]",             // the marker, written through the shared page
+        "ldr w0, [x19, #8]",         // the notification handle left for us
+        "mov x8, #23",               // Syscall::NotifySignal — tell the creator
+        "svc #0",
+        ".Lthread_exit:",
+        "mov x8, #4",                // Syscall::Exit — this thread ends, not the process
+        "svc #0",
+
         // -------- puts: emit a whole NUL-terminated string atomically --------
         // x2 = pointer to a NUL-terminated string. Measures its length and writes
         // the whole thing with a single `DebugWrite` (syscall 19), so the line is
@@ -578,7 +926,7 @@ extern "C" fn _start() -> ! {
         "2:",
         ".asciz \"\\n[driver] newline received; user-space IRQ driver exiting\\n\"",
         "3:",
-        ".asciz \"[memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew heap by 4096 pages (16 MiB), all written and read back\\n\"",
+        ".asciz \"[memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back\\n\"",
         "4:",
         ".asciz \"[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8\\n\"",
         "5:",
@@ -599,6 +947,26 @@ extern "C" fn _start() -> ! {
         ".asciz \"[stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand\\n\"",
         "15:",
         ".asciz \"[stack] MARKER MISMATCH - a demand-mapped stack page was wrong\\n\"",
+        "16:",
+        ".asciz \"[client] monotonic clock: two ClockNow reads from EL0, the second strictly later - no capability needed\\n\"",
+        "17:",
+        ".asciz \"[client] CLOCK DID NOT ADVANCE - ClockNow returned zero, an error, or went backwards\\n\"",
+        "18:",
+        ".asciz \"[memtest] MapAnon(0) refused - a zero-page request is an error, not a page\\n\"",
+        "19:",
+        ".asciz \"[client] read the marker from the SECOND page of a 2-page shared buffer\\n\"",
+        "20:",
+        ".asciz \"[client] SleepUntil: woke no earlier than its 20 ms absolute deadline\\n\"",
+        "21:",
+        ".asciz \"[client] SLEEP WRONG - woke before the deadline it asked for\\n\"",
+        "22:",
+        ".asciz \"[client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block\\n\"",
+        "23:",
+        ".asciz \"[client] WAITANY WRONG - wrong index, or a wait with nothing to wake it returned anyway\\n\"",
+        "24:",
+        ".asciz \"[client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0\\n\"",
+        "25:",
+        ".asciz \"[client] THREAD WRONG - it never ran, wrote nowhere we can see, or shared our thread pointer\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,

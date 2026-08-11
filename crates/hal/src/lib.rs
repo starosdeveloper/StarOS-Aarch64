@@ -1,11 +1,19 @@
-//! Hardware Abstraction Layer — trait definitions only.
+//! Hardware Abstraction Layer — the traits hardware is programmed through.
 //!
 //! The HAL is where the kernel says *what* it needs from hardware without
 //! saying *how* any particular chip provides it. Arch crates and drivers
 //! implement these traits; the portable kernel core depends only on the traits.
 //! This inversion is what lets the core be unit-tested on the host and keeps
 //! chip-specific `unsafe` MMIO out of the scheduler.
-#![no_std]
+//!
+//! One module here is not a trait: [`clock`], the arithmetic that turns
+//! [`Timer`]'s raw ticks into nanoseconds. It sits with the trait it serves
+//! because every implementor needs the same conversion and none of them should
+//! write it again — and because, being pure arithmetic, it is host-tested, while
+//! the register read that feeds it cannot be.
+#![cfg_attr(not(test), no_std)]
+
+pub mod clock;
 
 use staros_abi::error::KResult;
 

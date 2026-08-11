@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use console::klog;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
@@ -261,6 +262,118 @@ fn detect_smmu(fdt: Fdt<'_>) -> Option<u64> {
 /// configure it default-deny, and report. A machine without an SMMU (plain
 /// `virt`) simply skips this — the DMA-capability model is in place regardless,
 /// but only an SMMU makes it enforceable against a real bus master.
+/// Check the monotonic clock against the interval the tick source is armed with,
+/// and say so in the log.
+///
+/// The two numbers come from the same register and nothing else: `interval` is
+/// `CNTFRQ_EL0 / TICK_HZ` counter ticks, and the clock is `CNTPCT_EL0` scaled by
+/// a fraction built from `CNTFRQ_EL0`. So waiting for the counter to advance by
+/// exactly one tick period must take exactly one tick period on the clock. A
+/// scale built wrong — the classic being an integer `ns_per_tick` that truncates,
+/// or a frequency read from the wrong place — breaks that equality immediately,
+/// while every other part of the system keeps working.
+///
+/// **What it deliberately does not check:** whether `CNTFRQ_EL0` tells the truth
+/// about real time. Firmware that declares 100 MHz for a 54 MHz counter passes
+/// this and is wrong by a factor of two; catching that needs a second clock (a
+/// UART's baud rate, an HPET, a stopwatch), and there isn't one here.
+///
+/// An earlier version of this compared elapsed nanoseconds against *interrupts
+/// counted* across the whole demo. It could not work: a tick is re-armed after it
+/// is serviced, so under TCG the observed period ran 33 % long on a good run —
+/// wide enough that a scale wrong by a factor of two sat comfortably inside the
+/// tolerance. Removing the scheduler from the measurement is what makes the
+/// tolerance tight enough to mean anything.
+fn check_clock(console: &mut Pl011, interval_ticks: u64) {
+    /// How far the measurement may stray from one tick period, either way. The
+    /// wait is a spin on the counter itself, so the only real error is the
+    /// overshoot of one loop iteration; 10 % is enormous headroom and still an
+    /// order of magnitude tighter than a factor-of-two mistake.
+    const TOLERANCE_PCT: u64 = 10;
+
+    let Some(before) = timer::monotonic_ns() else {
+        let _ = writeln!(console, "clock: no monotonic clock to check on this machine");
+        return;
+    };
+    // Spin until the counter has advanced by one tick period. No interrupts, no
+    // scheduler, no `wfi` — nothing in this loop can be delayed by anything the
+    // rest of the kernel does, which is the whole point.
+    let start = GenericTimer::counter();
+    while GenericTimer::counter().wrapping_sub(start) < interval_ticks {
+        core::hint::spin_loop();
+    }
+    let Some(after) = timer::monotonic_ns() else {
+        let _ = writeln!(console, "clock: the monotonic clock stopped answering mid-check");
+        return;
+    };
+
+    let measured_us = after.saturating_sub(before) / 1000;
+    let expected_us = 1_000_000 / TICK_HZ;
+    let low = expected_us * (100 - TOLERANCE_PCT) / 100;
+    let high = expected_us * (100 + TOLERANCE_PCT) / 100;
+    let verdict = if measured_us < low {
+        "CLOCK SCALE WRONG - the clock under-counts nanoseconds"
+    } else if measured_us > high {
+        "CLOCK SCALE WRONG - the clock over-counts nanoseconds"
+    } else {
+        "agrees with the tick interval"
+    };
+    let _ = writeln!(
+        console,
+        "clock: one tick interval ({interval_ticks} counter ticks) measured {measured_us} us \
+         against an expected {expected_us} us ({verdict})",
+    );
+}
+
+/// How much time the monotonic clock saw pass while the demo ran, and how many
+/// ticks core 0 took in it. Informational: this pairing cannot be a check (see
+/// [`check_clock`]), but a clock that stopped, or a core that stopped being
+/// preempted, both show up here as a zero.
+fn report_clock(console: &mut Pl011, before: Option<u64>, ticks_before: u64) {
+    let ticks = irq::tick_count_for(0).saturating_sub(ticks_before);
+    let Some(elapsed_ns) = before.zip(timer::monotonic_ns()).map(|(a, b)| b.saturating_sub(a))
+    else {
+        let _ = writeln!(
+            console,
+            "clock: no monotonic clock on this machine — {ticks} tick(s) went unmeasured",
+        );
+        return;
+    };
+    let _ = writeln!(
+        console,
+        "clock: the demo took {} ms on the monotonic clock, during which core 0 took {ticks} tick(s)",
+        elapsed_ns / 1_000_000,
+    );
+
+    // Sleeping, as three numbers that fail in different directions. Zero parks
+    // would mean no task ever slept (so the state and the re-aimed timer went
+    // untested); zero already-past would mean the "do not park a caller who is
+    // already late" path never ran; and parks without wake-ups would mean tasks
+    // went to sleep and were rescued by something other than the clock.
+    let (parked, already_past, wakeups, worst_late) = sched::sleep_counts();
+    // The overshoot is the sleep *resolution*: the gap between a deadline and the
+    // task being made `Ready`, with no scheduling in it (a task timing its own
+    // sleep would measure the round trip instead, and on a loaded run that says
+    // more about contention than about the timer).
+    //
+    // It is **reported, not judged**, and that took two tries to accept. A verdict
+    // with a threshold was written first, and it failed intermittently on machines
+    // where the sleep was fine: the worst case is decided by whether the sleep
+    // happened to land on the longest uninterruptible stretch in the kernel —
+    // zeroing 2.5 MiB of `.bss` for a `Spawn`, or scrolling the framebuffer console
+    // — and under TCG that is a lottery. Measured range across runs of the same
+    // config: 2.9 ms to 437 ms. The typical value is single-digit milliseconds and
+    // the number is worth printing; asserting on the worst case would be asserting
+    // on the emulator's luck. A real board, where those stretches cost microseconds
+    // rather than hundreds of milliseconds, is where this becomes a claim.
+    let _ = writeln!(
+        console,
+        "sleep: {parked} task-sleep(s) parked, {already_past} deadline(s) already past (returned \
+         at once), {wakeups} clock wake-up(s), worst overshoot {} us",
+        worst_late / 1000,
+    );
+}
+
 fn init_smmu(console: &mut Pl011, fdt: Fdt<'_>) {
     let Some(base) = detect_smmu(fdt) else {
         return;
@@ -859,6 +972,34 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     let r_bad = unsafe { syscall::invoke(0xdead, 0) };
     let _ = writeln!(console, "syscall Yield -> {r_yield}; syscall 0xdead -> {r_bad}");
 
+    // --- Monotonic clock ---
+    // Started before the tick source, so the clock covers the rest of boot and so
+    // the tick measurement below has a base older than the first tick. Until this
+    // line runs, nothing in the system — kernel or EL0 — can measure elapsed time
+    // at all; `ClockNow` answers `NotSupported` rather than zero.
+    // SAFETY: primary core, during boot, before any other core is started.
+    match unsafe { timer::init_monotonic() } {
+        Some(scale) => {
+            let _ = writeln!(
+                console,
+                "clock: {} Hz counter, {} ns per {} tick(s){}",
+                GenericTimer::frequency_hz(),
+                scale.numerator(),
+                scale.denominator(),
+                if scale.is_exact() { " (exact)" } else { "" },
+            );
+        }
+        None => {
+            // Firmware that never programmed CNTFRQ_EL0. Everything else still
+            // works; timing does not, and says so once here rather than handing
+            // out plausible numbers.
+            let _ = writeln!(
+                console,
+                "clock: this machine reports a zero counter frequency — ClockNow will refuse",
+            );
+        }
+    }
+
     // --- Timer + scheduler bring-up ---
     let interval = GenericTimer::frequency_hz() / TICK_HZ;
     irq::set_tick_interval(interval);
@@ -890,6 +1031,10 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     smp::enable_wake_ipi();
     // SAFETY: timer IRQ routed; arm the periodic tick that drives preemption.
     unsafe { GenericTimer::arm(interval) };
+
+    // With the interval known, hold the clock against it once — before any task
+    // exists, so nothing the scheduler does can blur the measurement.
+    check_clock(&mut console, interval);
 
     // --- IOMMU (SMMUv3), if the machine has one ---
     // Brought up default-deny before any driver could program a DMA-capable
@@ -1169,12 +1314,23 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         stackgrow_space,
         cap::empty_caps().expect("stack grower caps"),
     );
+    // Bracket the whole demo with the monotonic clock and the tick counter. Two
+    // independent readings of the same elapsed time: one from `CNTPCT_EL0` scaled
+    // to nanoseconds, one from counting interrupts armed at `freq / TICK_HZ`
+    // ticks apart. They are derived from the same counter but through entirely
+    // different arithmetic, so a wrong tick→nanosecond scale makes them disagree
+    // — which is the only thing that can catch a scale that is confidently wrong.
+    let clock_before = timer::monotonic_ns();
+    let ticks_before = irq::tick_count();
+
     // Runs the tasks (each starts with IRQs enabled) until they exit — including
     // any the spawner creates at runtime via `Spawn`.
     sched::start();
 
     // SAFETY: tasks are done; stop the timer source.
     unsafe { GenericTimer::disable() };
+
+    report_clock(&mut console, clock_before, ticks_before);
 
     // Reclaim shared-memory and DMA frames now that no task can still map them.
     // These belong to their objects, not to any address space, so task teardown
@@ -1441,8 +1597,6 @@ pub extern "Rust" fn staros_user_fault(far: u64, esr: u64) -> bool {
     if ec == EC_DATA_ABORT_LOWER_EL && translation_fault && sched::grow_stack_current(far) {
         return true;
     }
-    // SAFETY: single-core; brief console access to report the isolated fault.
-    let mut console = unsafe { Pl011::qemu_virt() };
     // Name the guard region specially. A fault just below `USER_STACK_LIMIT` is not
     // a wild pointer but a stack that ran past the limit — the exact case the guard
     // exists to catch, and worth distinguishing in a log where every other kill
@@ -1451,8 +1605,12 @@ pub extern "Rust" fn staros_user_fault(far: u64, esr: u64) -> bool {
         ..addrspace::USER_STACK_LIMIT)
         .contains(&far);
     let what = if guard { " — stack guard: growth limit reached" } else { "" };
-    let _ = writeln!(
-        console,
+    // Through the console lock, like every other line. This used to build its own
+    // `Pl011` and write straight to the UART, on a comment that said "single-core"
+    // — which stopped being true at 1.8 and left one path that could interleave.
+    // It cost nothing until a task on another core printed a long line at the wrong
+    // moment, and then a fault report was spliced through the middle of it.
+    klog!(
         "[fault] task {} killed: EL0 fault at {far:#x} (ec {ec:#04x}){what} — isolated, \
          kernel continues",
         sched::current_id(),
@@ -1466,6 +1624,22 @@ pub extern "Rust" fn staros_user_fault(far: u64, esr: u64) -> bool {
 /// task's `TTBR0`, so its EL0 pages are live; we simply drop to EL0 at the shared
 /// user entry point on the private user stack. Control returns to the kernel only
 /// via a syscall — `Exit` ends the task, so this never returns here.
+/// Kernel-side entry for a *thread*: like [`user_task_entry`], but it enters EL0
+/// at the address its creator named, on the stack its creator allocated, with the
+/// argument its creator passed. A thread with no `user_start` recorded cannot
+/// exist — `spawn_thread` always sets one — so a missing one is a kernel bug and
+/// ends the task rather than guessing an entry point.
+extern "C" fn user_thread_entry() {
+    let Some((entry, sp, arg)) = sched::current_user_start() else {
+        klog!("[thread] started with no entry recorded; killing it");
+        sched::exit()
+    };
+    // SAFETY: the creator's address space is active (this thread shares it), the
+    // entry lies in its EL0-executable image and the stack in EL0-writable
+    // anonymous memory it just mapped.
+    unsafe { usermode::enter_el0(entry, sp, arg) };
+}
+
 extern "C" fn user_task_entry() {
     // The predecessor this core switched away from was already settled and reaped by
     // the entry trampoline (`staros_post_switch`) before we got here, so there is
@@ -1475,7 +1649,7 @@ extern "C" fn user_task_entry() {
     let entry = sched::current_user_entry();
     // SAFETY: this task's address space is active (its user code/stack pages are
     // mapped EL0-accessible) and the EL1 vectors service its syscalls.
-    unsafe { usermode::enter_el0(entry, addrspace::USER_STACK_TOP) };
+    unsafe { usermode::enter_el0(entry, addrspace::USER_STACK_TOP, 0) };
 }
 
 /// Map every `PT_LOAD` segment of the parsed `init` ELF into `space`, each at its

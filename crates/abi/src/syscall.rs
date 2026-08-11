@@ -37,10 +37,16 @@ pub enum Syscall {
     /// Until this is called the kernel keeps the line masked, so a level-triggered
     /// source cannot storm while the driver runs.
     IrqAck = 9,
-    /// Map one fresh, zero-filled, read/write page into the caller's address
-    /// space and return its virtual address. Anonymous memory a task requests at
-    /// runtime — the basis of a growable user heap. No capability is required: a
-    /// task may always grow its own memory (until the pool is exhausted).
+    /// Map `arg0` fresh, zero-filled, read/write pages into the caller's address
+    /// space and return the virtual address of the first. Anonymous memory a task
+    /// requests at runtime — the basis of a growable user heap. No capability is
+    /// required: a task may always grow its own memory (until the pool is
+    /// exhausted).
+    ///
+    /// The pages are contiguous **in virtual address space only**; each is a
+    /// separate frame. A count of zero is an error rather than a synonym for one,
+    /// because a zero here is always a caller's arithmetic having gone wrong, and
+    /// the request is capped so a single call cannot drain the pool.
     MapAnon = 10,
     /// Create a new EL0 process from the init image, seeded with the id in arg0.
     /// This is how user space (an `init`) builds the process tree itself, rather
@@ -58,9 +64,9 @@ pub enum Syscall {
     /// interrupt counterpart to [`GrantDevice`]. Returns the new interrupt
     /// capability's handle.
     GrantIrq = 13,
-    /// Create a shared-memory buffer: one fresh, zeroed physical page the caller
-    /// can share with another task. Returns a *shared capability* handle. No
-    /// argument, no authority — any task may create shared memory, exactly as any
+    /// Create a shared-memory buffer: `arg0` fresh, zeroed, physically contiguous
+    /// pages the caller can share with another task. Returns a *shared capability*
+    /// handle. No authority — any task may create shared memory, exactly as any
     /// task may grow its own with [`MapAnon`]. Delegate the returned handle over
     /// IPC and both sides map the same page with [`MapShared`], so real payloads
     /// (a screen frame, a network packet) pass by reference, not by copying six
@@ -104,6 +110,76 @@ pub enum Syscall {
     /// `DebugPutc` remains for a single stray byte. Returns the number of bytes
     /// written, or an error (unreadable pointer, or a length past the kernel cap).
     DebugWrite = 19,
+    /// Read the monotonic clock: nanoseconds since the kernel started counting.
+    /// No argument, no capability — reading the time is not a privilege, and a
+    /// task that cannot measure elapsed time cannot animate, time out, or profile
+    /// itself.
+    ///
+    /// The value only ever climbs, is common to every task and every core (one
+    /// system counter underneath), and is unrelated to wall-clock time: it says
+    /// how long since *this boot*, not what the date is. Returns an error only on
+    /// a machine whose firmware never declared its counter frequency, which is
+    /// the one case where any number would be a guess.
+    ClockNow = 20,
+    /// Sleep until the monotonic clock reaches `arg0` nanoseconds — the same
+    /// scale [`ClockNow`] returns. The task is parked and the CPU given to someone
+    /// else; it becomes runnable again once the deadline passes.
+    ///
+    /// The deadline is **absolute**, not a duration, and that is what makes it
+    /// usable for pacing: a loop that sleeps "16 ms" drifts by however long its own
+    /// work takes, while one that sleeps until `start + n * 16 ms` does not. A
+    /// deadline already in the past returns immediately without parking, so this
+    /// doubles as the timeout half of an event loop.
+    ///
+    /// Returns 0, or an error on a machine with no monotonic clock.
+    SleepUntil = 21,
+    /// Create a notification of the caller's own and return a capability handle
+    /// for it. No authority: signalling is only possible for whoever holds the
+    /// capability, so creating one grants nothing on its own.
+    ///
+    /// The counterpart of [`IrqRegister`], which mints a notification bound to a
+    /// hardware line. This one is bound to nothing, and exists so user space can
+    /// wake user space — the role `eventfd` plays in a POSIX event loop, and the
+    /// only way a task can be roused by something other than a device or a
+    /// message.
+    NotifyCreate = 22,
+    /// Signal the notification named by `arg0`. Wakes its waiter, or is remembered
+    /// as one pending signal if nobody is waiting, exactly as an interrupt's
+    /// notification behaves. Delegate the capability over IPC and one task can
+    /// wake another.
+    NotifySignal = 23,
+    /// Wait for the first of several notifications, with a deadline: `arg0` = a
+    /// pointer to an array of `arg1` capability handles in the caller's memory,
+    /// `arg2` = an absolute deadline in the [`ClockNow`] scale (0 means "no
+    /// deadline").
+    ///
+    /// Returns the **index** into that array of the notification that fired, having
+    /// consumed one of its pending signals — or [`WouldBlock`] if the deadline
+    /// passed first. An index rather than a handle: the caller indexes its own
+    /// array with it, and an index cannot be mistaken for an error code.
+    ///
+    /// This is what an event loop needs and what [`Wait`] cannot do. A loop that
+    /// can only wait on one source at a time either misses the others or spins;
+    /// `poll` exists on every POSIX system for the same reason.
+    ///
+    /// [`WouldBlock`]: crate::error::KError::WouldBlock
+    WaitAny = 24,
+    /// Create a thread in the caller's **own** address space: `arg0` = the EL0
+    /// entry point, `arg1` = how many pages of stack to give it, `arg2` = its
+    /// thread pointer (`TPIDR_EL0`), `arg3` = a value passed to the entry in the
+    /// first argument register. Returns the new task's id.
+    ///
+    /// The difference from [`Spawn`] is the whole point: `Spawn` builds a fresh
+    /// address space from the init image and is therefore a *process*, while this
+    /// shares every page and every capability with its creator. A C runtime needs
+    /// the second thing and cannot be built out of the first, because threads
+    /// sharing a heap is the entire premise.
+    ///
+    /// Three things do not carry over. The thread gets its own stack (shared pages
+    /// would mean two threads writing through one stack), its own thread pointer
+    /// (that is what makes `thread_local` work), and a *copy* of the capability
+    /// table taken at creation — so a capability minted later is not visible to it.
+    SpawnThread = 25,
 }
 
 impl Syscall {
@@ -131,6 +207,12 @@ impl Syscall {
             17 => Some(Syscall::MapDma),
             18 => Some(Syscall::BindDma),
             19 => Some(Syscall::DebugWrite),
+            20 => Some(Syscall::ClockNow),
+            21 => Some(Syscall::SleepUntil),
+            22 => Some(Syscall::NotifyCreate),
+            23 => Some(Syscall::NotifySignal),
+            24 => Some(Syscall::WaitAny),
+            25 => Some(Syscall::SpawnThread),
             _ => None,
         }
     }
@@ -142,11 +224,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=19 {
+        for n in 0..=25 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(20), None);
+        assert_eq!(Syscall::from_raw(26), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

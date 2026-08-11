@@ -315,14 +315,20 @@ Done:
   and `Vec` instead of fixed-size static arrays. Verified in QEMU: a heap-backed
   `Vec` of eight squares prints `… sums to 204 — global allocator live`.
 
-- **Anonymous user memory (`MapAnon`).** A task grows its own address space at
-  runtime: the `MapAnon` syscall maps one fresh zero page (from the buddy pool)
-  read/write at the next free VA in a per-space heap region above the fixed
-  data/stack/device pages, and returns it — no capability required, since a task
-  may always allocate its own memory. `AddressSpace` tracks a `heap_next` cursor
-  and adds the page to its owned set so teardown reclaims it. Verified in QEMU: a
-  capability-less process maps two pages, writes and reads back `0xDEADBEEF`, and
-  reports `[memtest] MapAnon gave writable pages; readback ok`.
+- **Anonymous user memory (`MapAnon(pages)`).** A task grows its own address space
+  at runtime: the `MapAnon` syscall maps `pages` fresh zero pages (from the buddy
+  pool) read/write at the next free VAs in a per-space heap region above the fixed
+  data/stack/device pages, and returns the first — no capability required, since a
+  task may always allocate its own memory. `AddressSpace` tracks a `heap_next`
+  cursor and adds each page to its owned set so teardown reclaims it. The run is
+  contiguous **in virtual address space only**: a heap is read through an MMU, so
+  demanding physical contiguity would mean power-of-two rounding and failure on
+  merely fragmented memory, for nothing. A zero count is an error rather than a
+  synonym for one, and the count is capped so a single call cannot drain the pool.
+  Verified in QEMU: a capability-less process takes 16 MiB in eight calls of 1024
+  pages, checking the *far end* of each run (zero before writing, `0xDEADBEEF`
+  after) and that consecutive runs abut exactly, then confirms `MapAnon(0)` is
+  refused.
 
 - **User-space process creation (`Spawn`).** The kernel no longer hard-codes every
   task: the `Spawn` syscall builds a fresh EL0 process from the init image, seeded
@@ -761,6 +767,98 @@ Done:
   down, reads every marker back, then overruns on purpose — the log shows
   `40 page(s) mapped on demand` and `stack guard: growth limit reached`, and every
   frame still comes back at teardown.
+
+- **A monotonic clock user space can read (`ClockNow`).** Nanoseconds since the
+  kernel started counting, from `CNTPCT_EL0` scaled by a reduced fraction built
+  once from `CNTFRQ_EL0`. The arithmetic lives in `staros_hal::clock` — a pure,
+  host-tested module — because every way of getting it wrong is silent: a 64-bit
+  product wraps nine minutes into a boot at 33 MHz, an integer `ns_per_tick` is
+  3.7 % off at 54 MHz, and `ticks / freq * 1e9` quantises to whole seconds. The
+  arch half reads the register (behind the `isb` the architecture requires) and
+  contains no arithmetic. No capability is needed: reading the time is not a
+  privilege. A machine whose firmware never programmed `CNTFRQ_EL0` gets
+  `NotSupported` rather than a plausible zero. Verified live in two places that
+  fail independently — the kernel holds the scale against the interval its own
+  tick source is armed with (before any task exists, so the scheduler cannot blur
+  it), and an EL0 task holding no capabilities reads the clock twice and requires
+  the second reading to be strictly later. The first version of that check
+  compared elapsed time against *interrupts counted* and was useless: a tick is
+  re-armed after servicing, so TCG stretched the observed period by a third and a
+  scale wrong by a factor of two fitted inside the tolerance.
+
+- **Sleeping against an absolute deadline (`SleepUntil`).** A task parks until the
+  monotonic clock reaches a given nanosecond, in a `Sleeping { until_ns }` state
+  that is deliberately *not* a flavour of `Blocked`: a blocked task may wait
+  forever for a message nobody sends, while a sleeping one is guaranteed a wake-up
+  by the clock, so `any_runnable` counts it as work. The deadline is absolute
+  because a relative sleep drifts by however long the caller's own work takes; a
+  deadline already past returns without parking, which is what makes the call
+  usable as an event loop's timeout. Sleeps do not wait for the next 10 Hz tick:
+  parking re-aims the core's timer at the deadline, and each tick re-arms for
+  `min(period, time to the nearest deadline)`.
+
+  Building it exposed an unrelated and much larger problem. A syscall runs with
+  IRQs masked end to end, so the multi-page `MapAnon` added just before it — 1024
+  pages zeroed and invalidated in one call — held off preemption for its whole
+  duration: the tick was running at 1.3 Hz instead of 10, and had been for some
+  time, unnoticed because nothing measured latency. `map_anon_current` now works in
+  16-page chunks with an interrupt window between them. Measured worst overshoot on
+  a 20 ms sleep: 708 ms unchunked, 42 ms at 64 pages, 13 ms at 16. What remains is
+  no longer `MapAnon` but other long masked stretches — chiefly zeroing 2.5 MiB of
+  `.bss` per `Spawn`.
+
+  The resolution is measured and printed but **not asserted**, after two attempts
+  showed it cannot be. Timing the sleep from EL0 measures park + wake + *be
+  scheduled* + read the clock, and failed on a loaded four-core run while the
+  wake-up itself was 2.3 ms late. Asserting the kernel's own deadline-to-`Ready`
+  gap failed too, on a headless config: the worst case depends on whether the sleep
+  landed on the longest uninterruptible stretch in the kernel, and the same config
+  produced 2.9 ms and 437 ms on different runs. What is asserted is the
+  deterministic half — a task never wakes before its deadline.
+
+- **Waiting on a set of sources with a deadline (`WaitAny`), and user-space
+  notifications (`NotifyCreate` / `NotifySignal`).** `Wait` blocks on exactly one
+  notification forever, which no event loop can use; `WaitAny` takes an array of
+  notification handles and an absolute deadline and returns the *index* of
+  whichever fired, having consumed one of its signals — the role `poll` plays on a
+  POSIX system. The two companion calls give user space a notification bound to no
+  hardware, delegable over IPC, so one task can wake another: `eventfd`, by another
+  name.
+
+  The interesting rule is deregistration. A waiter that has woken must be removed
+  from **every** queue it stood in, not just the one that fired — while a task is
+  registered, `signal` hands the wake to it instead of counting it in `pending`, so
+  a signal arriving after a wait has returned would simply vanish. Combining with a
+  timeout reuses `Sleeping { until_ns }`: `wake_expired` frees the task on time and
+  `unblock` frees it early, one state rather than a "blocked plus a timer" pair
+  that two paths could race over. Handles are copied out of user memory once,
+  before any is resolved, so the array cannot change between check and use.
+
+  `signal` now counts every signal, waiter or not. It used to hand one straight to
+  a parked waiter and count it only when nobody was waiting — correct for `Wait`,
+  where waking *is* the answer, and broken for `WaitAny`, where the woken task must
+  still discover which source fired and can only do so from the counts. Single-core
+  runs never showed it (the signaller always got there first, taking the counted
+  path); the four-core configs in the smoke matrix did.
+
+- **Threads in one address space (`SpawnThread`).** A thread is a task sharing its
+  creator's `TTBR0`, its pages and its capabilities, entered at an address the
+  creator names with an argument in `x0`. Three things do not carry over: its stack
+  (anonymous memory allocated at creation — sharing one stack would have two threads
+  writing through each other), its `TPIDR_EL0` (which now rides in `CpuContext` and
+  is switched by `__context_switch`, because restoring it anywhere else leaves a
+  window where a thread runs on its neighbour's thread pointer, and the symptom of
+  that is `thread_local` aliasing rather than anything that looks like scheduling),
+  and its capability table, which is *copied* rather than shared — so a capability
+  minted after the thread starts is invisible to it.
+
+  Teardown is the interesting half: the last task out of a shared space destroys it,
+  and "last" is decided by asking the task table whether any other live task still
+  names that `TTBR0`. A reference count would be a second copy of a fact the table
+  already holds, and the two disagree after a failed spawn or a task that dies before
+  it runs. Verified in QEMU by making the freed frames *matter*: after its thread
+  exits, the creator claims 64 fresh pages and re-reads a marker the thread left —
+  falsifying the rule kills the creator with a fault at the dead thread's stack.
 
 Not yet implemented:
 

@@ -50,7 +50,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use staros_abi::error::KError;
 use staros_arch_aarch64::addrspace::AddressSpace;
 use staros_arch_aarch64::context::{context_switch, CpuContext};
-use staros_arch_aarch64::{boot, exceptions, mmu};
+use staros_arch_aarch64::{boot, exceptions, mmu, timer};
+use staros_mm::PAGE_SIZE;
 
 use crate::cap::{self, Cap, CapTable};
 use crate::ipc::KMessage;
@@ -69,6 +70,20 @@ enum State {
     /// Waiting for an event (e.g. an IPC message). Not schedulable until an
     /// [`unblock`] makes it `Ready` again.
     Blocked,
+    /// Waiting for a *time*, not an event: `SleepUntil` parked this task until the
+    /// monotonic clock reaches `until_ns`. Not schedulable before then, and made
+    /// `Ready` by [`wake_expired`] once the deadline has passed.
+    ///
+    /// Deliberately a separate state from [`Blocked`], not a flavour of it. The
+    /// two differ in the only way the scheduler cares about: a blocked task may
+    /// wait forever for a message nobody will send, while a sleeping task *will*
+    /// become runnable — the clock guarantees it. That difference is what
+    /// [`Scheduler::any_runnable`] turns on, and conflating them would make the
+    /// kernel decide it had finished while a task still had a wake-up coming.
+    Sleeping {
+        /// Monotonic nanoseconds at which this task becomes runnable again.
+        until_ns: u64,
+    },
     /// Finished; slot will not be scheduled again.
     Dead,
 }
@@ -95,6 +110,16 @@ struct Task {
     space: Option<AddressSpace>,
     /// This task's capability table: the objects it may act on, named by handle.
     caps: CapTable,
+    /// Where this task enters EL0, if it is not simply the program's ELF entry on
+    /// the standard stack: `(entry, stack top, argument)`.
+    ///
+    /// `None` for a process — it starts at `e_entry` on the one stack its address
+    /// space provides. `Some` for a *thread*, which shares that space and therefore
+    /// cannot share the stack: two threads growing one stack would silently write
+    /// through each other. A thread's stack is ordinary anonymous memory, allocated
+    /// by whoever created it, and is fixed-size — the demand-growth path belongs to
+    /// the one stack region the address space knows about.
+    user_start: Option<(u64, u64, u64)>,
     /// Message delivered to this task while it was blocked in `Recv`, read when
     /// it resumes. `None` unless a sender has just handed it a message.
     mailbox: Option<KMessage>,
@@ -241,16 +266,36 @@ impl Scheduler {
             .find(|&i| self.pickable(i))
     }
 
-    /// Whether any task is `Ready` or already `Running` on some core.
+    /// Whether any task is `Ready`, already `Running` on some core, or `Sleeping`.
     ///
     /// Deliberately *not* counting `Blocked`: a task waiting for an event nobody
     /// will send is not work, and treating it as work is how a kernel hangs
     /// instead of finishing. This matches what the single-core scheduler did when
     /// it stopped as soon as nothing was runnable.
+    ///
+    /// `Sleeping` *is* counted, and that is the whole reason it is not a flavour
+    /// of `Blocked`. A sleeping task has a wake-up coming from the clock, so
+    /// treating it as "no work left" would end the run with a task that was about
+    /// to be runnable — the demo would simply lose whatever it was going to do
+    /// after its sleep, silently and only sometimes.
     fn any_runnable(&self) -> bool {
+        self.tasks.iter().any(|t| {
+            matches!(
+                t.state,
+                State::Ready | State::Running | State::Sleeping { .. }
+            )
+        })
+    }
+
+    /// The earliest deadline among sleeping tasks, if any are asleep.
+    fn next_wake(&self) -> Option<u64> {
         self.tasks
             .iter()
-            .any(|t| matches!(t.state, State::Ready | State::Running))
+            .filter_map(|t| match t.state {
+                State::Sleeping { until_ns } => Some(until_ns),
+                _ => None,
+            })
+            .min()
     }
 }
 
@@ -353,6 +398,108 @@ fn post_switch() {
     // `_freed_stack` drops here, outside the scheduler lock.
 }
 
+/// Create a thread in the *current* task's address space: another schedulable
+/// task sharing every page and every capability, starting at EL0 `entry` with
+/// `arg` in `x0`, on `stack_pages` of fresh anonymous memory, with `tls` as its
+/// thread pointer. Returns the new task's id, or a negative [`KError`].
+///
+/// Backs the `SpawnThread` syscall, and is what `Spawn` is not: `Spawn` builds a
+/// whole new address space from the init image, which is a *process*. A C runtime
+/// needs the other thing — several threads over one heap — and cannot be built out
+/// of processes, because the whole point is that they share memory.
+///
+/// Three things differ between a thread and its creator, and each is a place this
+/// could go wrong:
+///
+/// - **The user stack.** Shared pages mean a shared stack region, and two threads
+///   growing one stack write through each other. So a thread's stack is ordinary
+///   anonymous memory — allocated here, fixed-size, with no demand growth.
+/// - **The thread pointer.** `tls` rides in the saved context (see
+///   [`CpuContext::set_tls`]), because it must change on every switch.
+/// - **The capability table.** The thread gets a *copy* of its creator's. Not a
+///   share: the tables are per-task arrays, and making them shared is a larger
+///   change than this needs. The consequence is honest and worth knowing — a
+///   capability minted *after* the thread starts is not visible to it.
+pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
+    let cpu = me();
+    let (cur, mut space, caps) = {
+        let sched = SCHED.lock();
+        let cur = sched.current[cpu];
+        match sched.tasks[cur].space {
+            Some(s) => (cur, s, sched.tasks[cur].caps.clone()),
+            None => return KError::InvalidArgument.as_raw(),
+        }
+    };
+
+    // The thread's stack, out of the creator's heap region. Taken before the
+    // scheduler lock, like every other allocation on this path.
+    // SAFETY: at EL1 with this (active) space's tables reachable through the linear
+    // map; `map_anon` only adds pages.
+    let Some(stack_base) = crate::mem::with(|frames| unsafe { space.map_anon(frames, stack_pages) })
+    else {
+        return KError::OutOfResources.as_raw();
+    };
+    // Persist the bumped heap cursor: the pages are the creator's space's now.
+    SCHED.lock().tasks[cur].space = Some(space);
+    // Stacks grow down, and AArch64 requires a 16-byte aligned `sp`.
+    // Stacks grow down, and AArch64 requires a 16-byte aligned `sp`.
+    //
+    // Worth knowing what the demo can and cannot catch here: pointing `sp` at the
+    // *bottom* of the run instead of the top was falsified and passed. The reason
+    // is the heap's own layout — anonymous pages are handed out consecutively, so
+    // the page below a thread's stack is the creator's own memory rather than a
+    // hole, and pushing into it corrupts quietly instead of faulting. A guard page
+    // between heap allocations would make it observable; there is none today, and
+    // saying so is more use than a check that cannot fail.
+    let user_sp = (stack_base + stack_pages * PAGE_SIZE as u64) & !0xf;
+
+    let Some(kstack) = alloc_stack() else {
+        return KError::OutOfResources.as_raw();
+    };
+    let mut ctx = CpuContext::empty();
+    ctx.init(crate::user_thread_entry, stack_top(&kstack));
+    ctx.set_tls(tls);
+    let Some(task) = try_box(Task {
+        ctx,
+        stack: kstack,
+        state: State::Ready,
+        id: 0,
+        ttbr0: space.ttbr0(),
+        // The same space value, not a new one: `AddressSpace` is a handle, and two
+        // tasks holding it is exactly what a thread is. Teardown is what has to
+        // change, and does — see `exit`.
+        space: Some(space),
+        caps,
+        user_start: Some((entry, user_sp, arg)),
+        mailbox: None,
+        wake_pending: false,
+        on_cpu: AtomicBool::new(false),
+    }) else {
+        return KError::OutOfResources.as_raw();
+    };
+
+    let mut sched = SCHED.lock();
+    if sched.tasks.try_reserve(1).is_err() {
+        return KError::OutOfResources.as_raw();
+    }
+    let mut task = task;
+    let id = sched.tasks.len() as u64;
+    task.id = id;
+    sched.tasks.push(task);
+    drop(sched);
+    crate::smp::wake_others();
+    id as isize
+}
+
+/// Where the current task should enter EL0: `(entry, stack top, argument)` for a
+/// thread, or `None` for a process (which starts at its ELF entry on the address
+/// space's own stack).
+#[must_use]
+pub fn current_user_start() -> Option<(u64, u64, u64)> {
+    let sched = SCHED.lock();
+    sched.tasks[sched.current[me()]].user_start
+}
+
 /// Post-switch settle for a *freshly created* task: its entry trampoline calls this
 /// (with IRQs still masked, as inherited from the switching-out core) before it
 /// enables interrupts and runs the task body, so the predecessor this core switched
@@ -396,6 +543,7 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         ttbr0: space.ttbr0(),
         space: Some(space),
         caps,
+        user_start: None,
         mailbox: None,
         wake_pending: false,
         on_cpu: AtomicBool::new(false),
@@ -554,7 +702,11 @@ pub fn request_resched() {
 /// Run at the end of IRQ handling: if a reschedule was requested, do it now
 /// (after the interrupt has been EOI'd).
 pub fn on_irq_epilogue() {
-    if NEED_RESCHED.swap(false, Ordering::Relaxed) {
+    // Any interrupt is a chance to notice that a deadline has passed. Done before
+    // the switch decision so a task whose sleep just expired can be picked on this
+    // pass rather than waiting for the next interrupt.
+    let woke = wake_expired();
+    if NEED_RESCHED.swap(false, Ordering::Relaxed) || woke {
         preempt();
     }
 }
@@ -624,7 +776,25 @@ pub fn exit() -> ! {
         PREV[cpu].store(prev, Ordering::Relaxed);
         // Take the exiting task's address space so its frames can be reclaimed;
         // leaving `None` ensures it is never torn down twice.
-        dead_space = sched.tasks[prev].space.take();
+        //
+        // Unless a *thread* still lives in it. Threads share one space, so the last
+        // one out has to be the one that tears it down — destroying it while a
+        // sibling is still running would pull the page tables out from under a live
+        // task, and the fault it takes would be at some unrelated address later.
+        //
+        // The test is "does any other live task still name this `TTBR0`" rather
+        // than a reference count kept alongside. A count is a second copy of a fact
+        // the task table already holds, and the two can disagree — after a failed
+        // spawn, after a task that dies before it runs. Asking the table costs a
+        // scan of a few dozen entries under a lock we already hold, once per exit.
+        let space = sched.tasks[prev].space.take();
+        let ttbr0 = sched.tasks[prev].ttbr0;
+        let shared = sched
+            .tasks
+            .iter()
+            .enumerate()
+            .any(|(i, t)| i != prev && t.state != State::Dead && t.ttbr0 == ttbr0);
+        dead_space = if shared { None } else { space };
         prev_ptr = &mut sched.tasks[prev].ctx;
         match sched.pick_next(prev) {
             Some(next) => {
@@ -711,11 +881,11 @@ pub fn live_spaces() -> usize {
     sched.tasks.iter().filter(|t| t.space.is_some()).count()
 }
 
-/// Mark the current task `Blocked` and switch away, resuming here when it is made
-/// `Ready` again and next scheduled. The caller must already have arranged for
-/// something to wake it (an endpoint wait queue). Runs in an IRQ-masked critical
-/// section around the switch.
-fn park_and_switch() {
+/// Park the current task in `parked` and switch away, resuming here when it is
+/// made `Ready` again and next scheduled. The caller must already have arranged
+/// for something to wake it — a wait queue for [`State::Blocked`], the clock for
+/// [`State::Sleeping`]. Runs in an IRQ-masked critical section around the switch.
+fn park_and_switch(parked: State) {
     // SAFETY: on entry we are in a syscall handler with IRQs already masked;
     // save/restore keeps that honest across the switch.
     let saved = unsafe { exceptions::irq_save() };
@@ -738,7 +908,7 @@ fn park_and_switch() {
             unsafe { exceptions::irq_restore(saved) };
             return;
         }
-        sched.tasks[prev].state = State::Blocked;
+        sched.tasks[prev].state = parked;
         // Hand `prev` to our successor to release once the switch has saved its
         // context. Crucially, an `unblock` may flip `prev` back to `Ready` the
         // instant we drop this lock — before the switch below saves it — but its
@@ -780,7 +950,7 @@ fn park_and_switch() {
 /// message. Called from the `Recv` path when no message is buffered.
 #[must_use]
 pub fn block_for_message() -> KMessage {
-    park_and_switch();
+    park_and_switch(State::Blocked);
     // Resumed: our mailbox holds the message a sender delivered.
     let mut sched = SCHED.lock();
     let me = sched.current[me()];
@@ -790,7 +960,166 @@ pub fn block_for_message() -> KMessage {
 /// Block the current task until a peer unblocks it. Called from the `Send` path
 /// when the endpoint ring is full; the receiver that drains it wakes us.
 pub fn block_current() {
-    park_and_switch();
+    park_and_switch(State::Blocked);
+}
+
+/// Park the current task until a peer unblocks it, or — if `deadline_ns` is given
+/// — until the monotonic clock reaches that deadline, whichever comes first.
+///
+/// The two wake-ups are deliberately the *same* mechanism seen from two sides: a
+/// waiting task is `Sleeping { until_ns }` when it has a deadline, so
+/// [`wake_expired`] can free it on time, and [`unblock`] treats `Sleeping` exactly
+/// as it treats `Blocked` so a peer's signal frees it early. Having one state
+/// rather than a "blocked with a timer" pair is what keeps the two paths from
+/// racing over who owns the task.
+pub fn block_until(deadline_ns: Option<u64>) {
+    match deadline_ns {
+        Some(deadline) => {
+            if let Some(now) = timer::monotonic_ns() {
+                if deadline <= now {
+                    return;
+                }
+                arm_for_deadline(deadline - now);
+            }
+            park_and_switch(State::Sleeping { until_ns: deadline });
+        }
+        None => park_and_switch(State::Blocked),
+    }
+}
+
+/// The monotonic clock, or 0 on a machine that has none.
+///
+/// Zero is the right answer for the callers this exists for — deadline
+/// comparisons — because a machine with no clock cannot honour a deadline anyway,
+/// and a clock frozen at zero makes every deadline lie in the future rather than
+/// silently in the past. Anything that needs to *distinguish* "no clock" uses
+/// `timer::monotonic_ns` directly, as `ClockNow` does.
+#[must_use]
+pub fn clock_now() -> u64 {
+    timer::monotonic_ns().unwrap_or(0)
+}
+
+/// Park the current task until the monotonic clock reaches `deadline_ns`. Backs
+/// the `SleepUntil` syscall. Returns 0 once the deadline has passed, or a negative
+/// [`KError`] if this machine has no clock to sleep against.
+///
+/// **The deadline is absolute, and that is the point.** A relative sleep ("wake me
+/// in 16 ms") drifts: the time between waking and asking again is not counted, so
+/// a loop pacing itself at 60 Hz runs slower than 60 Hz by however long its own
+/// work takes, and the error accumulates. An absolute deadline is also immune to
+/// the race a relative one has — being preempted between computing a duration and
+/// asking to sleep makes the sleep longer than intended, and there is no way for
+/// the caller to notice.
+///
+/// A deadline already in the past returns **immediately** without parking. That is
+/// what makes this usable as the timeout half of an event loop: a caller that is
+/// already late must not be put to sleep for a whole scheduling round.
+pub fn sleep_until(deadline_ns: u64) -> isize {
+    let Some(now) = timer::monotonic_ns() else {
+        return KError::NotSupported.as_raw();
+    };
+    if deadline_ns <= now {
+        SLEEPS_ALREADY_PAST.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
+    // Point this core's timer at the deadline *before* parking. Without it the
+    // task would still wake — on the next periodic tick — but no sooner, so every
+    // sleep would round up to the tick period. That is the difference between a
+    // 16 ms frame deadline and a 100 ms one.
+    arm_for_deadline(deadline_ns - now);
+    SLEEPS.fetch_add(1, Ordering::Relaxed);
+    park_and_switch(State::Sleeping { until_ns: deadline_ns });
+    0
+}
+
+/// Program this core's timer to fire in at most `nanos` from now, and never later
+/// than the ordinary tick period.
+///
+/// **Redundant with `irq::next_interval`, and measurably so.** Breaking either one
+/// alone leaves the sleep resolution intact — the tick handler re-aims for the
+/// nearest deadline anyway, so a task that parked without this would still be woken
+/// within a tick of asking. What this buys is the *first* window: the stretch
+/// between parking and the next tick, which is up to a full period long and is
+/// exactly where a short sleep lives. Both were falsified; only breaking both moved
+/// the measured overshoot (13 ms to 72 ms).
+///
+/// Clamped below so a deadline that is nearly upon us cannot ask for an interval
+/// the machine spends its whole time servicing: at a 62.5 MHz counter a single
+/// tick is 16 ns, and arming that would re-enter the handler before it returned.
+fn arm_for_deadline(nanos: u64) {
+    /// Floor on any programmed interval. Long enough that the interrupt is taken,
+    /// dispatched and returned from with room to spare; short enough to be
+    /// invisible to anything a user task can perceive.
+    const MIN_NANOS: u64 = 50_000; // 50 us
+    let Some(ticks) = timer::ticks_from_nanos(nanos.max(MIN_NANOS)) else {
+        return;
+    };
+    let interval = ticks.min(crate::irq::tick_interval());
+    // SAFETY: at EL1 with the timer routed through the GIC; arming it again is
+    // what every tick already does.
+    unsafe { timer::GenericTimer::arm(interval) };
+}
+
+/// Make every sleeping task whose deadline has passed `Ready` again. Returns
+/// `true` if any woke, so the caller can request a reschedule.
+///
+/// Called from the IRQ epilogue: any interrupt is an opportunity to notice that
+/// time has passed, and the timer — whose interval [`arm_for_deadline`] shortens
+/// to reach the nearest deadline — guarantees one arrives when it should.
+pub fn wake_expired() -> bool {
+    let Some(now) = timer::monotonic_ns() else {
+        return false;
+    };
+    let mut sched = SCHED.lock();
+    let mut woke = false;
+    for task in &mut sched.tasks {
+        if let State::Sleeping { until_ns } = task.state {
+            if until_ns <= now {
+                task.state = State::Ready;
+                woke = true;
+                // How late the wake-up was. This is the sleep *resolution*, and it
+                // is the only number that says whether re-aiming the timer works:
+                // without it every sleep would be late by up to a tick period, and
+                // nothing else in the log would look any different.
+                let late = now - until_ns;
+                LATEST_WAKE_NS.fetch_max(late, Ordering::Relaxed);
+            }
+        }
+    }
+    if woke {
+        WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    }
+    woke
+}
+
+/// The earliest deadline any sleeping task is waiting for, if any is asleep. Read
+/// by the timer tick so it can re-arm for that deadline instead of the full tick
+/// period.
+#[must_use]
+pub fn next_wake_ns() -> Option<u64> {
+    SCHED.lock().next_wake()
+}
+
+/// Sleeps that actually parked, sleeps whose deadline had already passed, and
+/// wake-ups performed. All three are the claim: zero parks would mean the demo
+/// never slept, and zero already-past would mean the "do not sleep if late" path
+/// was never taken.
+static SLEEPS: AtomicU64 = AtomicU64::new(0);
+static SLEEPS_ALREADY_PAST: AtomicU64 = AtomicU64::new(0);
+static WAKEUPS: AtomicU64 = AtomicU64::new(0);
+/// The worst overshoot any sleeper saw: how long after its deadline it was made
+/// runnable. The sleep resolution, measured rather than assumed.
+static LATEST_WAKE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `(parked, already past, wake-ups, worst overshoot in ns)` — see [`SLEEPS`].
+#[must_use]
+pub fn sleep_counts() -> (u64, u64, u64, u64) {
+    (
+        SLEEPS.load(Ordering::Relaxed),
+        SLEEPS_ALREADY_PAST.load(Ordering::Relaxed),
+        WAKEUPS.load(Ordering::Relaxed),
+        LATEST_WAKE_NS.load(Ordering::Relaxed),
+    )
 }
 
 /// Make a blocked task runnable again without switching to it. The caller keeps
@@ -802,7 +1131,15 @@ pub fn block_current() {
 pub fn unblock(task: usize) {
     {
         let mut sched = SCHED.lock();
-        if sched.tasks[task].state == State::Blocked {
+        // `Sleeping` counts as parked here, not just `Blocked`: a task waiting on
+        // `WaitAny` with a timeout is sleeping against its deadline *and* standing
+        // in wait queues, and a signal must free it early. A task that is merely
+        // sleeping (`SleepUntil`) is in no queue, so nothing signals it — the two
+        // cannot be confused by accident.
+        if matches!(
+            sched.tasks[task].state,
+            State::Blocked | State::Sleeping { .. }
+        ) {
             sched.tasks[task].state = State::Ready;
         } else {
             sched.tasks[task].wake_pending = true;
@@ -939,9 +1276,10 @@ pub fn current_range_ok(ptr: u64, len: usize, write: bool) -> bool {
     unsafe { space.user_range_ok(ptr, len, write) }
 }
 
-/// Map a fresh anonymous read/write page into the *current* task's address space
-/// and return its user virtual address (or a negative [`KError`] if the caller is
-/// not a user task or its memory cannot grow). Backs the `MapAnon` syscall.
+/// Map `pages` fresh anonymous read/write pages into the *current* task's address
+/// space and return the user virtual address of the first (or a negative
+/// [`KError`] if the caller is not a user task or its memory cannot grow). Backs
+/// the `MapAnon` syscall.
 ///
 /// The scheduler lock is taken only to *copy the space out* and later to *write
 /// the bumped cursor back*, not held across the mapping itself. That matters on
@@ -952,7 +1290,7 @@ pub fn current_range_ok(ptr: u64, len: usize, write: bool) -> bool {
 /// space is touched only by that task, and a task runs on one core at a time, so
 /// nothing else races the copy; the frame lock inside `map_anon` still serialises
 /// the allocation itself.
-pub fn map_anon_current() -> isize {
+pub fn map_anon_current(pages: u64) -> isize {
     let cpu = me();
     let (cur, mut space) = {
         let sched = SCHED.lock();
@@ -962,14 +1300,57 @@ pub fn map_anon_current() -> isize {
             None => return KError::InvalidArgument.as_raw(),
         }
     };
-    // SAFETY: at EL1 with this (active) space's tables reachable through the
-    // linear map and the frame pool mapped writable; `map_anon` only adds a page,
-    // and the frame lock it takes makes the allocation atomic against other cores.
-    let va = crate::mem::with(|frames| unsafe { space.map_anon(frames) });
+    // Done in chunks, with interrupts let through between them. A syscall runs with
+    // IRQs masked from the moment the exception is taken until it returns, so a
+    // single call that mapped 1024 pages — a page zeroed and a TLB entry
+    // invalidated each — held off the timer for the whole of it. Nothing was lost
+    // by that, but nothing could be *scheduled* either: preemption stopped, and a
+    // task sleeping on a 20 ms deadline could not be woken until this call
+    // finished. That is exactly the latency an event loop cannot have, and it was
+    // invisible until `SleepUntil` existed to measure it.
+    //
+    // The chunk size is the trade: small enough that the masked stretch stays
+    // short, large enough that the window costs little. Measured on the QEMU
+    // `virt` demo, worst sleep overshoot against a 20 ms deadline: 708 ms with no
+    // chunking at all, 42 ms at 64 pages, 13 ms at 16. The demo's runtime did not
+    // move, so the windows themselves cost nothing measurable — 16 it is.
+    const CHUNK: u64 = 16;
+    let mut first = None;
+    let mut mapped = 0;
+    while mapped < pages {
+        let chunk = CHUNK.min(pages - mapped);
+        // SAFETY: at EL1 with this (active) space's tables reachable through the
+        // linear map and the frame pool mapped writable; `map_anon` only adds
+        // pages, and the frame lock it takes makes the allocation atomic against
+        // other cores.
+        let Some(va) = crate::mem::with(|frames| unsafe { space.map_anon(frames, chunk) }) else {
+            break;
+        };
+        first.get_or_insert(va);
+        mapped += chunk;
+        if mapped < pages {
+            // Open a window. Any pending interrupt is taken here — which may
+            // reschedule this core and resume us later. That is safe because
+            // `space` is a *copy*: only this task touches its own heap cursor, and
+            // it is running on this core, mid-syscall, until this returns.
+            // SAFETY: at EL1 with vectors and the GIC up; the mask is restored
+            // immediately, so the caller's masked section resumes unchanged.
+            unsafe {
+                exceptions::enable_irqs();
+                exceptions::disable_irqs();
+            }
+        }
+    }
     // Persist the bumped heap cursor. The task cannot have run elsewhere in the
     // meantime (it is mid-syscall on this core), so no update is lost.
     SCHED.lock().tasks[cur].space = Some(space);
-    va.map_or(KError::OutOfResources.as_raw(), |v| v as isize)
+    // A partial run is a failure, even though the pages it did map stay mapped and
+    // are reclaimed at teardown: handing back an address for a run shorter than
+    // asked would be read as the whole thing.
+    match first {
+        Some(va) if mapped == pages => va as isize,
+        _ => KError::OutOfResources.as_raw(),
+    }
 }
 
 /// Try to satisfy a fault at `far` by growing the current task's stack.

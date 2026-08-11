@@ -13,7 +13,9 @@ tree instead of hard-coded addresses, TTBR1 split with 4 KiB page tables, GICv2
 **and** GICv3, PSCI + SMP, a preemptive scheduler, EL0 isolation, capabilities
 with revocation, synchronous IPC, shared memory, an ELF loader, drivers and
 interrupt handling in **user space**, an SMMUv3 enforced against a real bus
-master, an initramfs, and a framebuffer console.
+master, an initramfs, a framebuffer console, a monotonic clock user space can read
+and sleep against, waiting on a set of sources with a deadline, and threads inside
+one address space.
 
 ## Layout
 
@@ -74,7 +76,7 @@ intrinsics); prefer them over a bare `cargo build`.
 cargo kbuild                 # build the kernel ELF for aarch64
 cargo krun                   # build + boot it in QEMU
 cargo kclippy                # clippy across the workspace
-cargo ktest-host             # portable-crate unit tests on the host (82 tests)
+cargo ktest-host             # portable-crate unit tests on the host (111 tests)
 ./scripts/smoke-test.sh      # boot the whole matrix and assert on the output
 ./scripts/smoke-test.sh --quick   # same, minus the slow 8-core run
 ```
@@ -93,11 +95,18 @@ device tree at 0x48000000 (1048576 bytes): linux,dummy-virt
   console: pl011 at 0x9000000 (+0x1000) — this console, found not assumed
 MMU enabled: true (kernel in TTBR1 at 0xffff000000000000; ...)
 framebuffer: ramfb 640x480 online (mirroring the console to the screen)
+clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
+clock: one tick interval (6250000 counter ticks) measured 101030 us against an expected 100000 us (agrees with the tick interval)
 smp: 4 core(s) online (PSCI v1.1)
 smp: 4 cores x 20000 locked increments = 80000 (expected 80000) — no increments lost
 [fault] task 3 killed: EL0 fault at 0x40000000 (ec 0x24) — isolated, kernel continues
 [devicemgr] parsed the device tree in user space: PL011 @ 0x9000000 intid 33
 [devicemgr] delegated UART device+irq to the driver and a device to the server
+[client] monotonic clock: two ClockNow reads from EL0, the second strictly later - no capability needed
+[client] SleepUntil: woke no earlier than its 20 ms absolute deadline
+[client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, ...
+[client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
+sleep: 2 task-sleep(s) parked, 1 deadline(s) already past, 3 clock wake-up(s), worst overshoot 2889 us
 [child] hello - I was created at runtime, not by the kernel
 ```
 
@@ -105,14 +114,16 @@ smp: 4 cores x 20000 locked increments = 80000 (expected 80000) — no increment
 
 Two layers, deliberately different in kind:
 
-- **`cargo ktest-host`** — 82 tests over the portable crates (`abi`, `cpio`,
-  `fdt`, `framebuffer`, `videocore`, `iommu`, `mm`, `ipc`, `init`), including
-  `fdt` against real `.dtb` blobs and `cpio` against a real archive. Fast, and
-  they cover the code whose bugs are silent.
+- **`cargo ktest-host`** — 113 tests over the portable crates (`abi`, `hal`,
+  `cpio`, `fdt`, `framebuffer`, `videocore`, `iommu`, `mm`, `ipc`, `init`),
+  including `fdt` against real `.dtb` blobs, `cpio` against a real archive, and
+  `hal`'s tick↔nanosecond arithmetic against the frequencies real machines report.
+  Fast, and they cover the code whose bugs are silent.
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **54 assertions, exit=0** on `--quick`.
+  failure signals. Currently **137 assertions, exit=0** on `--quick` (157 on the
+  full matrix).
 
 ## Status
 
@@ -123,6 +134,12 @@ framebuffer console, VideoCore mailbox, GICv2, PSCI/SMP). What remains there
 needs the board, not more code: `./scripts/pi5-sdcard.sh <mounted-boot-part>`
 stages a card, and [`docs/PI5-BRINGUP.md`](docs/PI5-BRINGUP.md) is the checklist
 — what to verify before the first boot, and how to read each failure mode.
+
+The graphical stack is planned separately, in
+[`docs/ROADMAP-QML.md`](docs/ROADMAP-QML.md): what a QML UI actually demands of a
+microkernel, which of those pieces already exist here, and the ABI gaps (monotonic
+time, multiplexed waiting, threads inside one address space) that block a Qt event
+loop long before any Qt code enters the tree.
 
 Design rationale, the SMP/IPC/IOMMU write-ups, and an honest "not yet
 implemented" list live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

@@ -12,8 +12,9 @@ use staros_abi::error::KError;
 use staros_abi::syscall::Syscall;
 use staros_abi::Handle;
 use staros_arch_aarch64::exceptions::SyscallRequest;
+use staros_arch_aarch64::timer;
 use staros_ipc::Message;
-use staros_mm::{FrameAllocator, PAGE_SIZE};
+use staros_mm::PAGE_SIZE;
 
 use crate::cap::Cap;
 use crate::ipc::KMessage;
@@ -218,18 +219,63 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
 
         // Block until the notification named by `x0` is signalled (consuming one
         // pending signal). This is how a driver sleeps until its device fires.
-        Some(Syscall::Wait) => {
-            let id = match sched::resolve_cap(req.args[0] as u32) {
-                Some(Cap::Notification { obj }) => match obj::get(obj) {
-                    Some(Object::Notification { id }) => id,
-                    _ => return KError::BadHandle.as_raw(),
-                },
-                Some(_) => return KError::PermissionDenied.as_raw(),
-                None => return KError::BadHandle.as_raw(),
+        Some(Syscall::Wait) => match resolve_notification(req.args[0] as u32) {
+            Ok(id) => {
+                notify::wait(id);
+                0
+            }
+            Err(e) => e.as_raw(),
+        },
+
+        // Create a notification of the caller's own and return its capability
+        // handle. Bound to no hardware — this is how user space wakes user space.
+        Some(Syscall::NotifyCreate) => {
+            let Some(notif_id) = notify::create() else {
+                return KError::OutOfResources.as_raw();
             };
-            notify::wait(id);
-            0
+            let Some(obj_ref) = obj::create(Object::Notification { id: notif_id }) else {
+                return KError::OutOfResources.as_raw();
+            };
+            match sched::install_cap_current(Cap::Notification { obj: obj_ref }) {
+                Some(handle) => handle as isize,
+                None => {
+                    obj::revoke(obj_ref);
+                    KError::OutOfResources.as_raw()
+                }
+            }
         }
+
+        // Signal the notification named by `x0`. Holding the capability is the
+        // whole authority: a task can only wake what it was given.
+        Some(Syscall::NotifySignal) => match resolve_notification(req.args[0] as u32) {
+            Ok(id) => {
+                notify::signal(id);
+                0
+            }
+            Err(e) => e.as_raw(),
+        },
+
+        // Create a thread in the caller's own address space: `x0` = EL0 entry,
+        // `x1` = stack pages, `x2` = thread pointer, `x3` = argument. No
+        // capability: a task may always divide its own time and its own memory,
+        // exactly as `MapAnon` lets it grow that memory.
+        Some(Syscall::SpawnThread) => {
+            /// A thread's stack is fixed-size (no demand growth outside the address
+            /// space's own stack region), so the ceiling is what a thread may claim
+            /// up front rather than what it may ever use. 64 pages is 256 KiB — the
+            /// same limit the main stack grows to.
+            const MAX_THREAD_STACK_PAGES: u64 = 64;
+            let pages = req.args[1];
+            if pages == 0 || pages > MAX_THREAD_STACK_PAGES {
+                return KError::InvalidArgument.as_raw();
+            }
+            sched::spawn_thread(req.args[0], pages, req.args[2], req.args[3])
+        }
+
+        // Wait for the first of `x1` notifications (handles at `x0`) to fire, or
+        // until the absolute deadline in `x2`. Returns the index of whichever
+        // fired, or `WouldBlock` on timeout.
+        Some(Syscall::WaitAny) => wait_any(req.args[0], req.args[1] as usize, req.args[2]),
 
         // Acknowledge the interrupt named by `x0`: re-enable the line now the
         // driver has serviced the device. Undoes the mask the forwarding path set.
@@ -242,9 +288,51 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             0
         }
 
-        // Grow the caller's memory: map one fresh zero page and return its VA.
-        // No capability needed — a task may always allocate its own memory.
-        Some(Syscall::MapAnon) => sched::map_anon_current(),
+        // Read the monotonic clock: nanoseconds since the kernel started counting.
+        // No capability, exactly like `MapAnon` needs none — time is not a
+        // privilege, and a task with no way to measure elapsed time can neither
+        // animate nor time out nor profile itself.
+        //
+        // The width is deliberate. Nanoseconds in an `isize` stay positive (and
+        // therefore stay distinguishable from an error code) for 292 years of
+        // uptime, and the value is measured from the kernel's own start rather
+        // than from whatever the firmware had already counted — so it begins near
+        // zero on every boot and the headroom is real rather than nominal.
+        Some(Syscall::ClockNow) => match timer::monotonic_ns() {
+            Some(ns) => ns as isize,
+            // Only reachable on a machine that never declared `CNTFRQ_EL0`. The
+            // honest answer is "this machine has no clock", not a plausible zero:
+            // a caller that gets zero twice concludes no time passed, while one
+            // that gets an error knows not to ask again.
+            None => KError::NotSupported.as_raw(),
+        },
+
+        // Park the caller until the monotonic clock reaches `x0`. No capability:
+        // giving up the CPU until a time is no more a privilege than reading the
+        // clock. The policy — absolute deadline, no parking if already late — lives
+        // in `sched::sleep_until`.
+        Some(Syscall::SleepUntil) => sched::sleep_until(req.args[0]),
+
+        // Grow the caller's memory: map `x0` fresh zero pages, contiguous in
+        // virtual address space, and return the VA of the first. No capability
+        // needed — a task may always allocate its own memory.
+        //
+        // Zero is rejected rather than quietly meaning one. A count of zero is
+        // always a caller's arithmetic going wrong (a length that underflowed, a
+        // loop that should not have run), and answering it with a page hides that
+        // at the exact moment it could still be caught.
+        Some(Syscall::MapAnon) => {
+            // A ceiling, so one call cannot take the whole pool in a single step
+            // and starve every other task before the allocator can say no. Large
+            // enough that a C heap grows in useful bites: 4 MiB per call turns the
+            // 4096 syscalls that 16 MiB used to cost into eight.
+            const MAX_ANON_PAGES: u64 = 1024;
+            let pages = req.args[0];
+            if pages == 0 || pages > MAX_ANON_PAGES {
+                return KError::InvalidArgument.as_raw();
+            }
+            sched::map_anon_current(pages)
+        }
 
         // Create a child EL0 process from the init image, seeded with the id in
         // `x0`. User space builds its own process tree instead of the kernel
@@ -281,10 +369,10 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             grant(Object::Interrupt { intid: req.args[1] as u32 }, |obj| Cap::Irq { obj })
         }
 
-        // Create a shared-memory buffer: allocate one zeroed frame, wrap it in a
-        // shared object, and hand the caller a shared capability. No authority —
+        // Create a shared-memory buffer: allocate `x0` zeroed frames, wrap them in
+        // a shared object, and hand the caller a shared capability. No authority —
         // any task may make memory to share, as any task may grow its own.
-        Some(Syscall::CreateShared) => create_shared(),
+        Some(Syscall::CreateShared) => create_shared(req.args[0] as usize),
 
         // Map a shared buffer (`x0` = shared capability handle) into the caller,
         // read/write, and return its VA. Both holders of the capability map the
@@ -325,31 +413,50 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
     }
 }
 
-/// Allocate one zeroed frame, make a shared-memory object from it, and install a
-/// shared capability for it into the caller's table. Returns the handle, or
-/// `OutOfResources` if the frame pool or heap is exhausted (unwinding whatever it
-/// already took so nothing leaks).
-fn create_shared() -> isize {
-    let Some(phys) = crate::mem::alloc_frame() else {
+/// Allocate `pages` zeroed frames, make a shared-memory object from them, and
+/// install a shared capability for it into the caller's table. Returns the handle,
+/// or an error if the request is out of range or memory is exhausted (unwinding
+/// whatever it already took so nothing leaks).
+///
+/// The run is physically contiguous, like a DMA buffer and unlike anonymous
+/// memory — but for a different reason. Nothing here has to be contiguous for the
+/// *hardware*; it has to be contiguous because a shared object is described by one
+/// `(phys, pages)` pair and mapped into each holder from that description. A
+/// scattered buffer would need the object to carry a frame list, which is a
+/// bigger change than this pays for. The visible consequence is the ceiling below:
+/// contiguous allocation rounds up to a power of two, so a large request can fail
+/// on merely fragmented memory.
+fn create_shared(pages: usize) -> isize {
+    /// Enough for a screenful at modest size (256 KiB) without letting one call
+    /// take a large contiguous run out of the pool.
+    const MAX_SHARED_PAGES: usize = 64;
+    // Zero is a caller's arithmetic going wrong, not a request for nothing.
+    if pages == 0 || pages > MAX_SHARED_PAGES {
+        return KError::InvalidArgument.as_raw();
+    }
+    let Some(phys) = crate::mem::with(|f| f.alloc_pages(pages)) else {
         return KError::OutOfResources.as_raw();
     };
-    // A shared page handed to two tasks must start clean, not carrying whatever a
-    // previous owner left in the frame.
-    // SAFETY: the frame is in the kernel's linear map and uniquely ours until we
-    // publish it; a full-page zeroing at its linear-map address is sound.
+    // Memory handed to two tasks must start clean, not carrying whatever a
+    // previous owner left in the frames. Every page, not just the first: the
+    // second page of a buffer is exactly where a stale secret would survive
+    // unnoticed, because nothing routinely reads it.
+    // SAFETY: the run is in the kernel's linear map and uniquely ours until we
+    // publish it; zeroing `pages` pages at its linear-map address is sound.
     unsafe {
         let va = staros_arch_aarch64::mmu::phys_to_virt(phys.0 as u64) as *mut u8;
-        core::ptr::write_bytes(va, 0, PAGE_SIZE);
+        core::ptr::write_bytes(va, 0, pages * PAGE_SIZE);
     }
-    let Some(obj_ref) = obj::create(Object::SharedMemory { phys: phys.0 as u64, pages: 1 }) else {
-        crate::mem::with(|f| f.free(phys));
+    let obj = Object::SharedMemory { phys: phys.0 as u64, pages: pages as u32 };
+    let Some(obj_ref) = obj::create(obj) else {
+        crate::mem::with(|f| f.free_pages(phys));
         return KError::OutOfResources.as_raw();
     };
     match sched::install_cap_current(Cap::Shared { obj: obj_ref }) {
         Some(handle) => handle as isize,
         None => {
             obj::revoke(obj_ref);
-            crate::mem::with(|f| f.free(phys));
+            crate::mem::with(|f| f.free_pages(phys));
             KError::OutOfResources.as_raw()
         }
     }
@@ -460,6 +567,64 @@ fn resolve_interrupt(handle: u32) -> Result<u32, KError> {
         },
         Some(_) => Err(KError::PermissionDenied),
         None => Err(KError::BadHandle),
+    }
+}
+
+/// Resolve a notification capability handle to its table id.
+fn resolve_notification(handle: u32) -> Result<usize, KError> {
+    match sched::resolve_cap(handle) {
+        Some(Cap::Notification { obj }) => match obj::get(obj) {
+            Some(Object::Notification { id }) => Ok(id),
+            _ => Err(KError::BadHandle),
+        },
+        Some(_) => Err(KError::PermissionDenied),
+        None => Err(KError::BadHandle),
+    }
+}
+
+/// The `WaitAny` syscall: resolve an array of notification handles from the
+/// caller's memory, wait for the first to fire, and return its index.
+///
+/// The handles are **copied out of user memory before anything is resolved**, and
+/// then resolved into table ids in one pass. Both halves matter: reading the array
+/// twice would let a caller change it between the check and the use, and resolving
+/// lazily inside the wait loop would mean touching user memory while parked.
+fn wait_any(ptr: u64, count: usize, deadline_ns: u64) -> isize {
+    /// Ceiling on how many sources one wait may name. Generous for an event loop's
+    /// real fan-out, and small enough to live on the kernel stack.
+    const MAX_WAIT_HANDLES: usize = 16;
+
+    if count == 0 || count > MAX_WAIT_HANDLES {
+        return KError::InvalidArgument.as_raw();
+    }
+    let bytes = count * size_of::<u32>();
+    // Handles are 4-byte values; require the array to be aligned to one, and every
+    // byte of it to be mapped EL0-readable in the caller's own tables.
+    if !ptr.is_multiple_of(size_of::<u32>() as u64) || !sched::current_range_ok(ptr, bytes, false) {
+        return KError::InvalidArgument.as_raw();
+    }
+    let mut raw = [0u8; MAX_WAIT_HANDLES * size_of::<u32>()];
+    // SAFETY: the caller's space is active and the walk above confirmed all
+    // `bytes` bytes are mapped EL0-readable; `bytes <= raw.len()`.
+    unsafe { staros_arch_aarch64::usercopy::copy_from_user(&mut raw[..bytes], ptr) };
+
+    let mut ids = [0usize; MAX_WAIT_HANDLES];
+    let (words, _) = raw[..bytes].as_chunks::<4>();
+    for (slot, chunk) in ids[..count].iter_mut().zip(words) {
+        let handle = u32::from_le_bytes(*chunk);
+        match resolve_notification(handle) {
+            Ok(id) => *slot = id,
+            Err(e) => return e.as_raw(),
+        }
+    }
+
+    // Zero means "no deadline" rather than "a deadline at time zero": a deadline of
+    // zero is always already past, so honouring it literally would turn every such
+    // call into a non-blocking poll — a plausible-looking wait that never waits.
+    let deadline = (deadline_ns != 0).then_some(deadline_ns);
+    match notify::wait_any(&ids[..count], deadline) {
+        Some(index) => index as isize,
+        None => KError::WouldBlock.as_raw(),
     }
 }
 

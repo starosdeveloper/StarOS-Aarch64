@@ -92,6 +92,38 @@ pub fn set_tick_interval(ticks: u64) {
     TICK_INTERVAL.store(ticks, Ordering::Relaxed);
 }
 
+/// The ordinary preemption interval, in counter ticks.
+#[must_use]
+pub fn tick_interval() -> u64 {
+    TICK_INTERVAL.load(Ordering::Relaxed)
+}
+
+/// How long to arm the timer for now: the ordinary tick period, or the time until
+/// the nearest sleeping task's deadline if that comes first.
+///
+/// This is the whole of the kernel's timer policy, and it is deliberately this
+/// small. Nothing here tracks *which* task the deadline belongs to or which core
+/// should serve it: any core that wakes runs [`sched::wake_expired`], which makes
+/// every expired sleeper `Ready` regardless of who was asleep. Shortening one
+/// core's interval is therefore an optimisation, never a correctness requirement —
+/// if the arithmetic below were removed entirely, sleeps would still complete, just
+/// no sooner than the next tick.
+fn next_interval() -> u64 {
+    /// Floor on the programmed interval, matching `sched::arm_for_deadline`: a
+    /// deadline that has all but arrived must not ask for an interval shorter than
+    /// the handler takes to run.
+    const MIN_NANOS: u64 = 50_000; // 50 us
+    let period = TICK_INTERVAL.load(Ordering::Relaxed);
+    let (Some(wake), Some(now)) = (sched::next_wake_ns(), timer::monotonic_ns()) else {
+        return period;
+    };
+    let remaining = wake.saturating_sub(now).max(MIN_NANOS);
+    match timer::ticks_from_nanos(remaining) {
+        Some(ticks) => ticks.min(period),
+        None => period,
+    }
+}
+
 /// Ticks counted since boot.
 #[must_use]
 pub fn tick_count() -> u64 {
@@ -123,10 +155,14 @@ pub extern "Rust" fn staros_irq_dispatch(intid: u32) {
         TICKS.fetch_add(1, Ordering::Relaxed);
         TICKS_PER_CPU[boot::cpu_id() as usize].fetch_add(1, Ordering::Relaxed);
 
-        // Re-arm for the next tick (the timer is one-shot per fire).
+        // Re-arm for the next tick (the timer is one-shot per fire) — or sooner,
+        // if a sleeping task's deadline falls before it. Without this the sleep
+        // resolution would be the tick period however precisely `SleepUntil` armed
+        // the timer on the way in: the first tick after parking would push the
+        // next one a full period out again.
         // SAFETY: at EL1 servicing the timer IRQ; reprogramming CNTP is exactly
         // what acknowledging the timer requires.
-        unsafe { GenericTimer::arm(TICK_INTERVAL.load(Ordering::Relaxed)) };
+        unsafe { GenericTimer::arm(next_interval()) };
 
         // Ask for a reschedule; the actual switch happens in the epilogue, after
         // this interrupt has been EOI'd.

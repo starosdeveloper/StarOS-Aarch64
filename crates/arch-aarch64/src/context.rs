@@ -27,7 +27,8 @@ extern "C" {
 /// Saved callee-saved CPU state for a suspended task.
 ///
 /// Layout is `#[repr(C)]` and mirrored exactly by the offsets in
-/// `__context_switch`: `regs[0..12]` are `x19`..=`x30`, followed by `sp`.
+/// `__context_switch`: `regs[0..12]` are `x19`..=`x30`, then `sp`, then
+/// `TPIDR_EL0`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct CpuContext {
@@ -35,6 +36,18 @@ pub struct CpuContext {
     regs: [u64; 12],
     /// Stack pointer.
     sp: u64,
+    /// `TPIDR_EL0` — the thread pointer EL0 reads for thread-local storage.
+    ///
+    /// It rides in the context rather than in the scheduler's `Task` because it
+    /// *is* thread state, in exactly the way `sp` is: two threads of one process
+    /// share every page and every capability, and this register is one of the few
+    /// things that must differ between them. Restoring it anywhere other than the
+    /// switch would leave a window where a thread runs with its neighbour's
+    /// thread pointer — and the symptom of that is `thread_local` variables
+    /// aliasing, which looks like memory corruption rather than a scheduling bug.
+    ///
+    /// Zero until user space sets it, which is what a program with no TLS wants.
+    tpidr_el0: u64,
 }
 
 impl CpuContext {
@@ -45,6 +58,7 @@ impl CpuContext {
         Self {
             regs: [0; 12],
             sp: 0,
+            tpidr_el0: 0,
         }
     }
 
@@ -58,6 +72,12 @@ impl CpuContext {
         self.regs[0] = entry as *const () as u64; // x19 = entry function
         self.regs[11] = __task_trampoline as *const () as u64; // x30 = trampoline
         self.sp = stack_top;
+        self.tpidr_el0 = 0;
+    }
+
+    /// Set the thread pointer this context restores on its next switch-in.
+    pub fn set_tls(&mut self, tls: u64) {
+        self.tpidr_el0 = tls;
     }
 }
 
@@ -88,6 +108,8 @@ __context_switch:
     stp     x29, x30, [x0, #80]
     mov     x2, sp
     str     x2, [x0, #96]
+    mrs     x2, tpidr_el0    // the outgoing thread's TLS pointer
+    str     x2, [x0, #104]
 
     ldp     x19, x20, [x1, #0]
     ldp     x21, x22, [x1, #16]
@@ -97,6 +119,8 @@ __context_switch:
     ldp     x29, x30, [x1, #80]
     ldr     x2, [x1, #96]
     mov     sp, x2
+    ldr     x2, [x1, #104]
+    msr     tpidr_el0, x2    // the incoming thread's TLS pointer
     ret
 
 .global __task_trampoline

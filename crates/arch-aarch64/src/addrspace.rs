@@ -278,40 +278,70 @@ impl AddressSpace {
         true
     }
 
-    /// Map one fresh, zero-filled, read/write page at the next free anonymous-heap
-    /// virtual address and return that address. Backs the `MapAnon` syscall: a
-    /// task grows its own memory at runtime. Returns `None` if the frame pool is
-    /// exhausted or the heap has reached [`USER_HEAP_END`].
+    /// Map `pages` fresh, zero-filled, read/write pages at the next free
+    /// anonymous-heap virtual addresses and return the address of the first.
+    /// Backs the `MapAnon` syscall: a task grows its own memory at runtime.
+    ///
+    /// The pages are **contiguous in virtual address space and nothing more** —
+    /// each is an independently allocated frame. That is the difference from a DMA
+    /// buffer, which must be physically contiguous because a device sees physical
+    /// addresses; a heap is read by a CPU behind an MMU and does not care. Asking
+    /// for physical contiguity here would mean a power-of-two rounding and a
+    /// failure whenever memory is merely fragmented, for no benefit at all.
+    ///
+    /// Returns `None` if `pages` is zero, if the run would leave
+    /// [`USER_HEAP_END`], or if the frame pool runs out partway. In that last case
+    /// the pages already mapped **stay mapped** and the heap cursor keeps them:
+    /// they belong to this space and are returned when the task is torn down.
+    /// Un-mapping them would be tidier and is not free — it means walking back
+    /// through the tables to hand frames back on the path where memory is already
+    /// exhausted. The caller gets an error and simply does not learn an address;
+    /// nothing leaks past the task's lifetime.
     ///
     /// # Safety
     /// Same preconditions as [`new`](AddressSpace::new). May run against the
-    /// *active* space (it only adds a previously-absent page, then flushes the
-    /// TLB), so a task can call it on itself.
-    pub unsafe fn map_anon<A: FrameAllocator>(&mut self, alloc: &mut A) -> Option<u64> {
-        let va = self.heap_next;
-        if va >= USER_HEAP_END {
+    /// *active* space (it only adds previously-absent pages, then flushes those
+    /// VAs from the TLB), so a task can call it on itself.
+    pub unsafe fn map_anon<A: FrameAllocator>(&mut self, alloc: &mut A, pages: u64) -> Option<u64> {
+        if pages == 0 {
             return None;
         }
-        // SAFETY: forwarded from this function's contract.
-        unsafe { self.map_fresh(alloc, va)? };
-        // Publish the new descriptor. Invalidate only *this* VA, not the whole
-        // TLB: a task growing its heap does this in a tight loop, and a full
-        // `tlbi vmalle1is` makes every core drop its entire TLB on each page —
-        // which serialised the machine when one task mapped thousands of pages.
-        // `vaae1is` (this VA, all ASIDs, inner-shareable) is the surgical form.
-        // SAFETY: `va >> 12` is the page number operand `TLBI VAAE1IS` expects.
-        unsafe {
-            asm!(
-                "dsb ish",
-                "tlbi vaae1is, {v}",
-                "dsb ish",
-                "isb",
-                v = in(reg) va >> 12,
-                options(nostack, preserves_flags),
-            );
+        let first = self.heap_next;
+        // Check the whole run up front, in arithmetic that cannot wrap: a request
+        // large enough to overflow the addition would otherwise "fit" and start
+        // mapping at a wrapped address.
+        let bytes = pages.checked_mul(PAGE_4K)?;
+        if first.checked_add(bytes)? > USER_HEAP_END {
+            return None;
         }
-        self.heap_next += PAGE_4K;
-        Some(va)
+        for i in 0..pages {
+            let va = first + i * PAGE_4K;
+            // SAFETY: forwarded from this function's contract.
+            if unsafe { self.map_fresh(alloc, va) }.is_none() {
+                // Out of frames partway. Keep what is mapped (see above) and
+                // report failure rather than a half-length run the caller would
+                // read as whole.
+                self.heap_next = va;
+                return None;
+            }
+            // Publish the new descriptor. Invalidate only *this* VA, not the whole
+            // TLB: a full `tlbi vmalle1is` makes every core drop its entire TLB per
+            // page, which serialised the machine when one task mapped thousands.
+            // `vaae1is` (this VA, all ASIDs, inner-shareable) is the surgical form.
+            // SAFETY: `va >> 12` is the page number operand `TLBI VAAE1IS` expects.
+            unsafe {
+                asm!(
+                    "dsb ish",
+                    "tlbi vaae1is, {v}",
+                    "dsb ish",
+                    "isb",
+                    v = in(reg) va >> 12,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        self.heap_next = first + bytes;
+        Some(first)
     }
 
     /// Load one ELF `PT_LOAD` segment into this space: back `[vaddr, vaddr +

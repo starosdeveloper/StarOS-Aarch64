@@ -77,6 +77,20 @@ req()    { if have "$LOG" "$1"; then PASS=$((PASS+1)); say "    ${G}✓${Z} $1";
 forbid() { if have "$LOG" "$1"; then FAIL=$((FAIL+1)); say "    ${R}✗ PRESENT (must be absent): $1${Z}"; FAILED_CONFIGS+=("$CURRENT");
            else PASS=$((PASS+1)); say "    ${G}✓${Z} absent: $1"; fi; }
 
+# The sleep *resolution* is deliberately not asserted anywhere, and the empty
+# space is worth a note so it is not filled back in.
+#
+# Two attempts were made. Asserting it in EL0 measured the whole park/wake/schedule
+# round trip and failed on a loaded four-core run while the wake-up itself was
+# 2.3 ms late. Asserting the kernel's own measurement — the deadline-to-`Ready` gap,
+# with no scheduling in it — failed too, on a *headless* config: the worst case
+# depends on whether the sleep landed on the longest uninterruptible stretch in the
+# kernel (zeroing 2.5 MiB of `.bss` per `Spawn`, or a framebuffer scroll), and under
+# TCG that is a lottery. The same config produced 2.9 ms and 437 ms on different
+# runs. The number is printed by the kernel and worth reading; a threshold on it
+# would be a test of the emulator's luck. What *is* asserted is the part that is
+# deterministic: EL0 never wakes before its deadline.
+
 # run <name> <timeout-seconds> -- <qemu args...>
 # Runs the image, then applies the assertions common to every machine. Config-
 # specific assertions follow the call.
@@ -115,6 +129,58 @@ run() {
     forbid "MARKER MISMATCH"
     req "stack guard: growth limit reached"
     req "page(s) mapped on demand"
+    # The monotonic clock, at both ends of the syscall boundary. The kernel holds
+    # `ClockNow`'s scale against the interval its own tick source is armed with
+    # (a mis-built scale breaks that equality and nothing else), and an EL0 task
+    # holding no capabilities at all reads the clock twice and requires the second
+    # reading to be strictly later.
+    # Multi-page allocation, at both syscalls that do it. The heap run is checked
+    # at its far end (a kernel honouring only the first page faults there instead),
+    # runs must be handed out back to back, and a zero-page request must be an
+    # error rather than a quiet page. The shared buffer's marker is written to and
+    # read from its SECOND page, so a one-page mapping kills the server instead.
+    # Sleeping against an absolute deadline, checked from both sides in EL0: waking
+    # early means the deadline was ignored, and waking only after a full 100 ms tick
+    # period means the kernel never re-aimed its timer. The final memtest line is
+    # the other half — that task sleeps last, so a scheduler that counted a sleeping
+    # task as "no work left" would end the run before it printed.
+    # Sleeping against an absolute deadline, asserted from the side that can see
+    # each half. EL0 checks only the lower bound — it must not wake early — because
+    # an upper bound measured there times the whole park/wake/schedule round trip.
+    # The kernel checks the resolution, from the gap between deadline and wake-up
+    # with no scheduling in it: at or above half a tick period means the timer was
+    # never re-aimed and the sleep just rode the next periodic tick.
+    req "[client] SleepUntil: woke no earlier than its 20 ms absolute deadline"
+    forbid "SLEEP WRONG"
+    # The resolution itself is measured by the kernel and printed, not asserted —
+    # see the note above the matrix for why a threshold on it cannot hold here.
+    # Waiting on a *set* of sources with a deadline — the primitive an event loop
+    # is built on. One line covers all three failures worth naming: the wrong
+    # index (a wait that reports the first handle rather than the one that fired),
+    # a wait that returns despite nothing signalling it, and — the race this was
+    # written for — a signal arriving after a timed-out wait, which must be counted
+    # rather than handed to a task that is no longer listening.
+    req "[client] WaitAny: index 1 of 2 from the server's notification"
+    forbid "WAITANY WRONG"
+    # A thread in the creator's own address space: it writes through a page the
+    # creator allocated (same address means the same frame — the whole difference
+    # from `Spawn`), runs with its own `TPIDR_EL0`, and its exit must NOT tear the
+    # shared space down. The last is checked by claiming 64 fresh pages afterwards
+    # and re-reading the marker: if the thread's exit had freed the space, its page
+    # tables would be back in the pool and handed straight out again.
+    req "[client] SpawnThread: a thread in this very address space"
+    forbid "THREAD WRONG"
+    # That one line covers four failures: the wrong index, a wait that returns with
+    # nothing to wake it, a signal after a timed-out wait going uncounted, and a
+    # stale registration poisoning the *next* block (which surfaces as a sleep that
+    # does not sleep — nowhere near notifications, which is why it is checked here).
+    req "grew the heap by 16 MiB in 8 calls of 1024 pages"
+    req "[memtest] MapAnon(0) refused"
+    req "[client] read the marker from the SECOND page of a 2-page shared buffer"
+    req "agrees with the tick interval"
+    forbid "CLOCK SCALE WRONG"
+    req "[client] monotonic clock: two ClockNow reads from EL0"
+    forbid "CLOCK DID NOT ADVANCE"
 }
 
 # ---------------------------------------------------------------------------
