@@ -420,6 +420,21 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             None => KError::BadHandle.as_raw(),
         },
 
+        // How big a shared buffer is, in pages (`x0` = shared capability handle).
+        // A server that receives a delegated buffer needs this to bound what it
+        // copies: the only other source for the size is the message that came with
+        // it, and a size a client can lie about is one that makes the *server*
+        // fault. Holding the capability is the whole permission — the answer
+        // describes memory the caller may already read and write in full.
+        Some(Syscall::SharedPages) => match sched::resolve_cap(req.args[0] as u32) {
+            Some(Cap::Shared { obj }) => match obj::get(obj) {
+                Some(Object::SharedMemory { pages, .. }) => pages as isize,
+                _ => KError::BadHandle.as_raw(),
+            },
+            Some(_) => KError::PermissionDenied.as_raw(),
+            None => KError::BadHandle.as_raw(),
+        },
+
         // Allocate a physically-contiguous, non-cacheable DMA buffer of `x0`
         // pages and hand the caller a DMA capability for it.
         Some(Syscall::CreateDma) => create_dma(req.args[0] as usize),

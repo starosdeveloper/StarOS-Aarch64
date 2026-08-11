@@ -207,6 +207,18 @@ pub enum Syscall {
     /// holds the capability, the range is one the kernel allocated for exactly this
     /// purpose, and with an IOMMU it is also the only range that device may reach.
     DmaPhys = 27,
+    /// How many 4 KiB pages a shared buffer holds: `arg0` = a *shared* capability
+    /// handle.
+    ///
+    /// [`MapShared`] tells the receiver of a delegated buffer *where* it landed but
+    /// not how big it is, so a server had only the sender's word for the size — and
+    /// a message is exactly what a server must not trust. Believing an inflated
+    /// length makes the **server** run off the end of the mapping and take the
+    /// fault, which is the wrong process to punish for a client's lie.
+    ///
+    /// The page count is not a secret from anyone holding the capability: it is the
+    /// size of memory that holder may already read and write in full.
+    SharedPages = 28,
 }
 
 impl Syscall {
@@ -242,6 +254,7 @@ impl Syscall {
             25 => Some(Syscall::SpawnThread),
             26 => Some(Syscall::SpawnImage),
             27 => Some(Syscall::DmaPhys),
+            28 => Some(Syscall::SharedPages),
             _ => None,
         }
     }
@@ -253,11 +266,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=27 {
+        for n in 0..=28 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(28), None);
+        assert_eq!(Syscall::from_raw(29), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

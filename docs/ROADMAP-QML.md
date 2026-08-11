@@ -882,23 +882,93 @@ frame reclaim: longest free run 128 MiB -> 128 MiB after teardown — every fram
 
 ---
 
-## Фаза G4. Файлы и ресурсы — `services/fssrv`
+## Фаза G4. Файлы и ресурсы — `services/fssrv` — **СДЕЛАНО**
 
 Qt читает `.qml`, шрифты, плагины и переводы. Часть можно вкомпилировать (`qrc`),
 но `QFile`, `QDir` и `QFileInfo` всё равно вызываются — движок проверяет пути,
 даже когда читает из ресурсов.
 
-- **`services/fssrv`** — read-only сервер поверх initramfs (`crates/cpio` уже
-  разбирает `newc`). Протокол: `Open(path) -> handle`, `Read(handle, off, len)`,
-  `Stat(path)`, `Close`.
-- Первым потребителем становится не Qt, а `staros-libc`: `open`/`read`/`fstat`/
-  `lseek`/`close` транслируются в IPC к `fssrv`. Значит слой проверяется задолго
-  до появления Qt.
+Файлы перестали быть частной памятью одного процесса. `devicemgr` умел читать
+initramfs с 2.4, но это «файловая система» ровно в том смысле, в каком ею является
+`include_bytes!`: у кого архив, тот и читает, у остальных нет ничего.
+
+- **`services/fssrv`** — read-only сервер поверх initramfs; разбирает архив тем же
+  `crates/cpio`, что и `devicemgr` (одна реализация `newc`, хост-тестируемая,
+  собирается один раз и линкуется в обе программы). Протокол: `Open(path)`,
+  `Read(handle, off, len)`, `Stat(path)`, `Close`, отказ — отдельный тег с кодом.
+  «Файла нет» и «файл пустой» — разные ответы; клиент, который их не различает,
+  однажды покажет пустой экран вместо ошибки.
+- **`services/fsclient`** — процесс с двумя endpoint-capability и одной своей
+  страницей. Ни архива, ни устройства, ни отображения. Он печатает содержимое
+  файла.
+- Массив данных ходит через **shared-буфер, который выделяет клиент** — как в
+  `displaysrv` и по той же причине: страницы клиентские, отзыв capability
+  заканчивает разговор, серверу нечего убирать за собой.
 - Запись — **не сейчас**. Read-only initramfs честно закрывает Q1 и Q2; настоящая
   ФС (UFS/SD + журнал) отложена в `ROADMAP-PIXEL` не случайно и здесь не нужна.
 
+### Дыра в ABI, которую вскрыл первый настоящий сервер: `SharedPages`
+
+`MapShared` говорит получателю делегированного буфера, **куда** тот лёг, но не
+**сколько** там места. Единственным источником размера оставалось сообщение — то
+есть число, которое выбрал клиент. Поверив ему, за чужую арифметику падает
+**сервер**, а не тот, кто соврал.
+
+Добавлен `SharedPages = 28`: сколько 4 KiB-страниц в буфере, который называет
+shared-capability. Это не раскрытие тайны — держатель capability и так может
+прочитать и записать всю эту память целиком. Теперь `fssrv` берёт границу отсюда,
+а не из запроса.
+
+*Живой лог (`cargo krun`, initramfs собирается рядом с образом):*
+
+```
+[fssrv] the files are mine: 3 of them, served over IPC to processes that hold no archive
+[fsclient] two endpoint capabilities and one page of my own memory - no archive, no device
+[fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
+[fsclient] read 'greeting.txt' through fssrv in 2 chunks: hello from the initramfs
+[fsclient] 25 of 25 bytes in 2 reads, the second one from offset 6
+[fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length
+[fsclient] asked for all 13240 bytes of 'init.elf' into a 4096-byte buffer and got 4096, with 9144 left
+[fsclient] the archive is at 0x900000000 in fssrv; touching it here must fault
+[fault] task 12 killed: EL0 fault at 0x900000000 (ec 0x24) — isolated, kernel continues
+[fssrv] served 12 requests, 4121 bytes of file data, and refused 4 - the archive never left this address space
+```
+
+Последние две строки — не украшение. Клиент в конце **намеренно** читает адрес, по
+которому архив лежит у сервера, и ядро его за это убивает. Без этого «байты пришли
+по IPC» — утверждение, которое нечем отличить от «процессу тихо отдали отображение».
+
+*Фальсификации (каждая ломалась, наблюдался названный отказ, затем возвращалась):*
+
+1. **Игнорировать `offset` в `Read`.** Строка становится `hello hello from the
+   initramfs` — вторая порция повторяет начало файла. Сервер, читающий всегда с
+   нуля, проходит любую проверку с одним чтением.
+2. **Не сверять поколение в handle.** Чтение по закрытому handle начинает
+   отвечать → `fssrv answered something it should have refused`. Без поколения
+   таблица выдаёт один и тот же номер дважды и обслуживает оба.
+3. **Верить длине чтения из запроса** (убрать `.min(buffer.len)`). `[fault] task 11
+   killed: EL0 fault at 0x500001000` — падает **сервер**, ровно на страницу за
+   буфером клиента. Это и есть смысл `SharedPages`.
+4. **Верить длине пути из запроса** (убрать `MAX_PATH`). Тот же отказ: клиент
+   присылает длину пути в мегабайт, сервер уходит за отображение и умирает.
+5. **Отдать клиенту тот же initramfs** (одна строка в `kmain`). Вместо fault
+   печатается `I READ THE ARCHIVE DIRECTLY - the file server was never needed`. То
+   есть проверка из последнего пункта действительно может провалиться.
+
+*Проверено:* 123 хост-теста, `kclippy -D warnings` чисто, smoke-матрица —
+**222 ассерта на 7 машинах, exit=0** (195 на `--quick`), `fb-check.sh` и
+`input-check.sh` PASS. Прогон **без** архива тоже проверен: сервер поднимается с
+пустым архивом и отвечает `no such file`, а не оставляет клиента висеть в `Recv`
+навсегда.
+
+*Что осталось недоказанным:* один клиент, а не несколько. Каждый делегированный
+буфер занимает у сервера слот в таблице capability, и **syscall «закрыть handle»
+в ABI нет** — есть только глобальный `Revoke`, который отзывает объект у всех
+сразу. Для демо из десятка запросов это неважно; настоящему серверу нужен
+`Close`/`Drop` на capability, и это отдельная маленькая работа перед G5.
+
 *Критерий:* EL0-программа печатает содержимое файла из initramfs, полученного
-только по IPC, без единого capability на устройство.
+только по IPC, без единого capability на устройство. **Выполнен.**
 
 ---
 
@@ -1127,13 +1197,13 @@ Qt взял время откуда-то ещё, и вы не знаете от�
 ```
 [Решение] движок (A/B/C) + sysroot-стратегия   ← можно отложить до G5, не дальше
         │
-   [G1] displaysrv: экран уезжает из ядра в EL0
+   [G1] displaysrv: экран уезжает из ядра в EL0            ✔ СДЕЛАНО
         │
-   [G2] virtio-input: ввод в QEMU   ──┐
+   [G2] virtio-input: ввод в QEMU   ──┐                    ✔ СДЕЛАНО
         │                            │  (независимы, можно параллельно)
-   [G3] пробелы ABI ─────────────────┘   ← ClockNow, WaitAny, SpawnThread: блокеры
+   [G3] пробелы ABI ─────────────────┘  ✔ СДЕЛАНО  ← ClockNow, WaitAny, SpawnThread
         │
-   [G4] fssrv поверх initramfs
+   [G4] fssrv поверх initramfs                            ✔ СДЕЛАНО
         │
    [G5] staros-libc + libc++   ← САМАЯ ДОРОГАЯ ФАЗА; чекпойнт: C++ hello с потоками
         │      └─ G5.0 gdbstub + раскрутка стека по x29 — ДО фазы, не после

@@ -56,8 +56,10 @@ board `unsafe`.
 | `services/devicemgr` | Device manager: parses the DTB **in user space**, mints device/IRQ capabilities from an authority cap, delegates them to drivers over IPC |
 | `services/displaysrv` | Display server: owns the framebuffer, composites client surfaces delivered as shared-memory capabilities |
 | `services/inputsrv` | virtio-input driver: virtqueue, interrupt and event decoding, all in EL0 |
+| `services/fssrv` | File server: owns the initramfs, answers `Open`/`Read`/`Stat`/`Close` over IPC through a client-supplied shared buffer |
+| `services/fsclient` | A process with no archive and no device, reading a file anyway — the only way "these bytes arrived over IPC" means anything |
 
-All four EL0 programs are built by `crates/kernel/build.rs` and embedded in the
+All six EL0 programs are built by `crates/kernel/build.rs` and embedded in the
 kernel image; there is no separate build step.
 
 ## Prerequisites
@@ -115,14 +117,14 @@ device tree at 0x48200000 (1048576 bytes): linux,dummy-virt
 exception vectors installed (VBAR_EL1)
 privileged access never (PAN): not implemented on this CPU
 MMU enabled: true (kernel in TTBR1 at 0xffff000000000000; RAM 0x40000000..0x50000000 Normal in the linear map; 44-bit PA per ID_AA64MMFR0_EL1)
-memory: 256 MiB RAM, 126 MiB usable, heap 1280 KiB @ 0x401a5000, 125 MiB of frames @ 0x402e5000
+memory: 256 MiB RAM, 126 MiB usable, heap 1280 KiB @ 0x401ad000, 125 MiB of frames @ 0x402ed000
 kernel heap: Vec of 8 squares (last 64) sums to 204 — global allocator live
 dynamic tables: 64 objects (old max 8), 64 caps in one task (old max 4), 64 notifications (old max 4) — all grew past the old fixed limits
 framebuffer: ramfb 640x480 online (mirroring the console to the screen)
 syscall Yield -> 0; syscall 0xdead -> -6
 clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
 interrupt controller: GICv2 online
-clock: one tick interval (6250000 counter ticks) measured 100995 us against an expected 100000 us (agrees with the tick interval)
+clock: one tick interval (6250000 counter ticks) measured 101187 us against an expected 100000 us (agrees with the tick interval)
 smp: 1 core(s) online (PSCI v1.1)
 smp: 1 cores x 20000 locked increments = 20000 (expected 20000) — no increments lost
 smp: single core — no inter-processor interrupt to send
@@ -137,8 +139,11 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [devicemgr] unpacked the initramfs in user space: 3 files, no storage driver
 [devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
 [displaysrv] the screen is mine: kernel output stopped, pixels are a process's now
+[fssrv] the files are mine: 3 of them, served over IPC to processes that hold no archive
+[fsclient] two endpoint capabilities and one page of my own memory - no archive, no device
 [stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand
-[fault] task 14 killed: EL0 fault at 0x7fffaffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
+[fault] task 16 killed: EL0 fault at 0x7fffaffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
+[child] hello - I was created at runtime, not by the kernel
 [loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
 [client] monotonic clock: two ClockNow reads from EL0, the second strictly later - no capability needed
 [driver] user-space UART-RX driver waiting for input
@@ -148,30 +153,37 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
 [displaysrv] composited a client surface onto a screen the client cannot touch
 [fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen
-[child] hello - I was created at runtime, not by the kernel
+[fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 #server drove the UART, then revoked it for everyone
 [child] hello - I was created at runtime, not by the kernel
 [client] read from shared memory: shared-memory works: written by the server, read by the client
 [client] read the marker from the SECOND page of a 2-page shared buffer
+[fsclient] read 'greeting.txt' through fssrv in 2 chunks: hello from the initramfs
+[fsclient] 25 of 25 bytes in 2 reads, the second one from offset 6
 [client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block
 [child] hello - I was created at runtime, not by the kernel
 [client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
 [cap] task 0 denied MapMemory(handle 0): no such capability
 [client] kernel refused a syscall pointer into an unmapped page - it walks our tables, not a range
 [parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
+[fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length
+[fsclient] asked for all 13240 bytes of 'init.elf' into a 4096-byte buffer and got 4096, with 9144 left
+[fsclient] the archive is at 0x900000000 in fssrv; touching it here must fault
+[fault] task 12 killed: EL0 fault at 0x900000000 (ec 0x24) — isolated, kernel continues
+[fssrv] served 12 requests, 4121 bytes of file data, and refused 4 - the archive never left this address space
 [ipc-storm] receiver drained every message from 3 concurrent senders, sequence sum exact - no message lost or duplicated
 [memtest] MapAnon(0) refused - a zero-page request is an error, not a page
 [memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
-clock: the demo took 11938 ms on the monotonic clock, during which core 0 took 94 tick(s)
-sleep: 3 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 4 clock wake-up(s), worst overshoot 18360 us
-scheduler: all tasks finished after 94 timer ticks; task table grew to 20 (old fixed max 8)
-task teardown: reaped 19 dead-task kernel stacks (608 KiB returned to the heap)
+clock: the demo took 9659 ms on the monotonic clock, during which core 0 took 79 tick(s)
+sleep: 3 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 4 clock wake-up(s), worst overshoot 7725 us
+scheduler: all tasks finished after 79 timer ticks; task table grew to 22 (old fixed max 8)
+task teardown: reaped 21 dead-task kernel stacks (672 KiB returned to the heap)
 user stacks: 40 page(s) mapped on demand (160 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=94
+preemption: timer ticks per core — cpu0=79
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x402f5000 (exited client's root was 0x402e6000)
+frame reclaim: post-teardown alloc 0x402ee000 (exited client's root was 0x402ee000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
   (1 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
 shutting down (PSCI SYSTEM_OFF)
@@ -189,7 +201,7 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **189 assertions, exit=0** on `--quick` (215 on the
+  failure signals. Currently **195 assertions, exit=0** on `--quick` (222 on the
   full matrix).
 - **`./scripts/input-check.sh`** — the only check that makes the *outside world*
   act: QEMU synthesises a real key event, and the assertion is that a driver in EL0

@@ -230,9 +230,35 @@ if [ -n "$INITRAMFS" ]; then
         req "refused a non-ELF file and an unmapped pointer"
         forbid "SPAWNIMAGE WRONG"
     fi
+    # Files stop being one process's memory. The server holds the archive; the
+    # client holds two endpoint capabilities and prints the file's bytes anyway.
+    # The offset is asserted through the *content*: a server that ignored it would
+    # return the head of the file twice and this line would read "hello hello from
+    # the initramfs", which passes every other check here.
+    req "[fssrv] the files are mine: $(printf '%s\n' $MEMBERS | wc -l) of them"
+    req "[fsclient] read 'greeting.txt' through fssrv in 2 chunks: $GREETING"
+    # The greeting plus its newline — computed, so changing the file's text does
+    # not quietly turn this assertion into a comparison of two stale numbers.
+    req "[fsclient] $((${#GREETING} + 1)) of $((${#GREETING} + 1)) bytes in 2 reads, the second one from offset 6"
+    req "[fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length"
+    # The lengths in a request are the client's to lie about, so the server takes
+    # the size from the capability (`SharedPages`) instead: asked for a whole file
+    # into one page, it must answer with one page and say what is left. Trusting the
+    # number instead faults *the server* at 0x500001000.
+    if [ -n "$HAVE_PROGRAM" ]; then
+        req "into a 4096-byte buffer and got 4096, with"
+    fi
+    # And the proof that none of it was a shortcut: the client touches the address
+    # the archive lives at *in the server* and the kernel kills it for that.
+    req "EL0 fault at 0x900000000"
+    forbid "I READ THE ARCHIVE DIRECTLY"
 else
     run gicv2-el1-smp1 90 -- -M virt,gic-version=2 -cpu cortex-a72 -smp 1 -m 512M
     req "no initramfs on this machine"
+    # No archive is not a reason to leave clients blocked forever: the server still
+    # runs and still answers, and the answer is "no such file".
+    req "[fssrv] the kernel gave me no initramfs; every open will be refused"
+    req "[fsclient] the server has no 'greeting.txt'"
 fi
 req "entered at EL1, running at EL1"
 req "interrupt controller: GICv2 online"

@@ -51,6 +51,14 @@ static DISPLAYSRV_IMAGE: &[u8] = include_bytes!(env!("STAROS_DISPLAYSRV_IMAGE"))
 /// crate, and what it drives is a device the kernel has never heard of.
 static INPUTSRV_IMAGE: &[u8] = include_bytes!(env!("STAROS_INPUTSRV_IMAGE"));
 
+/// The file server's image. Like the display server, what makes it what it is is a
+/// mapping nobody else gets: the initramfs. Its clients hold two endpoints.
+static FSSRV_IMAGE: &[u8] = include_bytes!(env!("STAROS_FSSRV_IMAGE"));
+
+/// Its client's image — a program with no archive, no device and no privilege,
+/// which is the only way "these bytes arrived over IPC" can mean anything.
+static FSCLIENT_IMAGE: &[u8] = include_bytes!(env!("STAROS_FSCLIENT_IMAGE"));
+
 mod cap;
 mod console;
 mod elf;
@@ -1225,6 +1233,9 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     let ep_fb_reply = obj::create(obj::Object::Endpoint { id: 6 }).expect("ep_fb_reply object");
     // The device manager's grants to the input driver.
     let ep_input = obj::create(obj::Object::Endpoint { id: 7 }).expect("ep_input object");
+    // The file protocol: a client's request and the server's reply.
+    let ep_fs = obj::create(obj::Object::Endpoint { id: 8 }).expect("ep_fs object");
+    let ep_fs_reply = obj::create(obj::Object::Endpoint { id: 9 }).expect("ep_fs_reply object");
 
     // The *only* device policy the kernel still holds: the authority to mint. It
     // pre-mints no UART objects at all now — the device manager (id 7) reads the
@@ -1363,6 +1374,62 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         );
     }
 
+    // The file server and its one client. The asymmetry between them is the whole
+    // demonstration: the server is handed the initramfs, the client is handed two
+    // endpoint capabilities, and the client is the one that ends up printing the
+    // contents of a file.
+    //
+    // Built even when the bootloader left no archive. A server that refuses to
+    // start leaves its clients blocked in `Recv` forever; one that starts with an
+    // empty archive answers "no such file", which is an answer.
+    let files = (|| {
+        // SAFETY: as every other space built here — the MMU is on with the frame
+        // pool mapped writable, and these frames are uniquely ours. `initrd` is the
+        // archive the bootloader loaded, already excluded from the frame pool.
+        let space = mem::with(|frames| unsafe {
+            let mut s = AddressSpace::new(frames)?;
+            let img = elf::Elf::parse(FSSRV_IMAGE)?;
+            if !load_segments(&mut s, frames, &img) {
+                s.destroy(frames);
+                return None;
+            }
+            s.set_entry(img.entry());
+            s.write_id(16);
+            if let Some((start, end)) = initrd {
+                let len = (end - start) as usize;
+                let Some(va) = s.map_initrd(frames, start, len) else {
+                    s.destroy(frames);
+                    return None;
+                };
+                s.write_initrd_info(va, len as u32);
+            }
+            Some(s)
+        })?;
+        let mut caps = cap::empty_caps()?;
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fs, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fs_reply, send: true, recv: false });
+
+        // SAFETY: as above; this space is given no mapping beyond its own image.
+        let client = mem::with(|frames| unsafe {
+            let mut s = AddressSpace::new(frames)?;
+            let img = elf::Elf::parse(FSCLIENT_IMAGE)?;
+            if !load_segments(&mut s, frames, &img) {
+                s.destroy(frames);
+                return None;
+            }
+            s.set_entry(img.entry());
+            s.write_id(17);
+            Some(s)
+        })?;
+        let mut client_caps = cap::empty_caps()?;
+        cap::install(&mut client_caps, cap::Cap::Endpoint { obj: ep_fs, send: true, recv: false });
+        cap::install(
+            &mut client_caps,
+            cap::Cap::Endpoint { obj: ep_fs_reply, send: false, recv: true },
+        );
+        Some(((space, caps), (client, client_caps)))
+    })();
+
     // The input driver. Built unconditionally — whether the machine *has* an input
     // device is not the kernel's business to know: the driver receives a capability
     // or it does not, and either way the kernel's part is the same three
@@ -1412,6 +1479,13 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     if let Some(((ds_space, ds_caps), (fbc_space, fbc_caps))) = display {
         sched::spawn_user(user_task_entry, ds_space, ds_caps);
         sched::spawn_user(user_task_entry, fbc_space, fbc_caps);
+    }
+    // The file server first, for the same reason as the display server: it should
+    // already be blocked in `Recv` when its client asks, so what the demo shows is
+    // the wake path rather than the spawn order.
+    if let Some(((fs_space, fs_caps), (fsc_space, fsc_caps))) = files {
+        sched::spawn_user(user_task_entry, fs_space, fs_caps);
+        sched::spawn_user(user_task_entry, fsc_space, fsc_caps);
     }
     sched::spawn_user(user_task_entry, storm_a_space, storm_a_caps);
     sched::spawn_user(user_task_entry, storm_b_space, storm_b_caps);

@@ -84,9 +84,98 @@ fn main() {
     // parses it directly.
     println!("cargo:rustc-env=STAROS_INIT_IMAGE={}", elf.display());
 
-    build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld);
+    // The device manager builds the `cpio` rlib on its way; the file server links
+    // against that same artefact rather than compiling a second copy — and takes
+    // its path as an argument, so the ordering these two lines encode is visible
+    // instead of being an implicit "must run after".
+    let cpio_rlib = build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld);
     build_displaysrv(&manifest_dir, &out_dir, &rustc, &image_ld);
     build_inputsrv(&manifest_dir, &out_dir, &rustc, &image_ld);
+    build_fssrv(&manifest_dir, &out_dir, &rustc, &image_ld, &cpio_rlib);
+    build_fsclient(&manifest_dir, &out_dir, &rustc, &image_ld);
+}
+
+/// Build the `fssrv` EL0 program and publish its ELF path.
+///
+/// Links against the `cpio` rlib the device manager's build already produced: the
+/// archive parser belongs in exactly one place, host-tested, and a server that
+/// re-implemented the header arithmetic would be the second place for the same bug
+/// to live.
+fn build_fssrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path, cpio_rlib: &Path) {
+    let src = canonical(&Path::new(manifest_dir).join("../../services/fssrv/main.rs"));
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let elf = Path::new(out_dir).join("fssrv.elf");
+    let status = Command::new(rustc)
+        .args(["--edition", "2021"])
+        .args(["--target", "aarch64-unknown-none"])
+        .args(["--crate-name", "staros_fssrv"])
+        .args(["--crate-type", "bin"])
+        .arg("-Copt-level=2")
+        .arg("-Cpanic=abort")
+        .arg("-Cstrip=symbols")
+        .arg("--extern")
+        .arg(format!("staros_cpio={}", cpio_rlib.display()))
+        .arg(format!("-Clink-arg=-T{}", image_ld.display()))
+        .arg("-Clink-arg=-z")
+        .arg("-Clink-arg=max-page-size=4096")
+        .arg("-o")
+        .arg(&elf)
+        .arg(&src)
+        .status()
+        .expect("failed to spawn rustc for fssrv");
+    assert!(status.success(), "rustc failed to build fssrv");
+
+    const MAX_FSSRV_BYTES: u64 = 128 * 1024;
+    let size = std::fs::metadata(&elf)
+        .expect("fssrv image was not produced")
+        .len();
+    assert!(
+        size <= MAX_FSSRV_BYTES,
+        "fssrv image is {size} bytes (> {MAX_FSSRV_BYTES}); the layout regressed",
+    );
+
+    println!("cargo:rustc-env=STAROS_FSSRV_IMAGE={}", elf.display());
+}
+
+/// Build the `fsclient` EL0 program and publish its ELF path.
+///
+/// One `rustc` step and no crate of ours: the whole program is syscalls and a
+/// message protocol, which is the point — a client of the file server needs
+/// nothing that knows what a CPIO archive is.
+fn build_fsclient(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) {
+    let src = canonical(&Path::new(manifest_dir).join("../../services/fsclient/main.rs"));
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let elf = Path::new(out_dir).join("fsclient.elf");
+    let status = Command::new(rustc)
+        .args(["--edition", "2021"])
+        .args(["--target", "aarch64-unknown-none"])
+        .args(["--crate-name", "staros_fsclient"])
+        .args(["--crate-type", "bin"])
+        .arg("-Copt-level=2")
+        .arg("-Cpanic=abort")
+        .arg("-Cstrip=symbols")
+        .arg(format!("-Clink-arg=-T{}", image_ld.display()))
+        .arg("-Clink-arg=-z")
+        .arg("-Clink-arg=max-page-size=4096")
+        .arg("-o")
+        .arg(&elf)
+        .arg(&src)
+        .status()
+        .expect("failed to spawn rustc for fsclient");
+    assert!(status.success(), "rustc failed to build fsclient");
+
+    const MAX_FSCLIENT_BYTES: u64 = 64 * 1024;
+    let size = std::fs::metadata(&elf)
+        .expect("fsclient image was not produced")
+        .len();
+    assert!(
+        size <= MAX_FSCLIENT_BYTES,
+        "fsclient image is {size} bytes (> {MAX_FSCLIENT_BYTES}); the layout regressed",
+    );
+
+    println!("cargo:rustc-env=STAROS_FSCLIENT_IMAGE={}", elf.display());
 }
 
 /// Build the `inputsrv` EL0 program and publish its ELF path.
@@ -196,7 +285,9 @@ fn build_displaysrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &P
 /// `devicemgr` against it with `--extern`. Still no `-Zbuild-std`: at
 /// `-Copt-level=2` the compiler inlines `fdt`'s slice work, so `core`'s memory
 /// intrinsics are never referenced and the pre-compiled `core` is enough.
-fn build_devicemgr(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) {
+/// Returns the path to the `cpio` rlib it built, which the file server links
+/// against too.
+fn build_devicemgr(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) -> PathBuf {
     let fdt_src = canonical(&Path::new(manifest_dir).join("../fdt/src/lib.rs"));
     let cpio_src = canonical(&Path::new(manifest_dir).join("../cpio/src/lib.rs"));
     let dm_src = canonical(&Path::new(manifest_dir).join("../../services/devicemgr/main.rs"));
@@ -277,6 +368,7 @@ fn build_devicemgr(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Pa
     );
 
     println!("cargo:rustc-env=STAROS_DEVICEMGR_IMAGE={}", dm_elf.display());
+    cpio_rlib
 }
 
 /// Canonicalize a path, panicking with a clear message if it does not exist —
