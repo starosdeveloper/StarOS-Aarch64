@@ -827,7 +827,7 @@ extern "C" fn _start() -> ! {
         // eat the frame pool instead.
         ".Lstackgrow:",
         "cmp w19, #11",
-        "b.ne .Lchild",              // id != 11 -> a spawned child (id 8)
+        "b.ne .Lloaded",             // id != 11 -> the loaded-from-a-file role, then the child
         "mov x25, sp",               // remember the top so we can restore it
         "mov w20, #{stack_pages}",   // pages to walk down
         "mov x21, sp",
@@ -861,6 +861,19 @@ extern "C" fn _start() -> ! {
         ".Lsg_bad:",
         "mov sp, x25",
         "adr x2, 15f",               // stack-growth MISMATCH string
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+
+        // ============ loaded from a file (id 12) ============
+        // Same bytes as every other role here, but this copy did not come from the
+        // kernel's built-in image: the device manager found `init.elf` inside the
+        // CPIO archive and handed those bytes to `SpawnImage`. Only this path seeds
+        // id 12, so the line below can have arrived no other way.
+        ".Lloaded:",
+        "cmp w19, #12",
+        "b.ne .Lchild",              // id != 12 -> a spawned child (id 8)
+        "adr x2, 26f",
         "bl .Lputs",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
@@ -967,6 +980,8 @@ extern "C" fn _start() -> ! {
         ".asciz \"[client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0\\n\"",
         "25:",
         ".asciz \"[client] THREAD WRONG - it never ran, wrote nowhere we can see, or shared our thread pointer\\n\"",
+        "26:",
+        ".asciz \"[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,

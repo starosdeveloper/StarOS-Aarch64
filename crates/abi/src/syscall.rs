@@ -180,6 +180,21 @@ pub enum Syscall {
     /// (that is what makes `thread_local` work), and a *copy* of the capability
     /// table taken at creation — so a capability minted later is not visible to it.
     SpawnThread = 25,
+    /// Create a process from an ELF image **in the caller's own memory**: `arg0` =
+    /// a pointer to the bytes, `arg1` = their length, `arg2` = the process id to
+    /// seed. Returns the new task's id.
+    ///
+    /// [`Spawn`] can only start another copy of the one image the kernel was built
+    /// with, which makes every program in the system something the kernel shipped.
+    /// This takes the image from user space, so a program can be a *file*: read out
+    /// of an initramfs, received over IPC, or produced at runtime.
+    ///
+    /// The kernel deliberately does not learn where the bytes came from. Giving it
+    /// a path would mean giving it an archive parser and, later, a filesystem —
+    /// the exact thing this system keeps in user space. The caller already knows
+    /// how to find its own bytes; the kernel's job is only to turn them into an
+    /// address space.
+    SpawnImage = 26,
 }
 
 impl Syscall {
@@ -213,6 +228,7 @@ impl Syscall {
             23 => Some(Syscall::NotifySignal),
             24 => Some(Syscall::WaitAny),
             25 => Some(Syscall::SpawnThread),
+            26 => Some(Syscall::SpawnImage),
             _ => None,
         }
     }
@@ -224,11 +240,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=25 {
+        for n in 0..=26 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(26), None);
+        assert_eq!(Syscall::from_raw(27), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

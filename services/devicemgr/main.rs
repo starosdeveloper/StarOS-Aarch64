@@ -34,6 +34,15 @@ const USER_DATA_VA: u64 = 0x4_0000_0000;
 /// The file the demo reads out of the initramfs to prove user-space unpacking.
 const GREETING_FILE: &str = "greeting.txt";
 
+/// An ELF *file* in the initramfs, started with `SpawnImage`. Optional: an archive
+/// without it simply skips that half, since the smoke matrix builds the archive
+/// only when `cpio` exists on the host.
+const PROGRAM_FILE: &str = "init.elf";
+
+/// The id the loaded-from-a-file process is seeded with. Nothing else uses it, so
+/// the line it prints can only have come from this path.
+const PROGRAM_ID: u64 = 12;
+
 // Syscall numbers — must match `staros_abi::syscall::Syscall`.
 const SYS_SEND: usize = 1;
 const SYS_EXIT: usize = 4;
@@ -42,6 +51,7 @@ const SYS_GRANT_DEVICE: usize = 12;
 const SYS_GRANT_IRQ: usize = 13;
 const SYS_CREATE_DMA: usize = 16;
 const SYS_BIND_DMA: usize = 18;
+const SYS_SPAWN_IMAGE: usize = 26;
 
 /// The error the kernel returns from `BindDma` on a machine with no IOMMU
 /// (`KError::NotSupported`), so the demo can tell "no SMMU here" from a real
@@ -210,6 +220,55 @@ fn unpack_initramfs() {
             puts("[devicemgr] initramfs has no '");
             puts(GREETING_FILE);
             puts("'\n");
+        }
+    }
+
+    // And the other half: a *program* out of the same archive. We hand the kernel
+    // the bytes we found; it parses the ELF and builds an address space. Nothing in
+    // the kernel knows this came from a CPIO archive — the parsing happened here,
+    // in EL0, with no filesystem anywhere.
+    if let Some(entry) = archive.find(PROGRAM_FILE) {
+        // SAFETY: `svc` with the SpawnImage convention; the kernel walks our own
+        // page tables before reading a byte of the buffer we name.
+        let rc = unsafe {
+            syscall3(
+                SYS_SPAWN_IMAGE,
+                entry.data.as_ptr() as u64,
+                entry.data.len() as u64,
+                PROGRAM_ID,
+            )
+        };
+        if rc < 0 {
+            puts("[devicemgr] the kernel refused the program from the initramfs\n");
+            return;
+        }
+        puts("[devicemgr] started '");
+        puts(PROGRAM_FILE);
+        puts("' from the initramfs as a new process - the kernel loaded a file, not a built-in image\n");
+
+        // Two things the kernel must refuse, checked here because this is the only
+        // place holding bytes to refuse. Both are what a loader gets handed by
+        // mistake sooner or later: a file that is not a program, and a pointer that
+        // is not memory.
+        let not_a_program = archive.find(GREETING_FILE).map_or(0, |e| {
+            // SAFETY: as above.
+            unsafe {
+                syscall3(
+                    SYS_SPAWN_IMAGE,
+                    e.data.as_ptr() as u64,
+                    e.data.len() as u64,
+                    PROGRAM_ID,
+                )
+            }
+        });
+        // An address inside our own window that nothing maps. A range check could
+        // not catch this — the kernel has to walk our tables before it reads.
+        // SAFETY: as above; the kernel never dereferences this pointer.
+        let not_mapped = unsafe { syscall3(SYS_SPAWN_IMAGE, 0x8040_0000, 64, PROGRAM_ID) };
+        if not_a_program < 0 && not_mapped < 0 {
+            puts("[devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must\n");
+        } else {
+            puts("[devicemgr] SPAWNIMAGE WRONG - the kernel accepted a non-program or an unmapped pointer\n");
         }
     }
 }

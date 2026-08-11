@@ -860,6 +860,19 @@ Done:
   exits, the creator claims 64 fresh pages and re-reads a marker the thread left —
   falsifying the rule kills the creator with a fault at the dead thread's stack.
 
+- **Loading a program from bytes (`SpawnImage`).** `Spawn` can only start another
+  copy of the image compiled into the kernel, which makes every program in the
+  system one the kernel shipped. `SpawnImage` takes a pointer and a length in the
+  *caller's* memory, parses the ELF and builds an address space — so a program can
+  be a file. The kernel deliberately never learns where the bytes came from: a path
+  argument would mean an archive parser in the kernel and, later, a filesystem, and
+  `devicemgr` already unpacks CPIO in EL0. Verified in QEMU with a real ELF added to
+  the initramfs: the device manager finds it, hands over the bytes, and the loaded
+  process announces itself under an id nothing else uses. The bytes are copied into
+  the kernel heap to be parsed (a contiguous slice for the parser, and EL1 cannot
+  read EL0 memory directly under PAN), which is the honest reason for the 256 KiB
+  cap; a larger image will need segments streamed through a page-sized buffer.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not

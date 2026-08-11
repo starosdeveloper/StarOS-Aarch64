@@ -524,18 +524,16 @@ fn me() -> usize {
 /// which, unlike the fixed table it replaces, is a limit set by the machine
 /// rather than by a number chosen in advance.
 ///
-/// Returns `false` if the task could not be allocated.
-pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -> bool {
+/// Returns the new task's id, or `None` if it could not be allocated.
+pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -> Option<u64> {
     // Build the whole task *before* taking the lock. Partly to keep the lock
     // short, but mainly to keep the lock order a straight line: allocating takes
     // the heap's lock, and doing that underneath the scheduler's would nest two
     // locks for no reason.
-    let Some(stack) = alloc_stack() else {
-        return false;
-    };
+    let stack = alloc_stack()?;
     let mut ctx = CpuContext::empty();
     ctx.init(entry, stack_top(&stack));
-    let Some(task) = try_box(Task {
+    let task = try_box(Task {
         ctx,
         stack,
         state: State::Ready,
@@ -547,9 +545,7 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         mailbox: None,
         wake_pending: false,
         on_cpu: AtomicBool::new(false),
-    }) else {
-        return false;
-    };
+    })?;
 
     let mut sched = SCHED.lock();
     // Append rather than reuse a `Dead` slot. Reuse would need proof that the dead
@@ -560,16 +556,17 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
     // definition, off the dead stack. So a task's stack no longer waits until
     // reboot; only the small `Task` header lingers, bounded by how many tasks ran.
     if sched.tasks.try_reserve(1).is_err() {
-        return false;
+        return None;
     }
     let mut task = task;
-    task.id = sched.tasks.len() as u64;
+    let id = sched.tasks.len() as u64;
+    task.id = id;
     sched.tasks.push(task);
     drop(sched);
     // A task is runnable now — ring the doorbell so an idle core picks it up at
     // once instead of sleeping until its next tick.
     crate::smp::wake_others();
-    true
+    Some(id)
 }
 
 /// Begin scheduling. Saves the bootstrap context and switches into the first

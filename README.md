@@ -14,8 +14,8 @@ tree instead of hard-coded addresses, TTBR1 split with 4 KiB page tables, GICv2
 with revocation, synchronous IPC, shared memory, an ELF loader, drivers and
 interrupt handling in **user space**, an SMMUv3 enforced against a real bus
 master, an initramfs, a framebuffer console, a monotonic clock user space can read
-and sleep against, waiting on a set of sources with a deadline, and threads inside
-one address space.
+and sleep against, waiting on a set of sources with a deadline, threads inside one
+address space, and processes loaded from a file rather than from the kernel image.
 
 ## Layout
 
@@ -106,6 +106,7 @@ smp: 4 cores x 20000 locked increments = 80000 (expected 80000) — no increment
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 [client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, ...
 [client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
+[devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
 sleep: 2 task-sleep(s) parked, 1 deadline(s) already past, 3 clock wake-up(s), worst overshoot 2889 us
 [child] hello - I was created at runtime, not by the kernel
 ```
@@ -122,7 +123,7 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **137 assertions, exit=0** on `--quick` (157 on the
+  failure signals. Currently **177 assertions, exit=0** on `--quick` (203 on the
   full matrix).
 
 ## Status

@@ -16,6 +16,7 @@ use console::klog;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
+use staros_abi::error::KError;
 use staros_abi::syscall::Syscall;
 use staros_arch_aarch64::addrspace::{self, AddressSpace};
 use staros_arch_aarch64::gic::{self, GicSpec};
@@ -1476,6 +1477,69 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     halt();
 }
 
+/// Build a process from an ELF image sitting in the *calling* task's memory, seed
+/// it with `id`, and schedule it. Returns the new task's id, or a negative
+/// [`KError`]. Backs the `SpawnImage` syscall.
+///
+/// This is what makes a program a *file* rather than something the kernel shipped.
+/// `Spawn` can only start another copy of the one image compiled into the kernel;
+/// here the caller supplies the bytes, so a process can come out of an initramfs,
+/// off a network, or from a compiler that just finished — and the kernel still has
+/// no idea what an archive or a filesystem is.
+///
+/// The image is copied into the kernel heap before it is parsed, which is the
+/// honest reason for the size cap at the syscall. Two things force the copy: the
+/// ELF parser wants a contiguous slice, and reading EL0 memory directly from EL1
+/// faults under PAN on real hardware. Streaming each segment through a page-sized
+/// bounce buffer would lift the cap; nothing yet needs it.
+///
+/// A capability-less child, exactly like [`spawn_child`]: it earns authority only
+/// by being sent it.
+pub fn spawn_image(ptr: u64, len: usize, id: u8) -> isize {
+    let mut bytes = alloc::vec::Vec::new();
+    if bytes.try_reserve_exact(len).is_err() {
+        return KError::OutOfResources.as_raw();
+    }
+    bytes.resize(len, 0);
+    // SAFETY: the caller's address space is active and the syscall layer confirmed
+    // every byte of `[ptr, ptr + len)` is mapped EL0-readable in its own tables;
+    // `bytes` is exactly `len` long. `copy_from_user` uses unprivileged loads, so
+    // this is sound under PAN.
+    unsafe { staros_arch_aarch64::usercopy::copy_from_user(&mut bytes, ptr) };
+
+    let Some(image) = elf::Elf::parse(&bytes) else {
+        return KError::InvalidArgument.as_raw();
+    };
+    // SAFETY: as `spawn_child` — the MMU is on with the frame pool identity-mapped
+    // and writable, and every frame allocated here is uniquely owned.
+    let space = mem::with(|frames| unsafe {
+        let mut s = AddressSpace::new(frames)?;
+        if !load_segments(&mut s, frames, &image) {
+            s.destroy(frames);
+            return None;
+        }
+        s.set_entry(image.entry());
+        s.write_id(id);
+        Some(s)
+    });
+    let Some(space) = space else {
+        return KError::OutOfResources.as_raw();
+    };
+    let Some(caps) = cap::empty_caps() else {
+        // SAFETY: `space` was just built and never installed as a live TTBR0.
+        mem::with(|frames| unsafe { space.destroy(frames) });
+        return KError::OutOfResources.as_raw();
+    };
+    match sched::spawn_user(user_task_entry, space, caps) {
+        Some(task_id) => task_id as isize,
+        None => {
+            // SAFETY: as above — the space never became anyone's active tables.
+            mem::with(|frames| unsafe { space.destroy(frames) });
+            KError::OutOfResources.as_raw()
+        }
+    }
+}
+
 /// Build a fresh EL0 process from the init image, seeded with `id`, and add it to
 /// the scheduler with no capabilities. Backs the `Spawn` syscall, letting user
 /// space grow the process tree itself. Returns `false` if the image is
@@ -1509,7 +1573,7 @@ pub fn spawn_child(id: u8) -> bool {
             return false;
         }
     };
-    if sched::spawn_user(user_task_entry, space, caps) {
+    if sched::spawn_user(user_task_entry, space, caps).is_some() {
         true
     } else {
         // The task could not be allocated: return the frames rather than leak them.

@@ -255,6 +255,28 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             Err(e) => e.as_raw(),
         },
 
+        // Create a process from an ELF image the caller holds: `x0` = pointer,
+        // `x1` = length, `x2` = the id to seed. The kernel never learns where the
+        // bytes came from — giving it a path would mean giving it an archive
+        // parser, and that lives in user space here.
+        Some(Syscall::SpawnImage) => {
+            /// Ceiling on an image handed over in one call. The bytes are copied
+            /// into the kernel heap to be parsed, so this is a real limit on kernel
+            /// memory, not a policy: a bigger program needs the loader to stream
+            /// segments straight from the caller's pages instead, which is work for
+            /// the phase that has a program that big.
+            const MAX_IMAGE_BYTES: usize = 256 * 1024;
+            let ptr = req.args[0];
+            let len = req.args[1] as usize;
+            if len == 0 || len > MAX_IMAGE_BYTES {
+                return KError::InvalidArgument.as_raw();
+            }
+            if !sched::current_range_ok(ptr, len, false) {
+                return KError::InvalidArgument.as_raw();
+            }
+            crate::spawn_image(ptr, len, req.args[2] as u8)
+        }
+
         // Create a thread in the caller's own address space: `x0` = EL0 entry,
         // `x1` = stack pages, `x2` = thread pointer, `x3` = argument. No
         // capability: a task may always divide its own time and its own memory,

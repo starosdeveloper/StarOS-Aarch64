@@ -47,6 +47,10 @@ IMAGE="$LOGDIR/kernel.img"
 "$objcopy" -O binary "$ELF" "$IMAGE"
 say "  image: $(wc -c <"$IMAGE") bytes"
 
+# The `init` EL0 image the kernel's build script just produced. It goes into the
+# initramfs as a file so the `SpawnImage` path has a real program to load.
+INIT_ELF="$(ls -t target/aarch64-unknown-none/debug/build/kernel-*/out/init.elf 2>/dev/null | head -1)"
+
 # --- build an initramfs to exercise the CPIO/initramfs path (2.4) ------------
 # A real `cpio -o -H newc` archive with a known file; the smoke test asserts the
 # kernel's bootstrap process unpacks it and reads that file's contents back. The
@@ -58,9 +62,22 @@ if command -v cpio >/dev/null 2>&1; then
     mkdir -p "$IRDIR"
     printf '%s\n' "$GREETING" >"$IRDIR/greeting.txt"
     printf 'STAR OS 0.2.0\n'  >"$IRDIR/version"
+    # A real ELF as a *file in the archive*, for the `SpawnImage` path: the device
+    # manager finds it, hands the bytes to the kernel, and the kernel builds a
+    # process out of them. It is the same program the kernel also has built in,
+    # which is what makes the test cheap — but it arrives the other way round, and
+    # the id it is seeded with is one only this path uses.
+    MEMBERS="greeting.txt version"
+    HAVE_PROGRAM=""
+    if [ -n "$INIT_ELF" ] && [ -f "$INIT_ELF" ]; then
+        cp "$INIT_ELF" "$IRDIR/init.elf"
+        MEMBERS="$MEMBERS init.elf"
+        HAVE_PROGRAM=1
+    fi
     INITRAMFS="$LOGDIR/initramfs.cpio"
-    ( cd "$IRDIR" && printf '%s\n' greeting.txt version | cpio -o -H newc --reproducible 2>/dev/null ) >"$INITRAMFS"
-    say "  initramfs: $(wc -c <"$INITRAMFS") bytes (2 files)"
+    # shellcheck disable=SC2086
+    ( cd "$IRDIR" && printf '%s\n' $MEMBERS | cpio -o -H newc --reproducible 2>/dev/null ) >"$INITRAMFS"
+    say "  initramfs: $(wc -c <"$INITRAMFS") bytes ($(printf '%s\n' $MEMBERS | wc -l) files)"
 else
     say "  ${Y}cpio not found — skipping the initramfs assertions${Z}"
 fi
@@ -194,8 +211,20 @@ run() {
 # one; otherwise this is the plain no-initramfs run.
 if [ -n "$INITRAMFS" ]; then
     run gicv2-el1-smp1 90 -- -M virt,gic-version=2 -cpu cortex-a72 -smp 1 -m 512M -initrd "$INITRAMFS"
-    req "unpacked the initramfs in user space: 2 files, no storage driver"
+    req "unpacked the initramfs in user space: $(printf '%s\n' $MEMBERS | wc -l) files, no storage driver"
     req "read 'greeting.txt' from the initramfs: $GREETING"
+    # A *program* out of the same archive: user space parsed the CPIO, found an
+    # ELF and handed the kernel its bytes. The loaded process is seeded with an id
+    # nothing else uses, so its line can only have come from this path. The kernel
+    # must also refuse what a loader gets handed by mistake — a file that is not a
+    # program, and a pointer that is not memory (which it can only know by walking
+    # the caller's tables; falsifying that check faults the kernel itself).
+    if [ -n "$HAVE_PROGRAM" ]; then
+        req "started 'init.elf' from the initramfs as a new process"
+        req "[loaded] hello - my ELF was a file in the initramfs"
+        req "refused a non-ELF file and an unmapped pointer"
+        forbid "SPAWNIMAGE WRONG"
+    fi
 else
     run gicv2-el1-smp1 90 -- -M virt,gic-version=2 -cpu cortex-a72 -smp 1 -m 512M
     req "no initramfs on this machine"
