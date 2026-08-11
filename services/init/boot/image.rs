@@ -827,7 +827,7 @@ extern "C" fn _start() -> ! {
         // eat the frame pool instead.
         ".Lstackgrow:",
         "cmp w19, #11",
-        "b.ne .Lloaded",             // id != 11 -> the loaded-from-a-file role, then the child
+        "b.ne .Lfbclient",           // id != 11 -> the display client, then the rest
         "mov x25, sp",               // remember the top so we can restore it
         "mov w20, #{stack_pages}",   // pages to walk down
         "mov x21, sp",
@@ -861,6 +861,71 @@ extern "C" fn _start() -> ! {
         ".Lsg_bad:",
         "mov sp, x25",
         "adr x2, 15f",               // stack-growth MISMATCH string
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+
+        // ============ display client (id 13) ============
+        // Holds two endpoint capabilities and nothing else — no device, no screen,
+        // no authority. It allocates its own pixels, fills them, and asks the
+        // display server to put them on the glass. The only thing it can reach is
+        // memory it made itself.
+        ".Lfbclient:",
+        "cmp w19, #13",
+        "b.ne .Lloaded",             // id != 13 -> the loaded-from-a-file role
+        // A 64x64 surface: 16 KiB, four pages of shared memory.
+        "mov x0, #4",
+        "mov x8, #14",               // Syscall::CreateShared
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lfb_bad",
+        "mov x21, x0",               // x21 = the surface's capability handle
+        "mov x8, #15",               // Syscall::MapShared
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lfb_bad",
+        "mov x22, x0",               // x22 = the pixels, in our own space
+        // Fill it: 64*64 = 4096 pixels of solid red, xRGB8888.
+        "movz w23, #0x00FF, lsl #16",  // 0x00FF0000
+        "mov x24, #4096",
+        "mov x25, x22",
+        ".Lfb_fill:",
+        "str w23, [x25], #4",
+        "subs x24, x24, #1",
+        "b.ne .Lfb_fill",
+        // Ask the server to composite it at (100, 80).
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #1",
+        "str x0, [x11]",             // msg.tag = 1 (Commit)
+        "mov x0, #64",
+        "str x0, [x11, #8]",         // words[0] = width
+        "str x0, [x11, #16]",        // words[1] = height
+        "mov x0, #100",
+        "str x0, [x11, #24]",        // words[2] = x
+        "mov x0, #80",
+        "str x0, [x11, #32]",        // words[3] = y
+        "str w21, [x11, #40]",       // msg.cap = the surface, delegated
+        "mov x0, #1",                // handle 1 = the display endpoint (send)
+        "mov x1, x11",
+        "mov x8, #1",                // Syscall::Send
+        "svc #0",
+        // Wait for the reply: pixels on the glass, not merely sent.
+        "mov x0, #2",                // handle 2 = the reply endpoint (recv)
+        "mov x1, x11",
+        "mov x8, #2",                // Syscall::Recv
+        "svc #0",
+        "ldr x20, [x11, #8]",        // words[0] = pixels the server drew
+        "mov x24, #4096",
+        "cmp x20, x24",
+        "b.ne .Lfb_bad",             // it drew a different number than we sent
+        "adr x2, 27f",
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+        ".Lfb_bad:",
+        "adr x2, 28f",
         "bl .Lputs",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
@@ -982,6 +1047,10 @@ extern "C" fn _start() -> ! {
         ".asciz \"[client] THREAD WRONG - it never ran, wrote nowhere we can see, or shared our thread pointer\\n\"",
         "26:",
         ".asciz \"[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes\\n\"",
+        "27:",
+        ".asciz \"[fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen\\n\"",
+        "28:",
+        ".asciz \"[fbclient] SURFACE WRONG - the buffer would not allocate, or the server drew a different rectangle\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,

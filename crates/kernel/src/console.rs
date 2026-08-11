@@ -32,6 +32,7 @@
 //! bare `DebugPutc` can do is interleave whole glyphs, not tear the cursor.
 
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use staros_arch_aarch64::uart::Pl011;
 use staros_framebuffer::Console as FbConsole;
@@ -51,10 +52,41 @@ static CONSOLE: SpinLock<()> = SpinLock::new(());
 /// the two cores from racing on the cursor.
 static FRAMEBUFFER: SpinLock<Option<FbConsole<'static>>> = SpinLock::new(None);
 
+/// Whether the kernel is still drawing to the screen.
+///
+/// Cleared when the screen is handed to a display server: from then on the pixels
+/// belong to a process in EL0, and a kernel log line drawn over them would be
+/// scribbling on someone else's window. The mirror itself is *kept*, not dropped —
+/// see [`reclaim_framebuffer`], which is what a panic uses to take the screen back
+/// when there is no longer anyone to be polite to.
+static MIRRORING: AtomicBool = AtomicBool::new(true);
+
 /// Install a framebuffer console as a mirror of the serial console. Called once,
 /// single-core, during boot after the framebuffer is configured.
 pub fn install_framebuffer(console: FbConsole<'static>) {
     *FRAMEBUFFER.lock() = Some(console);
+}
+
+/// Stop drawing kernel output to the screen: it now belongs to a display server.
+///
+/// The UART keeps everything. This is the whole of "the kernel gives up the
+/// screen" — no unmapping, no teardown, because the mirror has to remain usable
+/// for [`reclaim_framebuffer`].
+pub fn stop_mirroring() {
+    MIRRORING.store(false, Ordering::Release);
+}
+
+/// Take the screen back, unconditionally. For a panic: whatever a display server
+/// was showing is less important than the reason the kernel is stopping, and on a
+/// board whose only output is the panel, a fault report nobody can see is a fault
+/// report that did not happen.
+pub fn reclaim_framebuffer() {
+    MIRRORING.store(true, Ordering::Release);
+}
+
+/// Whether kernel output should be drawn to the screen right now.
+fn mirroring() -> bool {
+    MIRRORING.load(Ordering::Acquire)
 }
 
 /// Write one raw byte to the console.
@@ -67,8 +99,10 @@ pub fn putc(byte: u8) {
     // SAFETY: as `print`.
     let console = unsafe { Pl011::qemu_virt() };
     console.write_byte(byte);
-    if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
-        fb.write_byte(byte);
+    if mirroring() {
+        if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
+            fb.write_byte(byte);
+        }
     }
 }
 
@@ -86,9 +120,11 @@ pub fn write_bytes(bytes: &[u8]) {
     for &byte in bytes {
         console.write_byte(byte);
     }
-    if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
-        for &byte in bytes {
-            fb.write_byte(byte);
+    if mirroring() {
+        if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
+            for &byte in bytes {
+                fb.write_byte(byte);
+            }
         }
     }
 }
@@ -100,9 +136,11 @@ pub fn println(args: core::fmt::Arguments) {
     let mut console = unsafe { Pl011::qemu_virt() };
     let _ = console.write_fmt(args);
     console.write_str("\n");
-    if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
-        let _ = fb.write_fmt(args);
-        fb.write_byte(b'\n');
+    if mirroring() {
+        if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
+            let _ = fb.write_fmt(args);
+            fb.write_byte(b'\n');
+        }
     }
 }
 

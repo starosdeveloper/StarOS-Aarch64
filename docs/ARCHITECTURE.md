@@ -873,6 +873,26 @@ Done:
   read EL0 memory directly under PAN), which is the honest reason for the 256 KiB
   cap; a larger image will need segments streamed through a page-sized buffer.
 
+- **The screen belongs to a process (`services/displaysrv`).** The framebuffer was
+  the kernel's, mirroring its log; while that is true no program can own a window.
+  The kernel now maps the pixels into one EL0 process, seeds the geometry beside
+  its id, stops mirroring, and logs to the UART. A client with nothing but two
+  endpoint capabilities allocates its own pixels with `CreateShared`, draws, and
+  delegates the buffer in one message; the server maps it and composites. The
+  *client* allocating is deliberate — the pages and the capability are its own, so
+  revocation takes the surface away with no bookkeeping in the server.
+
+  A panic calls `console::reclaim_framebuffer` and takes the screen back: on a
+  board whose only output is the panel, a fault report nobody can see did not
+  happen. The pixels are mapped Normal rather than Device (a framebuffer is written
+  in bulk), which leaves a cache-maintenance obligation on hardware whose scanout
+  is not coherent — real on a Pi, absent under QEMU.
+
+  Verified by *pixels*, not lines: `scripts/fb-check.sh` screendumps over QMP and
+  asserts named coordinates. That distinction earned itself immediately — a server
+  that ignores the client's requested position passes every text assertion in the
+  smoke matrix (the pixel count still matches) and fails the pixel check.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not

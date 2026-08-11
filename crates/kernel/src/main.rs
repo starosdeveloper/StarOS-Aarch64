@@ -42,6 +42,11 @@ static INIT_IMAGE: &[u8] = include_bytes!(env!("STAROS_INIT_IMAGE"));
 /// rather than every user task.
 static DEVICEMGR_IMAGE: &[u8] = include_bytes!(env!("STAROS_DEVICEMGR_IMAGE"));
 
+/// The display server's image, built the same way. A separate program rather than
+/// another role inside `init` because what distinguishes it is not a branch on an
+/// id but a mapping nobody else is given — the screen.
+static DISPLAYSRV_IMAGE: &[u8] = include_bytes!(env!("STAROS_DISPLAYSRV_IMAGE"));
+
 mod cap;
 mod console;
 mod elf;
@@ -678,10 +683,8 @@ fn acquire_framebuffer(
 /// mailbox on a Pi, `ramfb` on QEMU); from here down the path is identical — map the
 /// pixels, wrap them in the portable console, install it, and run the font self-test.
 /// If no source is present this quietly does nothing and the kernel runs UART-only.
-fn init_framebuffer(console: &mut Pl011, fdt: &Fdt<'_>) {
-    let Some((info, source)) = acquire_framebuffer(fdt) else {
-        return;
-    };
+fn init_framebuffer(console: &mut Pl011, fdt: &Fdt<'_>) -> Option<staros_arch_aarch64::fbinfo::FramebufferInfo> {
+    let (info, source) = acquire_framebuffer(fdt)?;
     let len = info.height * info.stride;
     // SAFETY: the source returned a linear-mapped buffer of exactly `height * stride`
     // bytes that nothing else will touch; we hold it forever.
@@ -691,15 +694,13 @@ fn init_framebuffer(console: &mut Pl011, fdt: &Fdt<'_>) {
     // xRGB8888 matches QEMU ramfb's DRM_FORMAT_XRGB8888 exactly. On a real Pi the
     // byte order follows the mailbox SET_PIXEL_ORDER we requested; confirm it live
     // when the board arrives (a wrong choice only swaps R/B, not the addressing).
-    let Some(fb) = Framebuffer::new(
+    let fb = Framebuffer::new(
         buf,
         info.width,
         info.height,
         info.stride,
         PixelFormat::xrgb8888(),
-    ) else {
-        return;
-    };
+    )?;
     let mut screen = FbConsole::new(fb, Rgb::GREEN, Rgb::BLACK);
     // ASCII only: this line is drawn by the 8x8 font, which has no em-dash glyph.
     let _ = writeln!(screen, "STAR OS framebuffer console - {}x{}", info.width, info.height);
@@ -713,6 +714,7 @@ fn init_framebuffer(console: &mut Pl011, fdt: &Fdt<'_>) {
     // primary core, before the secondaries or any EL0 task, so the sweep it prints
     // is race-free — a screenshot here shows the glyphs in isolation.
     console::framebuffer_selftest();
+    Some(info)
 }
 
 /// Report what the machine said about itself.
@@ -962,9 +964,9 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // hardware a firmware framebuffer will take this slot. Done here, before the
     // frame pool's free run is snapshotted below, so the never-freed pixel buffer
     // is already excluded and does not read as a leak at teardown.
-    if let Ok(fdt) = machine {
-        init_framebuffer(&mut console, &fdt);
-    }
+    // The geometry is kept: a display server needs it, and by the time one exists
+    // the source it came from (mailbox or fw_cfg) is no longer around to ask.
+    let framebuffer = machine.ok().and_then(|fdt| init_framebuffer(&mut console, &fdt));
 
     // Exercise the syscall path: `Yield` dispatches to 0, a bad number to -6.
     // SAFETY: vectors are installed; `invoke` issues a plain `svc`.
@@ -1214,6 +1216,9 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     let ep_srv = obj::create(obj::Object::Endpoint { id: 3 }).expect("ep_srv object");
     // The contention endpoint: three senders and one receiver, all on it at once.
     let ep_storm = obj::create(obj::Object::Endpoint { id: ipc::STORM_EP }).expect("ep_storm object");
+    // The display protocol: a client's commit request and the server's reply.
+    let ep_fb = obj::create(obj::Object::Endpoint { id: 5 }).expect("ep_fb object");
+    let ep_fb_reply = obj::create(obj::Object::Endpoint { id: 6 }).expect("ep_fb_reply object");
 
     // The *only* device policy the kernel still holds: the authority to mint. It
     // pre-mints no UART objects at all now — the device manager (id 7) reads the
@@ -1289,6 +1294,68 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     let mut storm_rx_caps = cap::empty_caps().expect("storm receiver caps");
     cap::install(&mut storm_rx_caps, cap::Cap::Endpoint { obj: ep_storm, send: false, recv: true });
 
+    // The display server and its one client, but only on a machine that has a
+    // screen to give away. Everything about this pair is ordinary — two processes
+    // and two endpoints — except that one of them is handed the pixels.
+    let display = framebuffer.and_then(|info| {
+        let len = info.height * info.stride;
+        // SAFETY: as the other spaces here; `info` describes the real pixel buffer,
+        // which `build_exclusions` kept out of the frame pool, and this is the only
+        // space it is mapped into.
+        let space = mem::with(|frames| unsafe {
+            let mut s = AddressSpace::new(frames)?;
+            let ds_image = elf::Elf::parse(DISPLAYSRV_IMAGE)?;
+            if !load_segments(&mut s, frames, &ds_image) {
+                s.destroy(frames);
+                return None;
+            }
+            s.set_entry(ds_image.entry());
+            s.write_id(14);
+            let Some(fb_va) = s.map_framebuffer(frames, info.phys, len) else {
+                s.destroy(frames);
+                return None;
+            };
+            s.write_fb_info(fb_va, info.width as u32, info.height as u32, info.stride as u32);
+            Some(s)
+        })?;
+        let mut caps = cap::empty_caps()?;
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb_reply, send: true, recv: false });
+
+        // Its client: an ordinary `init` role with no privilege at all beyond the
+        // two endpoint capabilities. It cannot reach the screen; it can only ask.
+        // SAFETY: as every other space built here — the MMU is on with the frame
+        // pool identity-mapped and writable, and these frames are uniquely ours.
+        let client = mem::with(|frames| unsafe {
+            let mut s = AddressSpace::new(frames)?;
+            if !load_segments(&mut s, frames, &image) {
+                s.destroy(frames);
+                return None;
+            }
+            s.set_entry(image.entry());
+            s.write_id(13);
+            Some(s)
+        })?;
+        let mut client_caps = cap::empty_caps()?;
+        cap::install(&mut client_caps, cap::Cap::Endpoint { obj: ep_fb, send: true, recv: false });
+        cap::install(
+            &mut client_caps,
+            cap::Cap::Endpoint { obj: ep_fb_reply, send: false, recv: true },
+        );
+        Some(((space, caps), (client, client_caps)))
+    });
+
+    // Hand the screen over *before* either of them runs. From here the kernel logs
+    // to the UART only; a panic takes the screen back (`console::reclaim_framebuffer`)
+    // because a fault report nobody can see is a fault report that did not happen.
+    if display.is_some() {
+        console::stop_mirroring();
+        let _ = writeln!(
+            console,
+            "framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here"
+        );
+    }
+
     // Remember the client's root table frame; after the tasks exit, teardown
     // returns it to the buddy allocator, and the next allocation should hand that
     // very frame back — visible proof the space was reclaimed, not leaked.
@@ -1305,6 +1372,12 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // senders start: the wake path is then part of what is being tested, not an
     // artefact of ordering.
     sched::spawn_user(user_task_entry, storm_rx_space, storm_rx_caps);
+    // The display server first, so it is already blocked in `Recv` when its client
+    // commits — the wake path is then part of what runs, not an artefact of order.
+    if let Some(((ds_space, ds_caps), (fbc_space, fbc_caps))) = display {
+        sched::spawn_user(user_task_entry, ds_space, ds_caps);
+        sched::spawn_user(user_task_entry, fbc_space, fbc_caps);
+    }
     sched::spawn_user(user_task_entry, storm_a_space, storm_a_caps);
     sched::spawn_user(user_task_entry, storm_b_space, storm_b_caps);
     sched::spawn_user(user_task_entry, storm_c_space, storm_c_caps);
@@ -1743,12 +1816,13 @@ unsafe fn load_segments<A: FrameAllocator>(
 /// console (if we can) and stop the core.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // SAFETY: exclusive early-boot ownership of the PL011 as in `kmain`; even if
-    // that assumption is now shaky, a best-effort panic message is worth it.
-    let mut console = unsafe { Pl011::qemu_virt() };
-    let _ = writeln!(console, "\n*** KERNEL PANIC ***");
+    // Take the screen back if a display server had it. Politeness about someone
+    // else's window is over: on a board whose only output is the panel, a panic
+    // that stays on the UART is a panic nobody sees.
+    console::reclaim_framebuffer();
+    klog!("\n*** KERNEL PANIC ***");
     if let Some(loc) = info.location() {
-        let _ = writeln!(console, "at {}:{}", loc.file(), loc.line());
+        klog!("at {}:{}", loc.file(), loc.line());
     }
     halt();
 }

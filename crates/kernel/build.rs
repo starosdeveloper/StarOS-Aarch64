@@ -85,6 +85,47 @@ fn main() {
     println!("cargo:rustc-env=STAROS_INIT_IMAGE={}", elf.display());
 
     build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld);
+    build_displaysrv(&manifest_dir, &out_dir, &rustc, &image_ld);
+}
+
+/// Build the `displaysrv` EL0 program and publish its ELF path.
+///
+/// One `rustc` step: unlike `devicemgr` it links against no crate of ours. It owns
+/// the screen and speaks a message protocol, and both of those are plain
+/// arithmetic over slices the kernel already handed it.
+fn build_displaysrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) {
+    let src = canonical(&Path::new(manifest_dir).join("../../services/displaysrv/main.rs"));
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let elf = Path::new(out_dir).join("displaysrv.elf");
+    let status = Command::new(rustc)
+        .args(["--edition", "2021"])
+        .args(["--target", "aarch64-unknown-none"])
+        .args(["--crate-name", "staros_displaysrv"])
+        .args(["--crate-type", "bin"])
+        .arg("-Copt-level=2")
+        .arg("-Cpanic=abort")
+        .arg("-Cstrip=symbols")
+        .arg(format!("-Clink-arg=-T{}", image_ld.display()))
+        .arg("-Clink-arg=-z")
+        .arg("-Clink-arg=max-page-size=4096")
+        .arg("-o")
+        .arg(&elf)
+        .arg(&src)
+        .status()
+        .expect("failed to spawn rustc for displaysrv");
+    assert!(status.success(), "rustc failed to build displaysrv");
+
+    const MAX_DISPLAYSRV_BYTES: u64 = 64 * 1024;
+    let size = std::fs::metadata(&elf)
+        .expect("displaysrv image was not produced")
+        .len();
+    assert!(
+        size <= MAX_DISPLAYSRV_BYTES,
+        "displaysrv image is {size} bytes (> {MAX_DISPLAYSRV_BYTES}); the layout regressed",
+    );
+
+    println!("cargo:rustc-env=STAROS_DISPLAYSRV_IMAGE={}", elf.display());
 }
 
 /// Build the `devicemgr` EL0 program and publish its ELF path.

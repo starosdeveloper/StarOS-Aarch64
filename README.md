@@ -15,7 +15,8 @@ with revocation, synchronous IPC, shared memory, an ELF loader, drivers and
 interrupt handling in **user space**, an SMMUv3 enforced against a real bus
 master, an initramfs, a framebuffer console, a monotonic clock user space can read
 and sleep against, waiting on a set of sources with a deadline, threads inside one
-address space, and processes loaded from a file rather than from the kernel image.
+address space, processes loaded from a file rather than from the kernel image, and
+a display server in user space that owns the screen.
 
 ## Layout
 
@@ -51,6 +52,7 @@ board `unsafe`.
 |-----------|------|
 | `services/init` | First EL0 process; `boot/image.rs` flattens the ELF to a bootable `Image` |
 | `services/devicemgr` | Device manager: parses the DTB **in user space**, mints device/IRQ capabilities from an authority cap, delegates them to drivers over IPC |
+| `services/displaysrv` | Display server: owns the framebuffer, composites client surfaces delivered as shared-memory capabilities |
 
 Both EL0 programs are built by `crates/kernel/build.rs` and embedded in the
 kernel image; there is no separate build step.
@@ -78,6 +80,7 @@ cargo krun                   # build + boot it in QEMU
 cargo kclippy                # clippy across the workspace
 cargo ktest-host             # portable-crate unit tests on the host (111 tests)
 ./scripts/smoke-test.sh      # boot the whole matrix and assert on the output
+./scripts/fb-check.sh        # assert on the *pixels* the display server composited
 ./scripts/smoke-test.sh --quick   # same, minus the slow 8-core run
 ```
 
@@ -95,6 +98,9 @@ device tree at 0x48000000 (1048576 bytes): linux,dummy-virt
   console: pl011 at 0x9000000 (+0x1000) — this console, found not assumed
 MMU enabled: true (kernel in TTBR1 at 0xffff000000000000; ...)
 framebuffer: ramfb 640x480 online (mirroring the console to the screen)
+framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
+[displaysrv] the screen is mine: kernel output stopped, pixels are a process's now
+[fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen
 clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
 clock: one tick interval (6250000 counter ticks) measured 101030 us against an expected 100000 us (agrees with the tick interval)
 smp: 4 core(s) online (PSCI v1.1)
@@ -123,8 +129,13 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **177 assertions, exit=0** on `--quick` (203 on the
+  failure signals. Currently **182 assertions, exit=0** on `--quick` (208 on the
   full matrix).
+- **`./scripts/fb-check.sh`** — the only check that cares what the screen *looks*
+  like: it boots with `ramfb`, screendumps over QMP, and asserts named coordinates
+  (the client's surface where it asked for it, the server's background around it,
+  no kernel console text left). A compositor that ignores its client's coordinates
+  passes every text assertion above and fails this one.
 
 ## Status
 

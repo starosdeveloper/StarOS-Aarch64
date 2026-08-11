@@ -263,6 +263,17 @@ req "no increments lost"
 # we only need the cheap serial gate so a broken fw_cfg driver fails CI.
 run ramfb-el2-smp4 90 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M -device ramfb
 req "framebuffer: ramfb 640x480 online"
+# The screen leaves the kernel: a process is handed the pixels, and a second
+# process with nothing but two endpoint capabilities gets its surface onto a
+# display it cannot touch. These are the *text* half of the claim — that the
+# rectangle really lands where it was asked for is pixels, and only
+# `scripts/fb-check.sh` can say so (it catches a server ignoring the client's
+# coordinates, which every line here passes).
+req "framebuffer: handed to displaysrv"
+req "[displaysrv] the screen is mine"
+req "[displaysrv] composited a client surface onto a screen the client cannot touch"
+req "[fbclient] 64x64 surface composited by displaysrv"
+forbid "SURFACE WRONG"
 # The single-core font self-test runs before SMP/tasks, so it must appear on a
 # machine with a framebuffer — and proves the line-atomic DebugWrite path is wired.
 req "[selftest] SINGLE THREAD TEST PASSED"

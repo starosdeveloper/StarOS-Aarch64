@@ -87,6 +87,14 @@ pub const USER_DTB_VA: u64 = 0x6_0000_0000;
 /// image the bootloader left.
 pub const USER_INITRD_VA: u64 = 0x9_0000_0000;
 
+/// Where a display server sees the framebuffer's pixels.
+///
+/// Its own region because the buffer is unlike everything else a process is
+/// handed: megabytes rather than a page, writable, and belonging to neither the
+/// process (teardown must not free it — it is firmware's or the GPU's) nor to any
+/// shared-memory object.
+pub const USER_FB_VA: u64 = 0xA_0000_0000;
+
 /// Top of the user stack (grows down); [`USER_STACK_PAGES`] sit just below it.
 pub const USER_STACK_TOP: u64 = 0x8_0000_0000;
 
@@ -698,6 +706,69 @@ impl AddressSpace {
             }
         }
         Some(USER_INITRD_VA + page_off)
+    }
+
+    /// Map the framebuffer's pixels (`len` bytes at physical `phys`) into this
+    /// space at [`USER_FB_VA`], read/write and EL0-accessible, and return that
+    /// virtual address.
+    ///
+    /// Carries no [`SW_OWNED`], like a device or shared mapping and for the
+    /// strongest version of the same reason: these frames were never the frame
+    /// allocator's. They are whatever the firmware or the GPU set aside before the
+    /// kernel had a pool, deliberately excluded from it — handing them back at
+    /// teardown would put memory the kernel does not own into circulation.
+    ///
+    /// Mapped as ordinary Normal memory rather than Device: a framebuffer is
+    /// written like memory, in bulk, and forcing every store through a Device
+    /// mapping would cost a display server most of its bandwidth for nothing. What
+    /// it *does* cost is a cache-maintenance obligation on hardware whose scanout
+    /// is not coherent with the CPU — real on a Pi, absent under QEMU, and the
+    /// server's problem rather than this function's.
+    ///
+    /// # Safety
+    /// As [`new`](AddressSpace::new), plus: `[phys, phys + len)` must be the real
+    /// pixel buffer, outside the frame pool, and this space must be the only one
+    /// given it.
+    pub unsafe fn map_framebuffer<A: FrameAllocator>(
+        &self,
+        alloc: &mut A,
+        phys: u64,
+        len: usize,
+    ) -> Option<u64> {
+        let page_off = phys & (PAGE_4K - 1);
+        let first_page = phys - page_off;
+        let pages = (page_off + len as u64).div_ceil(PAGE_4K);
+        for i in 0..pages {
+            let pa = first_page + i * PAGE_4K;
+            // SAFETY: forwarded from this function's contract; a table frame may be
+            // allocated for the walk, and the page is Normal RW EL0.
+            if !unsafe { self.map_page(alloc, USER_FB_VA + i * PAGE_4K, user_data_page(pa)) } {
+                return None;
+            }
+        }
+        Some(USER_FB_VA + page_off)
+    }
+
+    /// Record where the framebuffer landed and what shape it is, in this space's
+    /// data page: virtual address at `+40`, width at `+48`, height at `+52`,
+    /// stride at `+56`, all as the display server reads them.
+    ///
+    /// Seeded rather than asked for over a syscall because the server cannot ask
+    /// before it runs, and what it needs is four numbers the kernel already knows.
+    ///
+    /// # Safety
+    /// The space must have been built by [`new`](AddressSpace::new) (so its data
+    /// frame exists) and not yet be running.
+    pub unsafe fn write_fb_info(&self, fb_va: u64, width: u32, height: u32, stride: u32) {
+        // SAFETY: `data_phys` backs a 4 KiB Normal-RAM frame this space owns;
+        // offsets 40..60 are aligned and inside the page.
+        unsafe {
+            let base = mmu::phys_to_virt(self.data_phys) as *mut u8;
+            base.add(40).cast::<u64>().write_volatile(fb_va);
+            base.add(48).cast::<u32>().write_volatile(width);
+            base.add(52).cast::<u32>().write_volatile(height);
+            base.add(56).cast::<u32>().write_volatile(stride);
+        }
     }
 
     /// Map a shared-memory buffer (`pages` contiguous frames at physical `phys`)
