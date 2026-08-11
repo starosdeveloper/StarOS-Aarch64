@@ -93,39 +93,88 @@ ELF to an `Image` and hands it to QEMU's arm64 Linux boot stub — **the same
 protocol a real bootloader uses**, and the only path that passes a device tree in
 `x0`. Exit QEMU with `Ctrl-A` then `X`.
 
-The runner passes `-device ramfb`, so the machine has a screen and the kernel hands
-it to `displaysrv`. Without it there is no framebuffer to give away, the display
-server and its client are never created, and the most visible thing this system
-does would be missing from its most ordinary command. `-initrd <archive>` is *not*
-passed — the `SpawnImage` path needs an archive to load a program from, and
-`./scripts/smoke-test.sh` is what builds one.
+The runner builds a *complete* machine on purpose: `-device ramfb` so there is a
+screen to hand to `displaysrv`, `-device virtio-keyboard-device` so `inputsrv` has
+a device to find, and an initramfs built beside the image (greeting, version, and
+the `init` ELF) so the archive and `SpawnImage` paths run too. Anything left out
+here is a subsystem that reports "this machine has none" and vanishes from the
+log — which is how the display server and then the input driver each went
+unnoticed after being written. The devices cost nothing when nothing uses them.
 
-Abridged output (`ramfb-el2-smp4`, one of the smoke-test configs):
+To press a key on that keyboard, run `./scripts/input-check.sh`: a headless
+`cargo krun` has no way to deliver one, so the driver arms its queue and waits.
+
+Abridged `cargo krun` output — everything below is from one run, with only the
+device-tree detail lines and the font self-test elided:
 
 ```
-STAR OS microkernel v0.2.0 — entered at EL2, running at EL1
-device tree at 0x48000000 (1048576 bytes): linux,dummy-virt
-  intc: GICv3, dist 0x8000000, redist 0x80a0000
-  console: pl011 at 0x9000000 (+0x1000) — this console, found not assumed
-MMU enabled: true (kernel in TTBR1 at 0xffff000000000000; ...)
+STAR OS microkernel v0.2.0 — entered at EL1, running at EL1
+device tree at 0x48200000 (1048576 bytes): linux,dummy-virt
+  ram total: 256 MiB
+  reserved regions: 0
+exception vectors installed (VBAR_EL1)
+privileged access never (PAN): not implemented on this CPU
+MMU enabled: true (kernel in TTBR1 at 0xffff000000000000; RAM 0x40000000..0x50000000 Normal in the linear map; 44-bit PA per ID_AA64MMFR0_EL1)
+memory: 256 MiB RAM, 126 MiB usable, heap 1280 KiB @ 0x401a5000, 125 MiB of frames @ 0x402e5000
+kernel heap: Vec of 8 squares (last 64) sums to 204 — global allocator live
+dynamic tables: 64 objects (old max 8), 64 caps in one task (old max 4), 64 notifications (old max 4) — all grew past the old fixed limits
 framebuffer: ramfb 640x480 online (mirroring the console to the screen)
-framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
-[displaysrv] the screen is mine: kernel output stopped, pixels are a process's now
-[fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen
+syscall Yield -> 0; syscall 0xdead -> -6
 clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
-clock: one tick interval (6250000 counter ticks) measured 101030 us against an expected 100000 us (agrees with the tick interval)
-smp: 4 core(s) online (PSCI v1.1)
-smp: 4 cores x 20000 locked increments = 80000 (expected 80000) — no increments lost
+interrupt controller: GICv2 online
+clock: one tick interval (6250000 counter ticks) measured 100995 us against an expected 100000 us (agrees with the tick interval)
+smp: 1 core(s) online (PSCI v1.1)
+smp: 1 cores x 20000 locked increments = 20000 (expected 20000) — no increments lost
+smp: single core — no inter-processor interrupt to send
+loaded init ELF: 13240 bytes, entry 0x80000000
+scheduler: capability delegation (client + server) + user-space IRQ driver
+framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [fault] task 3 killed: EL0 fault at 0x40000000 (ec 0x24) — isolated, kernel continues
 [devicemgr] parsed the device tree in user space: PL011 @ 0x9000000 intid 33
 [devicemgr] delegated UART device+irq to the driver and a device to the server
+[devicemgr] found a virtio-input device at a003e00 intid 79 and delegated it to the input driver
+[devicemgr] no IOMMU on this machine; DMA capability stands but is unenforced
+[devicemgr] unpacked the initramfs in user space: 3 files, no storage driver
+[devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
+[displaysrv] the screen is mine: kernel output stopped, pixels are a process's now
+[stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand
+[fault] task 14 killed: EL0 fault at 0x7fffaffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
+[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
 [client] monotonic clock: two ClockNow reads from EL0, the second strictly later - no capability needed
-[client] SleepUntil: woke no earlier than its 20 ms absolute deadline
-[client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, ...
-[client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
+[driver] user-space UART-RX driver waiting for input
+[driver] newline received; user-space IRQ driver exiting
+[inputsrv] virtio-input driver up in EL0: queue armed, waiting for the device
 [devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
-sleep: 2 task-sleep(s) parked, 1 deadline(s) already past, 3 clock wake-up(s), worst overshoot 2889 us
+[devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
+[displaysrv] composited a client surface onto a screen the client cannot touch
+[fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen
 [child] hello - I was created at runtime, not by the kernel
+[client] SleepUntil: woke no earlier than its 20 ms absolute deadline
+#server drove the UART, then revoked it for everyone
+[child] hello - I was created at runtime, not by the kernel
+[client] read from shared memory: shared-memory works: written by the server, read by the client
+[client] read the marker from the SECOND page of a 2-page shared buffer
+[client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block
+[child] hello - I was created at runtime, not by the kernel
+[client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
+[cap] task 0 denied MapMemory(handle 0): no such capability
+[client] kernel refused a syscall pointer into an unmapped page - it walks our tables, not a range
+[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
+[ipc-storm] receiver drained every message from 3 concurrent senders, sequence sum exact - no message lost or duplicated
+[memtest] MapAnon(0) refused - a zero-page request is an error, not a page
+[memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back
+[memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
+clock: the demo took 11938 ms on the monotonic clock, during which core 0 took 94 tick(s)
+sleep: 3 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 4 clock wake-up(s), worst overshoot 18360 us
+scheduler: all tasks finished after 94 timer ticks; task table grew to 20 (old fixed max 8)
+task teardown: reaped 19 dead-task kernel stacks (608 KiB returned to the heap)
+user stacks: 40 page(s) mapped on demand (160 KiB), 1 mapped up front per task, limit 256 KiB
+preemption: timer ticks per core — cpu0=94
+ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
+frame reclaim: post-teardown alloc 0x402f5000 (exited client's root was 0x402e6000)
+frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
+  (1 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
+shutting down (PSCI SYSTEM_OFF)
 ```
 
 ## Testing
