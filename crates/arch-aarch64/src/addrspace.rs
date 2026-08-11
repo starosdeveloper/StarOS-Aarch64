@@ -871,10 +871,23 @@ impl AddressSpace {
     /// `dev_phys` must be a real device page the caller is permitted to map (the
     /// kernel gates which addresses reach here). Rewrites a live page table.
     pub unsafe fn map_device<A: FrameAllocator>(&self, alloc: &mut A, dev_phys: u64) -> Option<u64> {
+        // A page maps a page, but a device does not have to start on one. Round
+        // down to map, and hand back the address *of the device* — the offset
+        // within the page, added back.
+        //
+        // This was wrong until the first unaligned device turned up. A PL011 sits
+        // at 0x9000000 and a GIC at 0x8000000, so returning the page address
+        // happened to be returning the device address, and the bug had nothing to
+        // stand out against. QEMU's virtio-mmio slots are 0x200 bytes apart:
+        // slot 31 is at 0xa003e00, and a driver handed 0xa003000 reads slot 24 —
+        // which is empty, answers every register with zero, and looks exactly like
+        // a machine with no such device.
+        let page_off = dev_phys & (PAGE_4K - 1);
+        let page = dev_phys - page_off;
         // SAFETY: forwarded from this function's contract. The barrier/TLB flush
         // publish the new mapping to the walker for the currently active regime.
         unsafe {
-            if !self.map_page(alloc, USER_DEV_VA, user_device_page(dev_phys)) {
+            if !self.map_page(alloc, USER_DEV_VA, user_device_page(page)) {
                 return None;
             }
             asm!(
@@ -885,7 +898,7 @@ impl AddressSpace {
                 options(nostack, preserves_flags),
             );
         }
-        Some(USER_DEV_VA)
+        Some(USER_DEV_VA + page_off)
     }
 }
 

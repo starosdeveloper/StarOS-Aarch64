@@ -255,6 +255,18 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             Err(e) => e.as_raw(),
         },
 
+        // The physical address of a DMA buffer (`x0` = a DMA capability handle) —
+        // the one thing a driver must tell its device and the one address
+        // `MapDma` cannot give it, since a device has no page table.
+        Some(Syscall::DmaPhys) => match sched::resolve_cap(req.args[0] as u32) {
+            Some(Cap::Dma { obj }) => match obj::get(obj) {
+                Some(Object::DmaBuffer { phys, .. }) => phys as isize,
+                _ => KError::BadHandle.as_raw(),
+            },
+            Some(_) => KError::PermissionDenied.as_raw(),
+            None => KError::BadHandle.as_raw(),
+        },
+
         // Create a process from an ELF image the caller holds: `x0` = pointer,
         // `x1` = length, `x2` = the id to seed. The kernel never learns where the
         // bytes came from — giving it a path would mean giving it an archive

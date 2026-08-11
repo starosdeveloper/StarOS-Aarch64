@@ -195,6 +195,18 @@ pub enum Syscall {
     /// how to find its own bytes; the kernel's job is only to turn them into an
     /// address space.
     SpawnImage = 26,
+    /// The physical address of a DMA buffer: `arg0` = a *DMA* capability handle.
+    ///
+    /// [`MapDma`] gives a driver the address *it* uses; a device does not have a
+    /// page table and needs the address the memory actually lives at. Until a real
+    /// driver existed, the difference never came up — the DMA path was exercised
+    /// by a program that only read and wrote the buffer itself. A virtqueue is
+    /// memory the *device* walks, and the first thing it must be told is where.
+    ///
+    /// Disclosing a physical address is not a leak of anything: the caller already
+    /// holds the capability, the range is one the kernel allocated for exactly this
+    /// purpose, and with an IOMMU it is also the only range that device may reach.
+    DmaPhys = 27,
 }
 
 impl Syscall {
@@ -229,6 +241,7 @@ impl Syscall {
             24 => Some(Syscall::WaitAny),
             25 => Some(Syscall::SpawnThread),
             26 => Some(Syscall::SpawnImage),
+            27 => Some(Syscall::DmaPhys),
             _ => None,
         }
     }
@@ -240,11 +253,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=26 {
+        for n in 0..=27 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(27), None);
+        assert_eq!(Syscall::from_raw(28), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

@@ -86,6 +86,67 @@ fn main() {
 
     build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld);
     build_displaysrv(&manifest_dir, &out_dir, &rustc, &image_ld);
+    build_inputsrv(&manifest_dir, &out_dir, &rustc, &image_ld);
+}
+
+/// Build the `inputsrv` EL0 program and publish its ELF path.
+///
+/// Two steps, like `devicemgr`: the `virtio` crate to an rlib, then the driver
+/// against it. The layout arithmetic it needs is the *whole* reason that crate
+/// exists — a driver that computed its own ring offsets would be the one place
+/// the mistake could not be host-tested.
+fn build_inputsrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path) {
+    let virtio_src = canonical(&Path::new(manifest_dir).join("../virtio/src/lib.rs"));
+    let src = canonical(&Path::new(manifest_dir).join("../../services/inputsrv/main.rs"));
+    println!("cargo:rerun-if-changed={}", virtio_src.display());
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let virtio_rlib = Path::new(out_dir).join("libstaros_virtio.rlib");
+    let status = Command::new(rustc)
+        .args(["--edition", "2021"])
+        .args(["--target", "aarch64-unknown-none"])
+        .args(["--crate-name", "staros_virtio"])
+        .args(["--crate-type", "lib"])
+        .arg("-Copt-level=2")
+        .arg("-Cpanic=abort")
+        .arg("-o")
+        .arg(&virtio_rlib)
+        .arg(&virtio_src)
+        .status()
+        .expect("failed to spawn rustc for the virtio rlib");
+    assert!(status.success(), "rustc failed to build the virtio rlib");
+
+    let elf = Path::new(out_dir).join("inputsrv.elf");
+    let status = Command::new(rustc)
+        .args(["--edition", "2021"])
+        .args(["--target", "aarch64-unknown-none"])
+        .args(["--crate-name", "staros_inputsrv"])
+        .args(["--crate-type", "bin"])
+        .arg("-Copt-level=2")
+        .arg("-Cpanic=abort")
+        .arg("-Cstrip=symbols")
+        .arg("--extern")
+        .arg(format!("staros_virtio={}", virtio_rlib.display()))
+        .arg(format!("-Clink-arg=-T{}", image_ld.display()))
+        .arg("-Clink-arg=-z")
+        .arg("-Clink-arg=max-page-size=4096")
+        .arg("-o")
+        .arg(&elf)
+        .arg(&src)
+        .status()
+        .expect("failed to spawn rustc for inputsrv");
+    assert!(status.success(), "rustc failed to build inputsrv");
+
+    const MAX_INPUTSRV_BYTES: u64 = 64 * 1024;
+    let size = std::fs::metadata(&elf)
+        .expect("inputsrv image was not produced")
+        .len();
+    assert!(
+        size <= MAX_INPUTSRV_BYTES,
+        "inputsrv image is {size} bytes (> {MAX_INPUTSRV_BYTES}); the layout regressed",
+    );
+
+    println!("cargo:rustc-env=STAROS_INPUTSRV_IMAGE={}", elf.display());
 }
 
 /// Build the `displaysrv` EL0 program and publish its ELF path.

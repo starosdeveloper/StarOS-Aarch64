@@ -52,6 +52,16 @@ const SYS_GRANT_IRQ: usize = 13;
 const SYS_CREATE_DMA: usize = 16;
 const SYS_BIND_DMA: usize = 18;
 const SYS_SPAWN_IMAGE: usize = 26;
+const SYS_MAP_MEMORY: usize = 3;
+
+/// Virtio-mmio register offsets and values we need to *identify* a device. The
+/// full map lives in `staros_virtio`, which this program does not link — three
+/// constants are cheaper than a second rlib in the build for a program that only
+/// reads two registers.
+const VIRTIO_MAGIC: u64 = 0x000;
+const VIRTIO_DEVICE_ID: u64 = 0x008;
+const VIRTIO_MAGIC_VALUE: u32 = 0x7472_6976; // 'virt'
+const VIRTIO_DEVICE_ID_INPUT: u32 = 18;
 
 /// The error the kernel returns from `BindDma` on a machine with no IOMMU
 /// (`KError::NotSupported`), so the demo can tell "no SMMU here" from a real
@@ -69,6 +79,8 @@ const DMA_PAGES: u64 = 4;
 const AUTHORITY: u64 = 1;
 const EP_DRIVER: u64 = 2;
 const EP_SERVER: u64 = 3;
+/// The endpoint the input driver receives its device and interrupt on.
+const EP_INPUT: u64 = 4;
 
 /// A message as the IPC ABI lays it out (`staros_ipc::Message`): tag, payload
 /// words, and a capability handle to transfer. `#[repr(C)]` so the field offsets
@@ -145,6 +157,34 @@ extern "C" fn devicemgr_main() -> ! {
     send_cap(EP_DRIVER, irq_driver as u32);
     send_cap(EP_SERVER, dev_server as u32);
     puts("[devicemgr] delegated UART device+irq to the driver and a device to the server\n");
+
+    // The input device, if this machine has one. Same shape as the UART: find it,
+    // mint a device and an interrupt capability, delegate both. The difference is
+    // that finding it needed a *look* at each slot's registers rather than a
+    // property in the tree — see `find_virtio_input`.
+    match find_virtio_input(&fdt) {
+        Some((phys, intid)) => {
+            // SAFETY: minting from the authority we hold, as above.
+            let (dev, irq) = unsafe {
+                (
+                    syscall2(SYS_GRANT_DEVICE, AUTHORITY, phys),
+                    syscall2(SYS_GRANT_IRQ, AUTHORITY, u64::from(intid)),
+                )
+            };
+            if dev < 0 || irq < 0 {
+                puts("[devicemgr] could not mint capabilities for the input device\n");
+            } else {
+                send_cap(EP_INPUT, dev as u32);
+                send_cap(EP_INPUT, irq as u32);
+                puts("[devicemgr] found a virtio-input device at ");
+                put_hex(phys);
+                puts(" intid ");
+                put_dec(u64::from(intid));
+                puts(" and delegated it to the input driver\n");
+            }
+        }
+        None => puts("[devicemgr] no virtio-input device on this machine\n"),
+    }
 
     // Enforcement (roadmap 2.3): make DMA safe against a bus master. A driver we
     // trust with a DMA-capable device could, without an IOMMU, point that device
@@ -279,6 +319,59 @@ fn send_cap(ep: u64, cap: u32) {
     // SAFETY: `Send` reads a `Message` at the pointer; `Msg` matches its layout,
     // and `ep` is a send-capable endpoint handle.
     unsafe { syscall2(SYS_SEND, ep, (&raw mut msg) as u64) };
+}
+
+/// Find the virtio-mmio slot that actually holds an input device, and return its
+/// physical base and interrupt id.
+///
+/// QEMU's `virt` machine declares **thirty-two** identical `virtio,mmio` nodes and
+/// leaves almost all of them empty; which one is populated depends on the order
+/// `-device` arguments were given. So the tree cannot answer this on its own: the
+/// only way to tell is to look at each slot's `DeviceID` register, which means
+/// mapping it. That is exactly what a device manager is for — it holds the
+/// authority to mint a capability for any page, so it can look where a driver may
+/// not, and hand on only the one slot that matters.
+fn find_virtio_input(fdt: &Fdt<'_>) -> Option<(u64, u32)> {
+    for node in fdt.find_all_compatible("virtio,mmio") {
+        let Some((phys, _)) = node.reg().and_then(|mut r| r.next()) else {
+            continue;
+        };
+        let Some((kind, number, _)) = node
+            .interrupts(GIC_INTERRUPT_CELLS)
+            .and_then(|mut i| i.next())
+        else {
+            continue;
+        };
+        let intid = if kind == 0 { SPI_BASE + number } else { number };
+
+        // Mint ourselves a capability for this slot and map it. The mapping goes
+        // to the same fixed address every time, so each slot is inspected and
+        // replaced — we are looking, not keeping.
+        // SAFETY: `GrantDevice` mints from the authority we hold; `MapMemory` maps
+        // the page the capability names into our own space.
+        let va = unsafe {
+            let cap = syscall2(SYS_GRANT_DEVICE, AUTHORITY, phys);
+            if cap < 0 {
+                continue;
+            }
+            syscall1(SYS_MAP_MEMORY, cap as u64)
+        };
+        if va < 0 {
+            continue;
+        }
+        // SAFETY: the page is mapped Device memory, read-only here; these two
+        // registers exist on every virtio-mmio transport, populated or not.
+        let (magic, device_id) = unsafe {
+            (
+                ((va as u64 + VIRTIO_MAGIC) as *const u32).read_volatile(),
+                ((va as u64 + VIRTIO_DEVICE_ID) as *const u32).read_volatile(),
+            )
+        };
+        if magic == VIRTIO_MAGIC_VALUE && device_id == VIRTIO_DEVICE_ID_INPUT {
+            return Some((phys, intid));
+        }
+    }
+    None
 }
 
 /// Find the first PL011 UART in the tree and return its physical base and GIC

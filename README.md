@@ -16,7 +16,8 @@ interrupt handling in **user space**, an SMMUv3 enforced against a real bus
 master, an initramfs, a framebuffer console, a monotonic clock user space can read
 and sleep against, waiting on a set of sources with a deadline, threads inside one
 address space, processes loaded from a file rather than from the kernel image, and
-a display server in user space that owns the screen.
+a display server in user space that owns the screen, and a virtio-input driver that
+decodes real key events without the kernel seeing one.
 
 ## Layout
 
@@ -32,6 +33,7 @@ a display server in user space that owns the screen.
 | `crates/cpio` | `newc` archive reader (Linux initramfs format) |
 | `crates/framebuffer` | 8×8 font + text console over an arbitrary pixel format |
 | `crates/videocore` | Raspberry Pi VideoCore property-mailbox **messages** (no MMIO) |
+| `crates/virtio` | Split-virtqueue layout, MMIO register map, input event format (no MMIO) |
 | `crates/iommu` | SMMUv3 descriptor/queue bit layouts (no MMIO) |
 
 The split is deliberate and repeated: every subsystem whose bugs hide in *layout*
@@ -53,8 +55,9 @@ board `unsafe`.
 | `services/init` | First EL0 process; `boot/image.rs` flattens the ELF to a bootable `Image` |
 | `services/devicemgr` | Device manager: parses the DTB **in user space**, mints device/IRQ capabilities from an authority cap, delegates them to drivers over IPC |
 | `services/displaysrv` | Display server: owns the framebuffer, composites client surfaces delivered as shared-memory capabilities |
+| `services/inputsrv` | virtio-input driver: virtqueue, interrupt and event decoding, all in EL0 |
 
-Both EL0 programs are built by `crates/kernel/build.rs` and embedded in the
+All four EL0 programs are built by `crates/kernel/build.rs` and embedded in the
 kernel image; there is no separate build step.
 
 ## Prerequisites
@@ -78,9 +81,10 @@ intrinsics); prefer them over a bare `cargo build`.
 cargo kbuild                 # build the kernel ELF for aarch64
 cargo krun                   # build + boot it in QEMU (with a framebuffer)
 cargo kclippy                # clippy across the workspace
-cargo ktest-host             # portable-crate unit tests on the host (111 tests)
+cargo ktest-host             # portable-crate unit tests on the host (123 tests)
 ./scripts/smoke-test.sh      # boot the whole matrix and assert on the output
 ./scripts/fb-check.sh        # assert on the *pixels* the display server composited
+./scripts/input-check.sh     # press a key on the emulated keyboard and check the driver decoded it
 ./scripts/smoke-test.sh --quick   # same, minus the slow 8-core run
 ```
 
@@ -128,16 +132,19 @@ sleep: 2 task-sleep(s) parked, 1 deadline(s) already past, 3 clock wake-up(s), w
 
 Two layers, deliberately different in kind:
 
-- **`cargo ktest-host`** — 113 tests over the portable crates (`abi`, `hal`,
-  `cpio`, `fdt`, `framebuffer`, `videocore`, `iommu`, `mm`, `ipc`, `init`),
+- **`cargo ktest-host`** — 123 tests over the portable crates (`abi`, `hal`,
+  `cpio`, `fdt`, `framebuffer`, `videocore`, `virtio`, `iommu`, `mm`, `ipc`, `init`),
   including `fdt` against real `.dtb` blobs, `cpio` against a real archive, and
   `hal`'s tick↔nanosecond arithmetic against the frequencies real machines report.
   Fast, and they cover the code whose bugs are silent.
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **182 assertions, exit=0** on `--quick` (208 on the
+  failure signals. Currently **189 assertions, exit=0** on `--quick` (215 on the
   full matrix).
+- **`./scripts/input-check.sh`** — the only check that makes the *outside world*
+  act: QEMU synthesises a real key event, and the assertion is that a driver in EL0
+  decoded it, with no kernel code anywhere in the path.
 - **`./scripts/fb-check.sh`** — the only check that cares what the screen *looks*
   like: it boots with `ramfb`, screendumps over QMP, and asserts named coordinates
   (the client's surface where it asked for it, the server's background around it,

@@ -47,6 +47,10 @@ static DEVICEMGR_IMAGE: &[u8] = include_bytes!(env!("STAROS_DEVICEMGR_IMAGE"));
 /// id but a mapping nobody else is given — the screen.
 static DISPLAYSRV_IMAGE: &[u8] = include_bytes!(env!("STAROS_DISPLAYSRV_IMAGE"));
 
+/// The input driver's image. Also its own program: it links against the `virtio`
+/// crate, and what it drives is a device the kernel has never heard of.
+static INPUTSRV_IMAGE: &[u8] = include_bytes!(env!("STAROS_INPUTSRV_IMAGE"));
+
 mod cap;
 mod console;
 mod elf;
@@ -1219,6 +1223,8 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // The display protocol: a client's commit request and the server's reply.
     let ep_fb = obj::create(obj::Object::Endpoint { id: 5 }).expect("ep_fb object");
     let ep_fb_reply = obj::create(obj::Object::Endpoint { id: 6 }).expect("ep_fb_reply object");
+    // The device manager's grants to the input driver.
+    let ep_input = obj::create(obj::Object::Endpoint { id: 7 }).expect("ep_input object");
 
     // The *only* device policy the kernel still holds: the authority to mint. It
     // pre-mints no UART objects at all now — the device manager (id 7) reads the
@@ -1279,6 +1285,7 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     cap::install(&mut devicemgr_caps, cap::Cap::DeviceAuthority { obj: authority });
     cap::install(&mut devicemgr_caps, cap::Cap::Endpoint { obj: ep_drv, send: true, recv: false });
     cap::install(&mut devicemgr_caps, cap::Cap::Endpoint { obj: ep_srv, send: true, recv: false });
+    cap::install(&mut devicemgr_caps, cap::Cap::Endpoint { obj: ep_input, send: true, recv: false });
 
     // The storm tasks: each sender gets send-only, the receiver recv-only, on the
     // one shared endpoint — handle 1 in every case, which is what the role code in
@@ -1356,6 +1363,28 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         );
     }
 
+    // The input driver. Built unconditionally — whether the machine *has* an input
+    // device is not the kernel's business to know: the driver receives a capability
+    // or it does not, and either way the kernel's part is the same three
+    // primitives. It holds nothing but the endpoint it receives on.
+    let input = (|| {
+        // SAFETY: as every other space built here.
+        let space = mem::with(|frames| unsafe {
+            let mut s = AddressSpace::new(frames)?;
+            let img = elf::Elf::parse(INPUTSRV_IMAGE)?;
+            if !load_segments(&mut s, frames, &img) {
+                s.destroy(frames);
+                return None;
+            }
+            s.set_entry(img.entry());
+            s.write_id(15);
+            Some(s)
+        })?;
+        let mut caps = cap::empty_caps()?;
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_input, send: false, recv: true });
+        Some((space, caps))
+    })();
+
     // Remember the client's root table frame; after the tasks exit, teardown
     // returns it to the buddy allocator, and the next allocation should hand that
     // very frame back — visible proof the space was reclaimed, not leaked.
@@ -1367,6 +1396,12 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     sched::spawn_user(user_task_entry, canary_space, canary_caps);
     sched::spawn_user(user_task_entry, memtest_space, memtest_caps);
     sched::spawn_user(user_task_entry, spawner_space, spawner_caps);
+    // Before the device manager, so it is already blocked in `Recv` when the
+    // manager delegates — otherwise the grants queue up and the ordering, rather
+    // than the wake path, is what makes the demo work.
+    if let Some((space, caps)) = input {
+        sched::spawn_user(user_task_entry, space, caps);
+    }
     sched::spawn_user(user_task_entry, devicemgr_space, devicemgr_caps);
     // The receiver goes in first so it is already blocked in `Recv` when the
     // senders start: the wake path is then part of what is being tested, not an

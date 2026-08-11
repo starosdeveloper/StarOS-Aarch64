@@ -1,0 +1,18 @@
+[package]
+name = "staros-virtio"
+description = "Virtio split-virtqueue layout and MMIO register map — zero-allocation, host-testable"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Dependency-free, same discipline as `fdt`/`cpio`/`videocore`: a virtqueue is a
+# structure in memory, and every way of getting it wrong is a layout mistake that
+# produces silence rather than an error. The doorbell — the MMIO write that tells
+# the device to look — lives in the driver.
+[dependencies]

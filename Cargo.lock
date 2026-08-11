@@ -88,3 +88,7 @@ dependencies = [
 [[package]]
 name = "staros-videocore"
 version = "0.2.0"
+
+[[package]]
+name = "staros-virtio"
+version = "0.2.0"

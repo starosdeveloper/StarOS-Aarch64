@@ -893,6 +893,26 @@ Done:
   that ignores the client's requested position passes every text assertion in the
   smoke matrix (the pixel count still matches) and fails the pixel check.
 
+- **Input, driven entirely in EL0 (`crates/virtio`, `services/inputsrv`).** A key
+  pressed outside the machine reaches a program in user space without the kernel
+  reading a device register, touching a ring, or seeing an event: it supplies a
+  capability that maps one MMIO page, one that turns an interrupt into a
+  notification, and physically-contiguous memory. The layout half — virtqueue
+  offsets, the register map, the event format — is a pure crate with 10 host tests,
+  because a ring at the wrong offset produces silence rather than an error. The
+  driver is the first real user of `CreateDma`: a virtqueue is memory the *device*
+  walks by physical address.
+
+  Three defects surfaced that only a real driver could find. `MapMemory` returned
+  the address of the *page* rather than of the device — invisible while every
+  device was page-aligned (PL011 at 0x9000000, GIC at 0x8000000), fatal for QEMU's
+  virtio-mmio slots, which are 0x200 apart. The ABI had no way to ask where a DMA
+  buffer physically *is*, which no earlier user needed because none of them let a
+  device walk the memory; that is now `DmaPhys`. And the device tree cannot say
+  which of its 32 identical `virtio,mmio` slots is populated — only the `DeviceID`
+  register can, so the device manager (which holds the authority) looks, and hands
+  the driver only the slot that answered.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not

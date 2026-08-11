@@ -136,6 +136,11 @@ run() {
     # The receiver checks the sum of every sequence number it drained, so a message
     # lost or duplicated by the ring/wait-queue path prints MISMATCH instead — on
     # every machine in the matrix, single-core included.
+    # The input driver comes up on every machine; whether it is *given* a device
+    # depends on the machine, and claiming one that is not there is the failure
+    # worth forbidding everywhere. The key-press half needs a synthesised event
+    # and lives in `scripts/input-check.sh`.
+    forbid "[inputsrv] that is not a virtio-input device"
     req "[ipc-storm] receiver drained every message"
     forbid "SEQUENCE SUM MISMATCH"
     # Demand-paged stacks: a task starts with ONE mapped stack page, walks 40 pages

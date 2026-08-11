@@ -7,6 +7,7 @@ members = [
     "crates/fdt",
     "crates/framebuffer",
     "crates/videocore",
+    "crates/virtio",
     "crates/iommu",
     "crates/mm",
     "crates/ipc",
@@ -41,6 +42,7 @@ staros-cpio = { path = "crates/cpio" }
 staros-fdt = { path = "crates/fdt" }
 staros-framebuffer = { path = "crates/framebuffer" }
 staros-videocore = { path = "crates/videocore" }
+staros-virtio = { path = "crates/virtio" }
 staros-iommu = { path = "crates/iommu" }
 staros-mm = { path = "crates/mm" }
 staros-ipc = { path = "crates/ipc" }
