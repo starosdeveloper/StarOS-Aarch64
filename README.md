@@ -76,7 +76,7 @@ intrinsics); prefer them over a bare `cargo build`.
 
 ```bash
 cargo kbuild                 # build the kernel ELF for aarch64
-cargo krun                   # build + boot it in QEMU
+cargo krun                   # build + boot it in QEMU (with a framebuffer)
 cargo kclippy                # clippy across the workspace
 cargo ktest-host             # portable-crate unit tests on the host (111 tests)
 ./scripts/smoke-test.sh      # boot the whole matrix and assert on the output
@@ -88,6 +88,13 @@ cargo ktest-host             # portable-crate unit tests on the host (111 tests)
 ELF to an `Image` and hands it to QEMU's arm64 Linux boot stub — **the same
 protocol a real bootloader uses**, and the only path that passes a device tree in
 `x0`. Exit QEMU with `Ctrl-A` then `X`.
+
+The runner passes `-device ramfb`, so the machine has a screen and the kernel hands
+it to `displaysrv`. Without it there is no framebuffer to give away, the display
+server and its client are never created, and the most visible thing this system
+does would be missing from its most ordinary command. `-initrd <archive>` is *not*
+passed — the `SpawnImage` path needs an archive to load a program from, and
+`./scripts/smoke-test.sh` is what builds one.
 
 Abridged output (`ramfb-el2-smp4`, one of the smoke-test configs):
 

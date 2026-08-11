@@ -31,10 +31,19 @@ fi
 image="${elf}.img"
 "$objcopy" -O binary "$elf" "$image"
 
+# `-device ramfb` is on by default, and that is a deliberate change of what the
+# plain `cargo krun` shows. A machine with no framebuffer gives the kernel no
+# screen to hand over, so `displaysrv` and its client are never created and the
+# most visible thing this system does is invisible in its most ordinary command.
+# The device costs nothing when nothing draws (the guest allocates the buffer), and
+# `-display none` keeps the run headless — the pixels are inspected with
+# `scripts/fb-check.sh`, not by opening a window.
 exec qemu-system-aarch64 \
     -M virt,gic-version=2 \
     -cpu cortex-a72 \
     -m 256M \
     -nographic \
+    -display none \
+    -device ramfb \
     -kernel "$image" \
     "$@"
