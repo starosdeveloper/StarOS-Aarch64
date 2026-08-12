@@ -112,6 +112,138 @@ fn main() {
     // will arrive through, exercised by something small enough to debug.
     let libc = build_libc(&manifest_dir, &out_dir, &rustc, &abi_rlib);
     build_hello_c(&manifest_dir, &out_dir, &image_ld, &objcopy, &libc);
+    build_hello_cpp(&manifest_dir, &out_dir, &image_ld, &objcopy, &libc);
+}
+
+/// The C++ standard library's headers on this host, as (`include`, `include/<triple>`).
+///
+/// The templates in those headers are portable; the second directory holds
+/// `bits/c++config.h`, which was generated for the *host's* triple. Using it for an
+/// AArch64 build is sound for the parts that matter here — both are LP64 with the
+/// same atomics — and it is what makes a C++ program possible at all without
+/// building libstdc++ from source. The day it stops being sound, it will stop at
+/// the first `static_assert`, not silently.
+fn libstdcxx_headers() -> Option<(PathBuf, PathBuf)> {
+    let root = Path::new("/usr/include/c++");
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("vector").is_file())
+        .collect();
+    // Newest first: the directory names are version numbers.
+    versions.sort();
+    let include = versions.pop()?;
+    let target = std::fs::read_dir(&include)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.join("bits/c++config.h").is_file())?;
+    Some((include, target))
+}
+
+/// Build `services/hello-cpp`: the phase's checkpoint — a C++ program with
+/// `std::vector`, `std::string`, `std::thread` and a static object with a
+/// destructor, running in EL0.
+///
+/// Two translation units: the program, and `crates/staros-libc/cxx/runtime.cpp`,
+/// which supplies the compiled half of the standard library that normally comes
+/// from `libstdc++.a`. Skipped, with a warning, on a host that has neither clang
+/// nor the C++ headers — the kernel then reports that there is no C++ demo rather
+/// than pretending one ran.
+fn build_hello_cpp(
+    manifest_dir: &str,
+    out_dir: &str,
+    image_ld: &Path,
+    objcopy: &Path,
+    libc: &Path,
+) {
+    let src = canonical(&Path::new(manifest_dir).join("../../services/hello-cpp/main.cpp"));
+    let runtime = canonical(&Path::new(manifest_dir).join("../staros-libc/cxx/runtime.cpp"));
+    let headers = canonical(&Path::new(manifest_dir).join("../staros-libc/include"));
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", runtime.display());
+    println!("cargo:rerun-if-changed={}", headers.display());
+
+    let absent = Path::new(out_dir).join("hello-cpp.absent");
+    let skip = |why: &str| {
+        println!("cargo:warning={why}; the C++ demo program will be absent");
+        std::fs::write(&absent, []).expect("failed to write the placeholder image");
+        println!("cargo:rustc-env=STAROS_HELLO_CPP_IMAGE={}", absent.display());
+    };
+
+    let (Ok(clangxx), Some((cxx_include, cxx_target_include))) =
+        (which("clang++"), libstdcxx_headers())
+    else {
+        skip("clang++ or the C++ standard headers were not found");
+        return;
+    };
+
+    // `-fno-exceptions -fno-rtti` is the roadmap's decision for the whole C++ side
+    // (Qt supports it as `QT_NO_EXCEPTIONS`): it keeps the unwinder, `.eh_frame`
+    // and `__cxa_throw` out of the system entirely. `-nostdlibinc` drops the host's
+    // C headers so the ones in `crates/staros-libc/include` are the only ones in
+    // play — a C++ program compiled against glibc's headers and linked against this
+    // libc would disagree about structure layouts and fail at run time.
+    let mut objects = Vec::new();
+    for (name, file) in [("hello-cpp.o", &src), ("cxx-runtime.o", &runtime)] {
+        let object = Path::new(out_dir).join(name);
+        let status = Command::new(&clangxx)
+            .args(["--target=aarch64-unknown-none", "-nostdlibinc", "-std=c++17"])
+            .args(["-fno-exceptions", "-fno-rtti", "-fno-omit-frame-pointer"])
+            .args(["-fno-stack-protector", "-fno-pie", "-O1", "-g", "-c"])
+            .arg("-isystem")
+            .arg(&cxx_include)
+            .arg("-isystem")
+            .arg(&cxx_target_include)
+            .arg("-isystem")
+            .arg(&headers)
+            .arg(file)
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .expect("failed to spawn clang++");
+        if !status.success() {
+            skip("clang++ could not compile the C++ demo against these headers");
+            return;
+        }
+        objects.push(object);
+    }
+
+    let lld = llvm_tool("rust-lld").expect("rust-lld is part of the Rust toolchain");
+    let debug_elf = Path::new(out_dir).join("hello-cpp.debug.elf");
+    let elf = Path::new(out_dir).join("hello-cpp.elf");
+    let status = Command::new(lld)
+        .args(["-flavor", "gnu"])
+        .arg(format!("-T{}", image_ld.display()))
+        .arg("-z")
+        .arg("max-page-size=4096")
+        .arg("-z")
+        .arg("norelro")
+        .arg("--gc-sections")
+        .arg("-o")
+        .arg(&debug_elf)
+        .args(&objects)
+        .arg(libc)
+        .status()
+        .expect("failed to spawn rust-lld");
+    if !status.success() {
+        skip("the C++ demo did not link");
+        return;
+    }
+    strip_to(objcopy, &debug_elf, &elf);
+
+    // A C++ program is bigger than a C one — templates instantiate — but it is
+    // still a program, not a library. Past this bound something stopped being
+    // garbage-collected.
+    const MAX_HELLO_CPP_BYTES: u64 = 512 * 1024;
+    let size = std::fs::metadata(&elf).expect("hello-cpp image was not produced").len();
+    assert!(
+        size <= MAX_HELLO_CPP_BYTES,
+        "hello-cpp image is {size} bytes (> {MAX_HELLO_CPP_BYTES}); check --gc-sections",
+    );
+
+    println!("cargo:rustc-env=STAROS_HELLO_CPP_IMAGE={}", elf.display());
 }
 
 /// Compile one dependency-free crate of ours to an rlib for the bare-metal target.

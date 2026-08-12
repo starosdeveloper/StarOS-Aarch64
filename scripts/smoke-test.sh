@@ -273,6 +273,18 @@ if [ -n "$INITRAMFS" ]; then
     # rather than returned from. The number in the line is measured, so only the
     # prefix is asserted.
     req "[hello-c] poll: a thread slept on an eventfd and a pipe"
+    # The phase's checkpoint: a C++ program with the real standard library — three
+    # std::threads under a std::mutex, 68 std::strings through a reallocating
+    # std::vector — plus the two halves of static initialisation. The constructor
+    # line proves `.init_array` ran; the destructor line proves `__cxa_atexit` did,
+    # and it is printed *after* main returned, so a runtime that forgets it loses
+    # only that line and nothing else.
+    req "[hello-cpp] a namespace-scope constructor ran before main"
+    req "[hello-cpp] a static local was constructed on first use"
+    req "[hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads"
+    req "[hello-cpp] the static local's destructor ran at exit"
+    forbid "[hello-cpp] FAIL"
+    forbid "C++ RUNTIME BROKEN"
     # An EL0 fault now reports where it happened, not just that it did.
     req "[fault]   backtrace ("
 else

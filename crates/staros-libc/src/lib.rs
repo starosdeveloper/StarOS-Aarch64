@@ -47,6 +47,7 @@
 // guard, several function calls away from anything that looks related.
 #![cfg_attr(not(test), no_builtins)]
 
+pub mod cxx;
 pub mod fd;
 pub mod fmt;
 pub mod file;
@@ -136,6 +137,10 @@ pub unsafe extern "C" fn _start() -> ! {
     let mut name = *b"program\0";
     let mut argv: [*mut core::ffi::c_char; 2] =
         [name.as_mut_ptr().cast::<core::ffi::c_char>(), core::ptr::null_mut()];
+    // Constructors before `main`: a C program's `.init_array` is empty and never
+    // notices, a C++ program's holds every namespace-scope object it declared.
+    // SAFETY: the entries are function pointers the compiler emitted for this image.
+    unsafe { cxx::run_init_array() };
     // SAFETY: `main` is provided by the program being linked; this is the C ABI.
     let status = unsafe { main(1, argv.as_mut_ptr()) };
     exit_process(status)
@@ -150,6 +155,10 @@ pub unsafe extern "C" fn _start() -> ! {
 /// like a client that walked away.
 #[cfg(not(test))]
 fn exit_process(status: c_int) -> ! {
+    // Destructors first, while the console and the file server are still usable —
+    // a static object's destructor that wants to log has nowhere to log after the
+    // flush below.
+    cxx::run_atexit();
     stdio::flush();
     file::shutdown();
     sys::exit(status)

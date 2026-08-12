@@ -21,7 +21,9 @@ decodes real key events without the kernel seeing one, a file server that hands
 files to processes holding no archive, and a **C program** — compiled by clang
 against this tree's own libc — that prints, allocates, sleeps, reads files, runs
 `pthread`s with real thread-local storage and blocks in `poll` until another thread
-writes to an eventfd, without a syscall in sight.
+writes to an eventfd, without a syscall in sight. And a **C++ program** on top of
+that, with `std::vector`, `std::string`, `std::thread` and a static object whose
+destructor runs at exit.
 
 ## Layout
 
@@ -63,11 +65,20 @@ board `unsafe`.
 | `services/inputsrv` | virtio-input driver: virtqueue, interrupt and event decoding, all in EL0 |
 | `services/fssrv` | File server: owns the initramfs, answers `Open`/`Read`/`Stat`/`Close` over IPC through a client-supplied shared buffer |
 | `services/fsclient` | A process with no archive and no device, reading a file anyway — the only way "these bytes arrived over IPC" means anything |
-| `services/hello-c` | A program written in **C**, compiled by clang and linked against `crates/staros-libc` — the toolchain Qt will arrive through, exercised by something small enough to debug: formatting, the heap, the clock, files and four threads with their own TLS |
+| `services/hello-c` | A program written in **C**, compiled by clang and linked against `crates/staros-libc` — the toolchain Qt will arrive through, exercised by something small enough to debug: formatting, the heap, the clock, files, four threads with their own TLS, and `poll` |
+| `services/hello-cpp` | A program written in **C++** with the real standard library: `std::vector<std::string>`, `std::sort`, three `std::thread`s under a `std::mutex`, a namespace-scope constructor and a function-local static whose destructor runs at exit |
 
-All seven EL0 programs are built by `crates/kernel/build.rs` and embedded in the
-kernel image; there is no separate build step. The C one is skipped, with a
-warning, on a host with no clang.
+All eight EL0 programs are built by `crates/kernel/build.rs` and embedded in the
+kernel image; there is no separate build step. The C and C++ ones are skipped, with
+a warning, on a host without clang or the C++ standard headers.
+
+The C++ half deserves a note, because there is no `libc++` here and none was built:
+the standard library's *templates* come from the host's libstdc++ headers compiled
+against this tree's own C headers (`crates/staros-libc/include`), and its *compiled*
+half — `operator new`, the `__cxa_*` ABI hooks, the `__throw_*` helpers a
+`-fno-exceptions` build still calls, and the three out-of-line functions behind
+`std::thread` — is written in `crates/staros-libc/cxx/runtime.cpp`. That list was
+not designed; the linker named every symbol in it, one at a time.
 
 ## Prerequisites
 
@@ -168,7 +179,12 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [displaysrv] composited a client surface onto a screen the client cannot touch
 [fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen
 [fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
-[hello-c] clock: 133086384 ns across a 20 ms nanosleep
+[hello-c] clock: 201651840 ns across a 20 ms nanosleep
+[hello-cpp] a namespace-scope constructor ran before main
+[hello-cpp] a C++ program in EL0: vector, string, thread, and a static with a destructor
+[hello-cpp] a static local was constructed on first use
+[hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads
+[hello-cpp] the static local's destructor ran at exit, holding 2 entries
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 #server drove the UART, then revoked it for everyone
 [child] hello - I was created at runtime, not by the kernel
@@ -194,17 +210,17 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
-[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 22302288 ns
+[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 22007440 ns
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 7 requests, 44 bytes of file data, and refused 1 - the archive never left this address space
-clock: the demo took 13520 ms on the monotonic clock, during which core 0 took 106 tick(s)
-sleep: 4 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 5 clock wake-up(s), worst overshoot 16043 us
-scheduler: all tasks finished after 106 timer ticks; task table grew to 28 (old fixed max 8)
-task teardown: reaped 27 dead-task kernel stacks (864 KiB returned to the heap)
+clock: the demo took 11438 ms on the monotonic clock, during which core 0 took 95 tick(s)
+sleep: 4 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 6 clock wake-up(s), worst overshoot 13077 us
+scheduler: all tasks finished after 95 timer ticks; task table grew to 34 (old fixed max 8)
+task teardown: reaped 33 dead-task kernel stacks (1056 KiB returned to the heap)
 user stacks: 40 page(s) mapped on demand (160 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=106
+preemption: timer ticks per core — cpu0=95
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x40307000 (exited client's root was 0x402f8000)
+frame reclaim: post-teardown alloc 0x40306000 (exited client's root was 0x40306000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
   (1 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
 shutting down (PSCI SYSTEM_OFF)
@@ -223,7 +239,7 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **203 assertions, exit=0** on `--quick` (230 on the
+  failure signals. Currently **209 assertions, exit=0** on `--quick` (236 on the
   full matrix).
 - **`./scripts/input-check.sh`** — the only check that makes the *outside world*
   act: QEMU synthesises a real key event, and the assertion is that a driver in EL0

@@ -64,6 +64,11 @@ static FSCLIENT_IMAGE: &[u8] = include_bytes!(env!("STAROS_FSCLIENT_IMAGE"));
 /// kernel reports rather than pretending the program ran.
 static HELLO_C_IMAGE: &[u8] = include_bytes!(env!("STAROS_HELLO_C_IMAGE"));
 
+/// A program written in **C++**, with `std::vector`, `std::string`, `std::thread`
+/// and a static object whose destructor runs at exit. Empty when the build host had
+/// no C++ compiler or standard headers.
+static HELLO_CPP_IMAGE: &[u8] = include_bytes!(env!("STAROS_HELLO_CPP_IMAGE"));
+
 mod cap;
 mod console;
 mod elf;
@@ -1459,6 +1464,31 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         file_pair(HELLO_C_IMAGE, 18, 19, ep_fs2, ep_fs2_reply)
     };
 
+    // The C++ program. It holds **no capabilities at all**: everything it does —
+    // the console, the heap, threads, notifications — needs none, which is worth
+    // seeing in one place. If the build host had no C++ compiler its image is
+    // empty and the kernel says so instead of pretending.
+    let cpp = if HELLO_CPP_IMAGE.is_empty() {
+        let _ = writeln!(
+            console,
+            "no C++ program in this image: the build host had no clang++ or C++ headers"
+        );
+        None
+    } else {
+        // SAFETY: as every other space built here.
+        mem::with(|frames| unsafe {
+            let mut s = AddressSpace::new(frames)?;
+            let img = elf::Elf::parse(HELLO_CPP_IMAGE)?;
+            if !load_segments(&mut s, frames, &img) {
+                s.destroy(frames);
+                return None;
+            }
+            s.set_entry(img.entry());
+            s.write_id(20);
+            Some(s)
+        })
+    };
+
     // The input driver. Built unconditionally — whether the machine *has* an input
     // device is not the kernel's business to know: the driver receives a capability
     // or it does not, and either way the kernel's part is the same three
@@ -1519,6 +1549,13 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     if let Some(((fs_space, fs_caps), (c_space, c_caps))) = c_files {
         sched::spawn_user(user_task_entry, fs_space, fs_caps);
         sched::spawn_user(user_task_entry, c_space, c_caps);
+    }
+    if let Some(cpp_space) = cpp {
+        sched::spawn_user(
+            user_task_entry,
+            cpp_space,
+            cap::empty_caps().expect("hello-cpp caps"),
+        );
     }
     sched::spawn_user(user_task_entry, storm_a_space, storm_a_caps);
     sched::spawn_user(user_task_entry, storm_b_space, storm_b_caps);

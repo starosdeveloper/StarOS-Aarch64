@@ -67,6 +67,37 @@ SECTIONS
         __tbss_end = .;
     }
 
+    /* Constructors, and the symbols the C runtime walks them with. A C program's
+     * `.init_array` is empty; a C++ program's holds one entry per namespace-scope
+     * object with a constructor, and a runtime that does not run them starts with
+     * those objects unbuilt — a failure that shows up far from its cause. */
+    .init_array : {
+        __init_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+        KEEP(*(.init_array))
+        __init_array_end = .;
+    }
+
+    /* The global offset table, and relocated read-only data.
+     *
+     * These used to be discarded, on the reasoning that a `-no-pie` program linked
+     * at a fixed address needs no indirection. That is true of the *code* this tree
+     * writes and false of C++: the compiler reaches some symbols through the GOT
+     * regardless, and with the section discarded those `adrp`/`ldr` pairs resolved
+     * to address zero. The symptom was a C++ thread faulting at 0x0 three frames
+     * into `std::thread`, with nothing in the source anywhere near a null pointer.
+     *
+     * Keeping the GOT costs a few words and no run-time work: with static
+     * relocations lld fills each entry with the final address at link time. */
+    .got : {
+        *(.got)
+        *(.got.plt)
+    }
+
+    .data.rel.ro : {
+        *(.data.rel.ro .data.rel.ro.*)
+    }
+
     .data : {
         *(.data .data.*)
     }
@@ -77,7 +108,6 @@ SECTIONS
     }
 
     /DISCARD/ : {
-        *(.got*)
         *(.comment)
         *(.note*)
         *(.eh_frame*)
