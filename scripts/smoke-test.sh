@@ -252,6 +252,20 @@ if [ -n "$INITRAMFS" ]; then
     # the archive lives at *in the server* and the kernel kills it for that.
     req "EL0 fault at 0x900000000"
     forbid "I READ THE ARCHIVE DIRECTLY"
+    # A program written in C, compiled by clang against crates/staros-libc: printf,
+    # malloc, the clock and the file server, with every result checked inside the
+    # program itself. The one line asserted here is the one it prints only if every
+    # check passed — the individual FAIL lines are forbidden separately so a partial
+    # failure cannot hide behind a missing summary.
+    req "[hello-c] a C program in EL0"
+    req "[hello-c] C RUNTIME OK - every check passed"
+    forbid "[hello-c] FAIL"
+    forbid "C RUNTIME BROKEN"
+    # The C program reaches the same file through the same server as fsclient, but
+    # through open/read/lseek rather than raw IPC.
+    req "[hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: $GREETING"
+    # An EL0 fault now reports where it happened, not just that it did.
+    req "[fault]   backtrace ("
 else
     run gicv2-el1-smp1 90 -- -M virt,gic-version=2 -cpu cortex-a72 -smp 1 -m 512M
     req "no initramfs on this machine"

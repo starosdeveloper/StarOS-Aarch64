@@ -1,0 +1,15 @@
+[package]
+name = "staros-libc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The C library for EL0 programs: the layers of the G5 contract that need no threads"
+
+[dependencies]
+staros-abi = { path = "../abi" }
+
+[lib]
+# `rlib` for the host tests and for `--extern` in `build.rs`; the bare-metal
+# `staticlib` that C links against is produced by `build.rs` with a direct `rustc`
+# invocation, exactly like the other EL0 artefacts.
+crate-type = ["rlib"]

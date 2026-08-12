@@ -4,6 +4,7 @@ members = [
     "crates/abi",
     "crates/hal",
     "crates/cpio",
+    "crates/staros-libc",
     "crates/fdt",
     "crates/framebuffer",
     "crates/videocore",

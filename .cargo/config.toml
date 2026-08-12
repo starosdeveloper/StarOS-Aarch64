@@ -31,4 +31,4 @@ kbuild = "build -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-f
 krun = "run -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
 kclippy = "clippy -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
 # Run the pure-logic tests (abi/fdt/mm/ipc) on the host.
-ktest-host = "test -p staros-abi -p staros-hal -p staros-cpio -p staros-fdt -p staros-framebuffer -p staros-videocore -p staros-virtio -p staros-iommu -p staros-mm -p staros-ipc -p staros-init --target x86_64-unknown-linux-gnu"
+ktest-host = "test -p staros-abi -p staros-hal -p staros-cpio -p staros-fdt -p staros-framebuffer -p staros-videocore -p staros-virtio -p staros-iommu -p staros-mm -p staros-ipc -p staros-libc -p staros-init --target x86_64-unknown-linux-gnu"

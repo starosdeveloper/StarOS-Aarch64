@@ -59,6 +59,11 @@ static FSSRV_IMAGE: &[u8] = include_bytes!(env!("STAROS_FSSRV_IMAGE"));
 /// which is the only way "these bytes arrived over IPC" can mean anything.
 static FSCLIENT_IMAGE: &[u8] = include_bytes!(env!("STAROS_FSCLIENT_IMAGE"));
 
+/// A program written in **C**, compiled by clang and linked against
+/// `crates/staros-libc`. Empty when the build host has no C compiler, which the
+/// kernel reports rather than pretending the program ran.
+static HELLO_C_IMAGE: &[u8] = include_bytes!(env!("STAROS_HELLO_C_IMAGE"));
+
 mod cap;
 mod console;
 mod elf;
@@ -1236,6 +1241,17 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // The file protocol: a client's request and the server's reply.
     let ep_fs = obj::create(obj::Object::Endpoint { id: 8 }).expect("ep_fs object");
     let ep_fs_reply = obj::create(obj::Object::Endpoint { id: 9 }).expect("ep_fs_reply object");
+    // A second pair, and below a second file server on it, for the C program.
+    //
+    // Not because two servers are wanted, but because a *reply* endpoint cannot be
+    // shared: `Recv` is a rendezvous, so with two clients waiting on one reply
+    // endpoint the answer to one of them can be delivered to the other. The real
+    // fix is a reply capability carried in the request, and the message already
+    // spends its one capability slot on the data buffer. Until that changes, one
+    // server per client is the honest arrangement — and it costs nothing but the
+    // pages, since the server is an ordinary program that can be run twice.
+    let ep_fs2 = obj::create(obj::Object::Endpoint { id: 10 }).expect("ep_fs2 object");
+    let ep_fs2_reply = obj::create(obj::Object::Endpoint { id: 11 }).expect("ep_fs2_reply object");
 
     // The *only* device policy the kernel still holds: the authority to mint. It
     // pre-mints no UART objects at all now — the device manager (id 7) reads the
@@ -1382,7 +1398,7 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // Built even when the bootloader left no archive. A server that refuses to
     // start leaves its clients blocked in `Recv` forever; one that starts with an
     // empty archive answers "no such file", which is an answer.
-    let files = (|| {
+    let file_pair = |client_image: &[u8], server_id: u8, client_id: u8, req, reply| {
         // SAFETY: as every other space built here — the MMU is on with the frame
         // pool mapped writable, and these frames are uniquely ours. `initrd` is the
         // archive the bootloader loaded, already excluded from the frame pool.
@@ -1394,7 +1410,7 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
                 return None;
             }
             s.set_entry(img.entry());
-            s.write_id(16);
+            s.write_id(server_id);
             if let Some((start, end)) = initrd {
                 let len = (end - start) as usize;
                 let Some(va) = s.map_initrd(frames, start, len) else {
@@ -1406,29 +1422,42 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
             Some(s)
         })?;
         let mut caps = cap::empty_caps()?;
-        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fs, send: false, recv: true });
-        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fs_reply, send: true, recv: false });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: req, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: reply, send: true, recv: false });
 
         // SAFETY: as above; this space is given no mapping beyond its own image.
         let client = mem::with(|frames| unsafe {
             let mut s = AddressSpace::new(frames)?;
-            let img = elf::Elf::parse(FSCLIENT_IMAGE)?;
+            let img = elf::Elf::parse(client_image)?;
             if !load_segments(&mut s, frames, &img) {
                 s.destroy(frames);
                 return None;
             }
             s.set_entry(img.entry());
-            s.write_id(17);
+            s.write_id(client_id);
             Some(s)
         })?;
         let mut client_caps = cap::empty_caps()?;
-        cap::install(&mut client_caps, cap::Cap::Endpoint { obj: ep_fs, send: true, recv: false });
-        cap::install(
-            &mut client_caps,
-            cap::Cap::Endpoint { obj: ep_fs_reply, send: false, recv: true },
-        );
+        // The order is the ABI: granting installs handles bottom-up, so the client
+        // finds "send on the request endpoint" at handle 1 and "receive on the reply
+        // endpoint" at handle 2 — which is what `staros-libc` and `fsclient` both
+        // assume.
+        cap::install(&mut client_caps, cap::Cap::Endpoint { obj: req, send: true, recv: false });
+        cap::install(&mut client_caps, cap::Cap::Endpoint { obj: reply, send: false, recv: true });
         Some(((space, caps), (client, client_caps)))
-    })();
+    };
+    let files = file_pair(FSCLIENT_IMAGE, 16, 17, ep_fs, ep_fs_reply);
+    // The C program, with its own server for the reason given at the endpoints. Its
+    // image is empty when the build host had no C compiler.
+    let c_files = if HELLO_C_IMAGE.is_empty() {
+        let _ = writeln!(
+            console,
+            "no C program in this image: the build host had no clang (the C library is still built)"
+        );
+        None
+    } else {
+        file_pair(HELLO_C_IMAGE, 18, 19, ep_fs2, ep_fs2_reply)
+    };
 
     // The input driver. Built unconditionally — whether the machine *has* an input
     // device is not the kernel's business to know: the driver receives a capability
@@ -1486,6 +1515,10 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     if let Some(((fs_space, fs_caps), (fsc_space, fsc_caps))) = files {
         sched::spawn_user(user_task_entry, fs_space, fs_caps);
         sched::spawn_user(user_task_entry, fsc_space, fsc_caps);
+    }
+    if let Some(((fs_space, fs_caps), (c_space, c_caps))) = c_files {
+        sched::spawn_user(user_task_entry, fs_space, fs_caps);
+        sched::spawn_user(user_task_entry, c_space, c_caps);
     }
     sched::spawn_user(user_task_entry, storm_a_space, storm_a_caps);
     sched::spawn_user(user_task_entry, storm_b_space, storm_b_caps);

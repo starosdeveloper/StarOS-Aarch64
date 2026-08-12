@@ -94,11 +94,184 @@ fn main() {
     // table, and `scripts/symbolize.sh` wants nothing else — an address in a fault
     // backtrace is only a name if something on the host still knows the names.
     let objcopy = llvm_objcopy();
+    // The ABI crate as an rlib for the bare-metal target: the file server and the C
+    // library both speak the protocol in `staros_abi::fsproto`, and a protocol
+    // written down twice is a protocol that will disagree with itself.
+    let abi_rlib = build_rlib(
+        &out_dir,
+        &rustc,
+        "staros_abi",
+        &canonical(&Path::new(&manifest_dir).join("../abi/src/lib.rs")),
+    );
     let cpio_rlib = build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
     build_displaysrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
     build_inputsrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
-    build_fssrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy, &cpio_rlib);
+    build_fssrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy, &cpio_rlib, &abi_rlib);
     build_fsclient(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
+    // The C library, and a C program linked against it. This is the toolchain Qt
+    // will arrive through, exercised by something small enough to debug.
+    let libc = build_libc(&manifest_dir, &out_dir, &rustc, &abi_rlib);
+    build_hello_c(&manifest_dir, &out_dir, &image_ld, &objcopy, &libc);
+}
+
+/// Compile one dependency-free crate of ours to an rlib for the bare-metal target.
+///
+/// Plain `rustc`, no `-Zbuild-std`: at `-Copt-level=2` these crates reference none
+/// of `core`'s memory intrinsics, so the target's precompiled `core` is enough.
+fn build_rlib(out_dir: &str, rustc: &str, crate_name: &str, src: &Path) -> PathBuf {
+    println!("cargo:rerun-if-changed={}", src.display());
+    let rlib = Path::new(out_dir).join(format!("lib{crate_name}.rlib"));
+    let status = Command::new(rustc)
+        .args(["--edition", "2021"])
+        .args(["--target", "aarch64-unknown-none"])
+        .args(["--crate-name", crate_name])
+        .args(["--crate-type", "lib"])
+        .arg("-Copt-level=2")
+        .arg("-Cpanic=abort")
+        .arg("-o")
+        .arg(&rlib)
+        .arg(src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn rustc for {crate_name}: {e}"));
+    assert!(status.success(), "rustc failed to build the {crate_name} rlib");
+    rlib
+}
+
+/// Build `crates/staros-libc` as a static library C can link against.
+///
+/// `staticlib` rather than `rlib` because the consumer is a C linker: it wants an
+/// archive of objects with C symbol names, and it must find `memcpy` and friends in
+/// it. Returns the archive's path.
+fn build_libc(manifest_dir: &str, out_dir: &str, rustc: &str, abi_rlib: &Path) -> PathBuf {
+    let src_dir = Path::new(manifest_dir).join("../staros-libc/src");
+    let src = canonical(&src_dir.join("lib.rs"));
+    // Every module, so editing one of them rebuilds the archive. `rustc` is invoked
+    // on the crate root, and cargo only re-runs this script for files it is told
+    // about.
+    for module in ["lib.rs", "fmt.rs", "file.rs", "heap.rs", "stdio.rs", "string.rs", "sys.rs", "time.rs"] {
+        println!("cargo:rerun-if-changed={}", canonical(&src_dir.join(module)).display());
+    }
+
+    let lib = Path::new(out_dir).join("libstaros_libc.a");
+    let status = Command::new(rustc)
+        .args(["--edition", "2021"])
+        .args(["--target", "aarch64-unknown-none"])
+        .args(["--crate-name", "staros_libc"])
+        .args(["--crate-type", "staticlib"])
+        .args(SERVICE_FLAGS)
+        .arg("--extern")
+        .arg(format!("staros_abi={}", abi_rlib.display()))
+        .arg("-o")
+        .arg(&lib)
+        .arg(&src)
+        .status()
+        .expect("failed to spawn rustc for staros-libc");
+    assert!(status.success(), "rustc failed to build staros-libc");
+    lib
+}
+
+/// Compile `services/hello-c/main.c` with clang and link it against the C library.
+///
+/// This is the path Qt will arrive through, which is why it uses the real tools
+/// rather than a Rust stand-in: clang for the C, `rust-lld` for the link, the same
+/// `image.ld` every EL0 program uses. `-ffreestanding` says there is no hosted
+/// environment; `-fno-builtin` keeps clang from turning a loop into a call to a
+/// `memcpy` it then assumes exists in a libc it knows — ours is the only one here,
+/// and it is linked in explicitly.
+///
+/// If clang is not installed the build says so and continues without the program;
+/// the kernel then reports that there is no C demo, rather than failing to build
+/// for everyone who has no C compiler.
+fn build_hello_c(
+    manifest_dir: &str,
+    out_dir: &str,
+    image_ld: &Path,
+    objcopy: &Path,
+    libc: &Path,
+) {
+    let src = canonical(&Path::new(manifest_dir).join("../../services/hello-c/main.c"));
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let Ok(clang) = which("clang") else {
+        // Point the kernel at an empty file rather than at nothing: `include_bytes!`
+        // needs a path that exists, and an empty image is a thing the kernel can
+        // check for and report. A `cfg` flag would work too and would mean the
+        // absence of a C compiler changes which code the kernel contains.
+        println!("cargo:warning=clang not found; the C demo program will be absent");
+        let empty = Path::new(out_dir).join("hello-c.absent");
+        std::fs::write(&empty, []).expect("failed to write the placeholder image");
+        println!("cargo:rustc-env=STAROS_HELLO_C_IMAGE={}", empty.display());
+        return;
+    };
+    let object = Path::new(out_dir).join("hello-c.o");
+    let status = Command::new(clang)
+        .args(["--target=aarch64-unknown-none", "-ffreestanding", "-fno-builtin"])
+        .args(["-fno-omit-frame-pointer", "-fno-stack-protector", "-fno-pie"])
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror", "-std=c11", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&object)
+        .status()
+        .expect("failed to spawn clang");
+    assert!(status.success(), "clang failed to compile hello-c");
+
+    // `rust-lld` ships with the toolchain, so the C program needs no cross binutils
+    // either. `--gc-sections` matters more here than elsewhere: the C library
+    // archive carries `core`'s formatting machinery, and without it a 200-line
+    // program links half a megabyte.
+    let lld = llvm_tool("rust-lld").expect("rust-lld is part of the Rust toolchain");
+    let debug_elf = Path::new(out_dir).join("hello-c.debug.elf");
+    let elf = Path::new(out_dir).join("hello-c.elf");
+    let status = Command::new(lld)
+        .args(["-flavor", "gnu"])
+        .arg(format!("-T{}", image_ld.display()))
+        .arg("-z")
+        .arg("max-page-size=4096")
+        .arg("--gc-sections")
+        .arg("-o")
+        .arg(&debug_elf)
+        .arg(&object)
+        .arg(libc)
+        .status()
+        .expect("failed to spawn rust-lld");
+    assert!(status.success(), "rust-lld failed to link hello-c");
+    strip_to(objcopy, &debug_elf, &elf);
+
+    const MAX_HELLO_C_BYTES: u64 = 256 * 1024;
+    let size = std::fs::metadata(&elf).expect("hello-c image was not produced").len();
+    assert!(
+        size <= MAX_HELLO_C_BYTES,
+        "hello-c image is {size} bytes (> {MAX_HELLO_C_BYTES}); did --gc-sections stop working?",
+    );
+
+    println!("cargo:rustc-env=STAROS_HELLO_C_IMAGE={}", elf.display());
+}
+
+/// Find a program on `PATH`.
+fn which(program: &str) -> Result<PathBuf, ()> {
+    let path = env::var_os("PATH").ok_or(())?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .ok_or(())
+}
+
+/// Find a tool that ships inside the Rust toolchain's `rustlib` bin directory.
+fn llvm_tool(name: &str) -> Option<PathBuf> {
+    let sysroot = Command::new(env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .ok()?;
+    let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_string();
+    let entries = std::fs::read_dir(Path::new(&sysroot).join("lib/rustlib")).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("bin").join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Flags every EL0 service is built with.
@@ -120,22 +293,7 @@ const SERVICE_FLAGS: &[&str] =
 /// someone has one. Same search as `scripts/qemu-run.sh`, for the same reason:
 /// no extra dependency to install.
 fn llvm_objcopy() -> PathBuf {
-    let sysroot = Command::new(env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
-        .arg("--print")
-        .arg("sysroot")
-        .output()
-        .expect("failed to ask rustc for its sysroot");
-    let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_string();
-    let lib = Path::new(&sysroot).join("lib/rustlib");
-    if let Ok(entries) = std::fs::read_dir(&lib) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("bin/llvm-objcopy");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    PathBuf::from("llvm-objcopy")
+    llvm_tool("llvm-objcopy").unwrap_or_else(|| PathBuf::from("llvm-objcopy"))
 }
 
 /// Strip `debug_elf` into `elf`, and fail the build if the tool is missing rather
@@ -163,6 +321,7 @@ fn build_fssrv(
     image_ld: &Path,
     objcopy: &Path,
     cpio_rlib: &Path,
+    abi_rlib: &Path,
 ) {
     let src = canonical(&Path::new(manifest_dir).join("../../services/fssrv/main.rs"));
     println!("cargo:rerun-if-changed={}", src.display());
@@ -177,6 +336,8 @@ fn build_fssrv(
         .args(SERVICE_FLAGS)
         .arg("--extern")
         .arg(format!("staros_cpio={}", cpio_rlib.display()))
+        .arg("--extern")
+        .arg(format!("staros_abi={}", abi_rlib.display()))
         .arg(format!("-Clink-arg=-T{}", image_ld.display()))
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")

@@ -55,6 +55,10 @@
 use core::arch::{asm, naked_asm};
 use core::panic::PanicInfo;
 
+use staros_abi::fsproto::{
+    ERR_BAD_HANDLE, ERR_MALFORMED, ERR_NO_FILE, MAX_PATH, TAG_BYE, TAG_CLOSE, TAG_ERROR, TAG_OPEN,
+    TAG_READ, TAG_STAT,
+};
 use staros_cpio::{Archive, Entry};
 
 /// The kernel-seeded data page. Process id at `+0`; the initramfs's user address
@@ -77,30 +81,9 @@ const SYS_SHARED_PAGES: usize = 28;
 const EP_REQUEST: u64 = 1;
 const EP_REPLY: u64 = 2;
 
-/// Request tags.
-const TAG_OPEN: u64 = 1;
-const TAG_READ: u64 = 2;
-const TAG_STAT: u64 = 3;
-const TAG_CLOSE: u64 = 4;
-const TAG_BYE: u64 = 9;
-
-/// The reply tag that means "refused"; the code is in `words[0]`.
-const TAG_ERROR: u64 = 0;
-
-/// No archive member by that name.
-const ERR_NO_FILE: u64 = 1;
-/// The handle names no open file — never opened, already closed, or reused.
-const ERR_BAD_HANDLE: u64 = 2;
-/// The request itself is wrong: unknown tag, missing buffer, unusable path.
-const ERR_MALFORMED: u64 = 3;
-
 /// How many files may be open at once. Small on purpose: the table is fixed, so a
 /// client cannot make the server allocate.
 const MAX_OPEN: usize = 8;
-
-/// The longest path this server will look at. An initramfs has short names, and a
-/// bound here is one fewer thing that depends on the client being reasonable.
-const MAX_PATH: usize = 128;
 
 /// A rubbish message must not become an infinite loop, and neither must a client
 /// that never says goodbye: `Recv` returns immediately whenever a sender is

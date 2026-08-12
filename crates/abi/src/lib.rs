@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod error;
+pub mod fsproto;
 pub mod syscall;
 
 /// An opaque, unforgeable reference to a kernel object (a capability handle).

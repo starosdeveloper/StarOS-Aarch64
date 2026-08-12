@@ -79,6 +79,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "staros-libc"
+version = "0.2.0"
+dependencies = [
+ "staros-abi",
+]
+
+[[package]]
 name = "staros-mm"
 version = "0.2.0"
 dependencies = [
