@@ -422,7 +422,7 @@ fn post_switch() {
 ///   capability minted *after* the thread starts is not visible to it.
 pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
     let cpu = me();
-    let (cur, mut space, caps) = {
+    let (cur, _old_space, caps) = {
         let sched = SCHED.lock();
         let cur = sched.current[cpu];
         match sched.tasks[cur].space {
@@ -431,16 +431,19 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
         }
     };
 
-    // The thread's stack, out of the creator's heap region. Taken before the
-    // scheduler lock, like every other allocation on this path.
-    // SAFETY: at EL1 with this (active) space's tables reachable through the linear
-    // map; `map_anon` only adds pages.
-    let Some(stack_base) = crate::mem::with(|frames| unsafe { space.map_anon(frames, stack_pages) })
-    else {
+    // The thread's stack, out of the creator's heap region. Reserved under the
+    // scheduler lock and mapped outside it, for the reason in
+    // `reserve_anon_shared`: the creator is not the only task holding a copy of
+    // this space's heap cursor, and two threads spawning at once would otherwise
+    // hand their children the same stack.
+    let Some((space, stack_base)) = reserve_anon_shared(cur, stack_pages) else {
         return KError::OutOfResources.as_raw();
     };
-    // Persist the bumped heap cursor: the pages are the creator's space's now.
-    SCHED.lock().tasks[cur].space = Some(space);
+    // SAFETY: at EL1 with this (active) space's tables reachable through the linear
+    // map; `map_anon_at` only adds pages at addresses just reserved.
+    if !crate::mem::with(|frames| unsafe { space.map_anon_at(frames, stack_base, stack_pages) }) {
+        return KError::OutOfResources.as_raw();
+    }
     // Stacks grow down, and AArch64 requires a 16-byte aligned `sp`.
     // Stacks grow down, and AArch64 requires a 16-byte aligned `sp`.
     //
@@ -1289,13 +1292,12 @@ pub fn current_range_ok(ptr: u64, len: usize, write: bool) -> bool {
 /// the allocation itself.
 pub fn map_anon_current(pages: u64) -> isize {
     let cpu = me();
-    let (cur, mut space) = {
+    let cur = {
         let sched = SCHED.lock();
-        let cur = sched.current[cpu];
-        match sched.tasks[cur].space {
-            Some(s) => (cur, s),
-            None => return KError::InvalidArgument.as_raw(),
-        }
+        sched.current[cpu]
+    };
+    let Some((space, first_va)) = reserve_anon_shared(cur, pages) else {
+        return KError::OutOfResources.as_raw();
     };
     // Done in chunks, with interrupts let through between them. A syscall runs with
     // IRQs masked from the moment the exception is taken until it returns, so a
@@ -1312,18 +1314,17 @@ pub fn map_anon_current(pages: u64) -> isize {
     // chunking at all, 42 ms at 64 pages, 13 ms at 16. The demo's runtime did not
     // move, so the windows themselves cost nothing measurable — 16 it is.
     const CHUNK: u64 = 16;
-    let mut first = None;
     let mut mapped = 0;
     while mapped < pages {
         let chunk = CHUNK.min(pages - mapped);
+        let va = first_va + mapped * PAGE_SIZE as u64;
         // SAFETY: at EL1 with this (active) space's tables reachable through the
-        // linear map and the frame pool mapped writable; `map_anon` only adds
-        // pages, and the frame lock it takes makes the allocation atomic against
-        // other cores.
-        let Some(va) = crate::mem::with(|frames| unsafe { space.map_anon(frames, chunk) }) else {
+        // linear map and the frame pool mapped writable; `map_anon_at` only adds
+        // pages at addresses this call reserved, and the frame lock it takes makes
+        // the allocation atomic against other cores.
+        if !crate::mem::with(|frames| unsafe { space.map_anon_at(frames, va, chunk) }) {
             break;
-        };
-        first.get_or_insert(va);
+        }
         mapped += chunk;
         if mapped < pages {
             // Open a window. Any pending interrupt is taken here — which may
@@ -1338,16 +1339,51 @@ pub fn map_anon_current(pages: u64) -> isize {
             }
         }
     }
-    // Persist the bumped heap cursor. The task cannot have run elsewhere in the
-    // meantime (it is mid-syscall on this core), so no update is lost.
-    SCHED.lock().tasks[cur].space = Some(space);
+    // The cursor was already published to every task in this space by the
+    // reservation; nothing to persist here.
+    //
     // A partial run is a failure, even though the pages it did map stay mapped and
     // are reclaimed at teardown: handing back an address for a run shorter than
     // asked would be read as the whole thing.
-    match first {
-        Some(va) if mapped == pages => va as isize,
-        _ => KError::OutOfResources.as_raw(),
+    if mapped == pages {
+        first_va as isize
+    } else {
+        KError::OutOfResources.as_raw()
     }
+}
+
+/// Reserve `pages` of anonymous address space for the task at index `cur`, and
+/// publish the new cursor to **every task sharing that address space**.
+///
+/// This exists because `AddressSpace` is a `Copy` handle and a thread is a second
+/// task holding a copy of it. The heap cursor lives in the handle, so two threads
+/// each bumping their own copy reserve the *same* addresses: the second `malloc` in
+/// a threaded program hands out memory the first one is already using. The symptom
+/// is not a crash but data that changes under a thread that never wrote it, and it
+/// only appears once two cores run the same process at once.
+///
+/// The whole read-modify-write happens under the scheduler lock, which is what
+/// makes concurrent reservations disjoint. Mapping the pages is left outside it.
+fn reserve_anon_shared(cur: usize, pages: u64) -> Option<(AddressSpace, u64)> {
+    let mut sched = SCHED.lock();
+    let ttbr0 = sched.tasks.get(cur)?.ttbr0;
+    // The authoritative cursor is the furthest any task in this space has reached.
+    let top = sched
+        .tasks
+        .iter()
+        .filter(|t| t.ttbr0 == ttbr0)
+        .filter_map(|t| t.space.as_ref().map(AddressSpace::heap_next))
+        .max()?;
+    let mut space = sched.tasks.get(cur)?.space?;
+    space.set_heap_next(top);
+    let va = space.reserve_anon(pages)?;
+    let next = space.heap_next();
+    for task in sched.tasks.iter_mut().filter(|t| t.ttbr0 == ttbr0) {
+        if let Some(s) = task.space.as_mut() {
+            s.set_heap_next(next);
+        }
+    }
+    Some((space, va))
 }
 
 /// Try to satisfy a fault at `far` by growing the current task's stack.

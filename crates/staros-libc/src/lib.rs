@@ -50,10 +50,34 @@
 pub mod fmt;
 pub mod file;
 pub mod heap;
+pub(crate) mod lock;
 pub mod stdio;
 pub mod string;
 pub mod sys;
+pub mod thread;
 pub mod time;
+
+/// Allocate from the process heap, aligned, for the parts of this library that
+/// need memory before C does — thread control blocks and TLS.
+///
+/// It exists so `thread` does not reach into the allocator's static directly; there
+/// is exactly one place that does, and this is it.
+#[cfg(not(test))]
+pub(crate) fn heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let _guard = HEAP_LOCK.lock();
+    // SAFETY: the lock is what makes this exclusive; every other user of `HEAP`
+    // takes it too.
+    unsafe { (*core::ptr::addr_of_mut!(HEAP)).alloc_aligned(size, align) }
+}
+
+/// The host build has no `MapAnon`, so the same call goes to the test harness's
+/// allocator. It exists so `thread` compiles under `cargo test` — nothing there
+/// runs a thread, and the arithmetic that *is* tested lives in `heap`.
+#[cfg(test)]
+pub(crate) fn heap_alloc(size: usize, align: usize) -> *mut u8 {
+    // SAFETY: a non-zero size with a power-of-two alignment is a valid layout.
+    unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(size.max(1), align).unwrap()) }
+}
 
 use core::ffi::{c_int, c_void};
 
@@ -70,10 +94,13 @@ impl heap::Pages for KernelPages {
     }
 }
 
-/// The process heap. Single-threaded, like everything else at layer 4 — the day
-/// `pthread_create` exists this needs a lock, and every use of it is here in one
-/// file so that change is one file's worth of work.
+/// The process heap, and the lock that makes it safe to share.
+///
+/// The lock arrived with layer 5 and not before, which is the honest order: until
+/// `pthread_create` existed there was no second thread to race with, and a lock
+/// nothing contends is a claim nothing tests.
 static mut HEAP: heap::Heap<KernelPages> = heap::Heap::new(KernelPages);
+static HEAP_LOCK: lock::Spin = lock::Spin::new();
 
 /// `errno`, such as it is. Nothing sets a meaningful value yet: the syscalls this
 /// library makes return their own errors, and inventing `ENOENT`/`EIO` codes to
@@ -95,6 +122,10 @@ pub unsafe extern "C" fn _start() -> ! {
     extern "C" {
         fn main(argc: c_int, argv: *mut *mut core::ffi::c_char) -> c_int;
     }
+    // Threads first: it builds the parker pool, and a notification created after a
+    // thread exists is one that thread cannot see. It also gives `main` its thread
+    // pointer, so `_Thread_local` works in `main` and not only in what it spawns.
+    thread::init();
     file::init();
     // No arguments to pass yet: there is no shell to pass them. `argv[0]` exists
     // because a C program is entitled to read it.
@@ -123,13 +154,14 @@ fn exit_process(status: c_int) -> ! {
 /// The C entry points that belong to no single module.
 #[cfg(not(test))]
 mod exports {
-    use super::{c_int, c_void, stdio, sys, ERRNO, HEAP};
+    use super::{c_int, c_void, stdio, sys, ERRNO, HEAP, HEAP_LOCK};
 
     /// # Safety
     /// C ABI.
     #[no_mangle]
     pub extern "C" fn malloc(size: usize) -> *mut c_void {
-        // SAFETY: single-threaded; see `HEAP`.
+        let _guard = HEAP_LOCK.lock();
+        // SAFETY: exclusive under the lock every user of `HEAP` takes.
         unsafe { (*core::ptr::addr_of_mut!(HEAP)).alloc(size).cast::<c_void>() }
     }
 
@@ -137,7 +169,8 @@ mod exports {
     /// C ABI: `ptr` is null or came from this allocator.
     #[no_mangle]
     pub unsafe extern "C" fn free(ptr: *mut c_void) {
-        // SAFETY: forwarded from the caller.
+        let _guard = HEAP_LOCK.lock();
+        // SAFETY: forwarded from the caller, under the heap lock.
         unsafe { (*core::ptr::addr_of_mut!(HEAP)).free(ptr.cast::<u8>()) };
     }
 
@@ -149,8 +182,11 @@ mod exports {
         let Some(total) = count.checked_mul(size) else {
             return core::ptr::null_mut();
         };
-        // SAFETY: single-threaded; see `HEAP`.
-        let p = unsafe { (*core::ptr::addr_of_mut!(HEAP)).alloc(total) };
+        let p = {
+            let _guard = HEAP_LOCK.lock();
+            // SAFETY: exclusive under the heap lock.
+            unsafe { (*core::ptr::addr_of_mut!(HEAP)).alloc(total) }
+        };
         if !p.is_null() {
             // SAFETY: the allocator just gave us `total` writable bytes.
             unsafe { core::ptr::write_bytes(p, 0, total) };
@@ -162,7 +198,8 @@ mod exports {
     /// C ABI: `ptr` is null or came from this allocator.
     #[no_mangle]
     pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
-        // SAFETY: forwarded from the caller.
+        let _guard = HEAP_LOCK.lock();
+        // SAFETY: forwarded from the caller, under the heap lock.
         unsafe {
             (*core::ptr::addr_of_mut!(HEAP))
                 .realloc(ptr.cast::<u8>(), size)
@@ -175,7 +212,8 @@ mod exports {
         if !align.is_power_of_two() {
             return core::ptr::null_mut();
         }
-        // SAFETY: single-threaded; see `HEAP`.
+        let _guard = HEAP_LOCK.lock();
+        // SAFETY: exclusive under the heap lock.
         unsafe {
             (*core::ptr::addr_of_mut!(HEAP))
                 .alloc_aligned(size, align)
@@ -205,7 +243,8 @@ mod exports {
     /// allocator of its own is otherwise invisible until memory runs out.
     #[no_mangle]
     pub extern "C" fn staros_heap_live(bytes: *mut usize, blocks: *mut usize) {
-        // SAFETY: single-threaded; the caller passes two writable words.
+        let _guard = HEAP_LOCK.lock();
+        // SAFETY: read under the heap lock; the caller passes two writable words.
         unsafe {
             let h = &*core::ptr::addr_of!(HEAP);
             if !bytes.is_null() {

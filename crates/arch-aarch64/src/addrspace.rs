@@ -310,46 +310,93 @@ impl AddressSpace {
     /// Same preconditions as [`new`](AddressSpace::new). May run against the
     /// *active* space (it only adds previously-absent pages, then flushes those
     /// VAs from the TLB), so a task can call it on itself.
+    ///
+    /// (Kept as one call for the single-task case. Where several tasks share the
+    /// space — threads — the caller must split it into
+    /// [`reserve_anon`](AddressSpace::reserve_anon) under whatever lock keeps their
+    /// copies of this handle in step, then
+    /// [`map_anon_at`](AddressSpace::map_anon_at).)
     pub unsafe fn map_anon<A: FrameAllocator>(&mut self, alloc: &mut A, pages: u64) -> Option<u64> {
+        let first = self.reserve_anon(pages)?;
+        // SAFETY: forwarded from this function's contract.
+        if unsafe { self.map_anon_at(alloc, first, pages) } {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    /// The next free address in the anonymous region.
+    ///
+    /// Public because the cursor is **not** private to one task: threads share an
+    /// address space and each holds its own copy of this handle, so whoever owns
+    /// the tasks (the scheduler) has to keep the copies agreeing. Two threads that
+    /// each bumped their own copy would map two "fresh" runs at the same addresses,
+    /// and the second would quietly hand out memory the first is using.
+    #[must_use]
+    pub const fn heap_next(&self) -> u64 {
+        self.heap_next
+    }
+
+    /// Adopt a cursor decided elsewhere. See [`heap_next`](AddressSpace::heap_next).
+    pub const fn set_heap_next(&mut self, va: u64) {
+        self.heap_next = va;
+    }
+
+    /// Take `pages` of address space from the anonymous region **without mapping
+    /// anything**, returning the first address.
+    ///
+    /// This is the half that must happen under whatever lock keeps the copies of
+    /// this handle in step; [`map_anon_at`](AddressSpace::map_anon_at) is the half
+    /// that can then run without it, which matters because mapping is slow (a frame
+    /// zeroed and a TLB entry invalidated per page) and holding a scheduler lock
+    /// across it would stall every core.
+    pub fn reserve_anon(&mut self, pages: u64) -> Option<u64> {
         if pages == 0 {
             return None;
         }
         let first = self.heap_next;
-        // Check the whole run up front, in arithmetic that cannot wrap: a request
-        // large enough to overflow the addition would otherwise "fit" and start
-        // mapping at a wrapped address.
+        // Arithmetic that cannot wrap: a request large enough to overflow the
+        // addition would otherwise "fit" and start mapping at a wrapped address.
         let bytes = pages.checked_mul(PAGE_4K)?;
         if first.checked_add(bytes)? > USER_HEAP_END {
             return None;
         }
+        self.heap_next = first + bytes;
+        Some(first)
+    }
+
+    /// Map `pages` fresh frames at `va`, which a previous
+    /// [`reserve_anon`](AddressSpace::reserve_anon) handed out.
+    ///
+    /// Returns `false` if the pool ran out partway; the pages already mapped stay
+    /// mapped and belong to the space, exactly as in [`map_anon`](AddressSpace::map_anon).
+    ///
+    /// # Safety
+    /// Same preconditions as [`map_anon`](AddressSpace::map_anon).
+    pub unsafe fn map_anon_at<A: FrameAllocator>(&self, alloc: &mut A, va: u64, pages: u64) -> bool {
         for i in 0..pages {
-            let va = first + i * PAGE_4K;
+            let page = va + i * PAGE_4K;
             // SAFETY: forwarded from this function's contract.
-            if unsafe { self.map_fresh(alloc, va) }.is_none() {
-                // Out of frames partway. Keep what is mapped (see above) and
-                // report failure rather than a half-length run the caller would
-                // read as whole.
-                self.heap_next = va;
-                return None;
+            if unsafe { self.map_fresh(alloc, page) }.is_none() {
+                return false;
             }
             // Publish the new descriptor. Invalidate only *this* VA, not the whole
             // TLB: a full `tlbi vmalle1is` makes every core drop its entire TLB per
             // page, which serialised the machine when one task mapped thousands.
-            // `vaae1is` (this VA, all ASIDs, inner-shareable) is the surgical form.
-            // SAFETY: `va >> 12` is the page number operand `TLBI VAAE1IS` expects.
+            // SAFETY: `page >> 12` is the page number operand `TLBI VAAE1IS` expects.
             unsafe {
                 asm!(
                     "dsb ish",
                     "tlbi vaae1is, {v}",
                     "dsb ish",
                     "isb",
-                    v = in(reg) va >> 12,
+                    v = in(reg) page >> 12,
                     options(nostack, preserves_flags),
                 );
             }
         }
-        self.heap_next = first + bytes;
-        Some(first)
+        true
     }
 
     /// Load one ELF `PT_LOAD` segment into this space: back `[vaddr, vaddr +

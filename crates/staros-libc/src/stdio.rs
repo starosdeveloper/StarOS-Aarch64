@@ -28,6 +28,12 @@ struct Stream {
 
 static mut OUT: Stream = Stream { buf: [0; LINE], len: 0 };
 
+/// The console is process-wide, so two threads printing at once would interleave
+/// inside the buffer and produce one line made of two. The lock makes a `printf`
+/// atomic against other threads, which is stronger than what it needs to be
+/// against other *processes* — there, one `DebugWrite` per line is the guarantee.
+static OUT_LOCK: crate::lock::Spin = crate::lock::Spin::new();
+
 /// The `FILE` a C program passes around. It carries nothing: both streams go to the
 /// same place, and the only thing this library needs from a `FILE*` is to tell them
 /// apart — which it does not yet need to, because neither is redirectable.
@@ -44,37 +50,55 @@ pub static mut stderr: *mut File = core::ptr::addr_of!(STDERR) as *mut File;
 static STDOUT: File = File { _private: 1 };
 static STDERR: File = File { _private: 2 };
 
-/// Append bytes to the line buffer, flushing at every newline and whenever the
-/// buffer is full.
-pub(crate) fn write_bytes(bytes: &[u8]) {
-    // SAFETY: single-threaded until layer 5; see `crate::file::FILES`.
+/// Run `f` with the console buffer, holding the lock for all of it.
+///
+/// Taking the lock per *byte* would be the obvious thing and would leave `printf`
+/// interleavable between its own characters, which is worse than not locking at
+/// all: the output would look like corruption rather than like two lines.
+pub(crate) fn with_out<R>(f: impl FnOnce(&mut Stream) -> R) -> R {
+    let _guard = OUT_LOCK.lock();
+    // SAFETY: exclusive under the console lock.
     let out = unsafe { &mut *core::ptr::addr_of_mut!(OUT) };
-    for &b in bytes {
-        out.buf[out.len] = b;
-        out.len += 1;
-        if b == b'\n' || out.len == LINE {
-            sys::debug_write(&out.buf[..out.len]);
-            out.len = 0;
-        }
-    }
+    f(out)
 }
 
-/// Push whatever is buffered, whether or not it ends in a newline.
-pub(crate) fn flush() {
-    // SAFETY: as `write_bytes`.
-    let out = unsafe { &mut *core::ptr::addr_of_mut!(OUT) };
-    if out.len > 0 {
+/// Append one byte, flushing at a newline or when the buffer is full.
+fn push_byte(out: &mut Stream, byte: u8) {
+    out.buf[out.len] = byte;
+    out.len += 1;
+    if byte == b'\n' || out.len == LINE {
         sys::debug_write(&out.buf[..out.len]);
         out.len = 0;
     }
 }
 
-/// A sink that writes through the line buffer.
-struct ConsoleSink;
+/// Append bytes to the line buffer.
+pub(crate) fn write_bytes(bytes: &[u8]) {
+    with_out(|out| {
+        for &b in bytes {
+            push_byte(out, b);
+        }
+    });
+}
 
-impl Sink for ConsoleSink {
+/// Push whatever is buffered, whether or not it ends in a newline.
+pub(crate) fn flush() {
+    with_out(|out| {
+        if out.len > 0 {
+            sys::debug_write(&out.buf[..out.len]);
+            out.len = 0;
+        }
+    });
+}
+
+/// A sink over an already-locked console buffer.
+struct ConsoleSink<'a> {
+    out: &'a mut Stream,
+}
+
+impl Sink for ConsoleSink<'_> {
     fn push(&mut self, byte: u8) {
-        write_bytes(&[byte]);
+        push_byte(self.out, byte);
     }
 }
 
@@ -138,7 +162,9 @@ pub mod exports {
         unsafe {
             let bytes = crate::string::as_bytes(format);
             let mut source = VaArgs(args);
-            fmt::format(&mut ConsoleSink, bytes, &mut source) as c_int
+            super::with_out(|out| {
+                fmt::format(&mut ConsoleSink { out }, bytes, &mut source) as c_int
+            })
         }
     }
 
@@ -150,7 +176,9 @@ pub mod exports {
         unsafe {
             let bytes = crate::string::as_bytes(format);
             let mut source = VaArgs(args);
-            fmt::format(&mut ConsoleSink, bytes, &mut source) as c_int
+            super::with_out(|out| {
+                fmt::format(&mut ConsoleSink { out }, bytes, &mut source) as c_int
+            })
         }
     }
 

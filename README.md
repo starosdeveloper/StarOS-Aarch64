@@ -19,8 +19,8 @@ address space, processes loaded from a file rather than from the kernel image, a
 display server in user space that owns the screen, a virtio-input driver that
 decodes real key events without the kernel seeing one, a file server that hands
 files to processes holding no archive, and a **C program** — compiled by clang
-against this tree's own libc — that prints, allocates, sleeps and reads files
-without a syscall in sight.
+against this tree's own libc — that prints, allocates, sleeps, reads files and runs
+`pthread`s with real thread-local storage, without a syscall in sight.
 
 ## Layout
 
@@ -38,7 +38,7 @@ without a syscall in sight.
 | `crates/videocore` | Raspberry Pi VideoCore property-mailbox **messages** (no MMIO) |
 | `crates/virtio` | Split-virtqueue layout, MMIO register map, input event format (no MMIO) |
 | `crates/iommu` | SMMUv3 descriptor/queue bit layouts (no MMIO) |
-| `crates/staros-libc` | The C library EL0 programs link against: `str*`/`mem*`/`printf`, `malloc` over `MapAnon`, time over `ClockNow`, files over the file server |
+| `crates/staros-libc` | The C library EL0 programs link against: `str*`/`mem*`/`printf`, `malloc` over `MapAnon`, time over `ClockNow`, files over the file server, and `pthread`s with real thread-local storage over `SpawnThread` |
 
 The split is deliberate and repeated: every subsystem whose bugs hide in *layout*
 gets a pure crate with exact-value tests, and only the doorbell-ringing half is
@@ -62,7 +62,7 @@ board `unsafe`.
 | `services/inputsrv` | virtio-input driver: virtqueue, interrupt and event decoding, all in EL0 |
 | `services/fssrv` | File server: owns the initramfs, answers `Open`/`Read`/`Stat`/`Close` over IPC through a client-supplied shared buffer |
 | `services/fsclient` | A process with no archive and no device, reading a file anyway — the only way "these bytes arrived over IPC" means anything |
-| `services/hello-c` | A program written in **C**, compiled by clang and linked against `crates/staros-libc` — the toolchain Qt will arrive through, exercised by something small enough to debug |
+| `services/hello-c` | A program written in **C**, compiled by clang and linked against `crates/staros-libc` — the toolchain Qt will arrive through, exercised by something small enough to debug: formatting, the heap, the clock, files and four threads with their own TLS |
 
 All seven EL0 programs are built by `crates/kernel/build.rs` and embedded in the
 kernel image; there is no separate build step. The C one is skipped, with a
@@ -152,7 +152,7 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [fsclient] two endpoint capabilities and one page of my own memory - no archive, no device
 [fssrv] the files are mine: 3 of them, served over IPC to processes that hold no archive
 [hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight
-[hello-c] heap: 103 allocations, 0 bytes live at the end
+[hello-c] heap: 103 allocations, 368 bytes live at the end
 [stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand
 [fault] task 18 killed: EL0 fault at 0x7fffaffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
 [fault]   backtrace (2 frames, x29 chain): 0x8000080c 0x80000804
@@ -167,7 +167,7 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [displaysrv] composited a client surface onto a screen the client cannot touch
 [fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen
 [fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
-[hello-c] clock: 149132176 ns across a 20 ms nanosleep
+[hello-c] clock: 133086384 ns across a 20 ms nanosleep
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 #server drove the UART, then revoked it for everyone
 [child] hello - I was created at runtime, not by the kernel
@@ -184,7 +184,6 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length
 [fsclient] asked for all 13240 bytes of 'init.elf' into a 4096-byte buffer and got 4096, with 9144 left
 [hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: hello from the initramfs
-[hello-c] C RUNTIME OK - every check passed
 [fsclient] the archive is at 0x900000000 in fssrv; touching it here must fault
 [fault] task 12 killed: EL0 fault at 0x900000000 (ec 0x24) — isolated, kernel continues
 [fault]   backtrace (3 frames, x29 chain): 0x80000014 0x800016c8 0x80000004
@@ -193,14 +192,17 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [memtest] MapAnon(0) refused - a zero-page request is an error, not a page
 [memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
-clock: the demo took 10749 ms on the monotonic clock, during which core 0 took 86 tick(s)
-sleep: 4 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 5 clock wake-up(s), worst overshoot 14505 us
-scheduler: all tasks finished after 86 timer ticks; task table grew to 24 (old fixed max 8)
-task teardown: reaped 23 dead-task kernel stacks (736 KiB returned to the heap)
+[hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
+[hello-c] C RUNTIME OK - every check passed
+[fssrv] served 7 requests, 44 bytes of file data, and refused 1 - the archive never left this address space
+clock: the demo took 13520 ms on the monotonic clock, during which core 0 took 106 tick(s)
+sleep: 4 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 5 clock wake-up(s), worst overshoot 16043 us
+scheduler: all tasks finished after 106 timer ticks; task table grew to 28 (old fixed max 8)
+task teardown: reaped 27 dead-task kernel stacks (864 KiB returned to the heap)
 user stacks: 40 page(s) mapped on demand (160 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=86
+preemption: timer ticks per core — cpu0=106
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x40305000 (exited client's root was 0x402f6000)
+frame reclaim: post-teardown alloc 0x40307000 (exited client's root was 0x402f8000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
   (1 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
 shutting down (PSCI SYSTEM_OFF)
@@ -219,7 +221,7 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **201 assertions, exit=0** on `--quick` (228 on the
+  failure signals. Currently **202 assertions, exit=0** on `--quick` (229 on the
   full matrix).
 - **`./scripts/input-check.sh`** — the only check that makes the *outside world*
   act: QEMU synthesises a real key event, and the assertion is that a driver in EL0

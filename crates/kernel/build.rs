@@ -145,12 +145,13 @@ fn build_rlib(out_dir: &str, rustc: &str, crate_name: &str, src: &Path) -> PathB
 fn build_libc(manifest_dir: &str, out_dir: &str, rustc: &str, abi_rlib: &Path) -> PathBuf {
     let src_dir = Path::new(manifest_dir).join("../staros-libc/src");
     let src = canonical(&src_dir.join("lib.rs"));
-    // Every module, so editing one of them rebuilds the archive. `rustc` is invoked
-    // on the crate root, and cargo only re-runs this script for files it is told
-    // about.
-    for module in ["lib.rs", "fmt.rs", "file.rs", "heap.rs", "stdio.rs", "string.rs", "sys.rs", "time.rs"] {
-        println!("cargo:rerun-if-changed={}", canonical(&src_dir.join(module)).display());
-    }
+    // The whole source directory, not a list of module names. `rustc` is invoked on
+    // the crate root and cargo only re-runs this script for files it was told
+    // about, so a hand-written list means the day somebody adds a module their
+    // edits stop taking effect — the build succeeds and runs the *previous*
+    // archive, which is a confusing hour to spend. (It was: `thread.rs` was the
+    // module the list forgot.)
+    println!("cargo:rerun-if-changed={}", canonical(&src_dir).display());
 
     let lib = Path::new(out_dir).join("libstaros_libc.a");
     let status = Command::new(rustc)
@@ -227,6 +228,14 @@ fn build_hello_c(
         .arg(format!("-T{}", image_ld.display()))
         .arg("-z")
         .arg("max-page-size=4096")
+        // No RELRO. It exists so a dynamic loader can re-protect relocated data
+        // after start-up, and there is no dynamic loader here — what it actually
+        // does in this build is split the writable half into two `PT_LOAD`s to put
+        // `.tdata` in its own, and the second one then begins at a *non-page*
+        // address. The kernel's loader maps segments by page and refuses that, so
+        // the program silently fails to load the moment it gains a thread-local.
+        .arg("-z")
+        .arg("norelro")
         .arg("--gc-sections")
         .arg("-o")
         .arg(&debug_elf)

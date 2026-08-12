@@ -61,9 +61,13 @@ struct Files {
     ready: bool,
 }
 
-/// Single-threaded for now, and the type system is not being asked to pretend
-/// otherwise: layer 5 (threads) is where this grows a lock, and the day it does the
-/// compiler will point at every use.
+/// The file state, and the lock every entry point below takes.
+///
+/// The lock covers the *whole* operation, IPC included, and that is deliberate:
+/// there is one shared buffer and one reply endpoint between this process and its
+/// file server, so two threads reading at once would overwrite each other's data
+/// and could take each other's replies. Serialising file I/O per process is the
+/// cost of that arrangement, and it is written down here rather than discovered.
 static mut FILES: Files = Files {
     fds: [Fd { handle: 0, size: 0, offset: 0 }; MAX_FDS],
     buffer_cap: 0,
@@ -71,6 +75,9 @@ static mut FILES: Files = Files {
     buffer_len: 0,
     ready: false,
 };
+
+/// See [`FILES`].
+static FILES_LOCK: crate::lock::Spin = crate::lock::Spin::new();
 
 /// Bytes in a page — the unit the shared buffer is measured in.
 const PAGE: usize = 4096;
@@ -149,6 +156,7 @@ fn put_path(path: &[u8]) -> Option<usize> {
 
 /// `open`, without the flags: everything here is read-only.
 pub(crate) fn open(path: &[u8]) -> c_int {
+    let _guard = FILES_LOCK.lock();
     let Some(len) = put_path(path) else {
         return -1;
     };
@@ -181,6 +189,7 @@ fn slot(fd: c_int) -> Option<usize> {
 
 /// `read`: fill `dst` from the current offset, and advance it.
 pub(crate) fn read(fd: c_int, dst: &mut [u8]) -> isize {
+    let _guard = FILES_LOCK.lock();
     let Some(index) = slot(fd) else {
         return -1;
     };
@@ -211,6 +220,7 @@ pub(crate) fn read(fd: c_int, dst: &mut [u8]) -> isize {
 
 /// `lseek`, with the three C whences.
 pub(crate) fn seek(fd: c_int, offset: i64, whence: c_int) -> i64 {
+    let _guard = FILES_LOCK.lock();
     let Some(index) = slot(fd) else {
         return -1;
     };
@@ -234,6 +244,7 @@ pub(crate) fn seek(fd: c_int, offset: i64, whence: c_int) -> i64 {
 
 /// The size a `stat`/`fstat` would report, or `None`.
 pub(crate) fn size_of_path(path: &[u8]) -> Option<u64> {
+    let _guard = FILES_LOCK.lock();
     let len = put_path(path)?;
     let reply = request(TAG_STAT, [len as u64, 0, 0], true)?;
     (reply.tag != TAG_ERROR).then_some(reply.words[0])
@@ -241,6 +252,7 @@ pub(crate) fn size_of_path(path: &[u8]) -> Option<u64> {
 
 /// The size behind an open descriptor.
 pub(crate) fn size_of_fd(fd: c_int) -> Option<u64> {
+    let _guard = FILES_LOCK.lock();
     let index = slot(fd)?;
     // SAFETY: single-threaded.
     let files = unsafe { &*core::ptr::addr_of!(FILES) };
@@ -249,6 +261,7 @@ pub(crate) fn size_of_fd(fd: c_int) -> Option<u64> {
 
 /// `close`.
 pub(crate) fn close(fd: c_int) -> c_int {
+    let _guard = FILES_LOCK.lock();
     let Some(index) = slot(fd) else {
         return -1;
     };
@@ -267,6 +280,7 @@ pub(crate) fn close(fd: c_int) -> c_int {
 /// Whether a path exists, for `access`. Distinguishes "no such file" from "the
 /// server did not answer" the only way a client can: by the error it got back.
 pub(crate) fn exists(path: &[u8]) -> bool {
+    let _guard = FILES_LOCK.lock();
     let Some(len) = put_path(path) else {
         return false;
     };

@@ -264,6 +264,10 @@ if [ -n "$INITRAMFS" ]; then
     # The C program reaches the same file through the same server as fsclient, but
     # through open/read/lseek rather than raw IPC.
     req "[hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: $GREETING"
+    # Threads: four of them, each with its own thread pointer, sharing a counter
+    # through a mutex whose critical section yields in the middle — a lock that does
+    # nothing passes a plain `counter++` loop and fails this one.
+    req "[hello-c] threads: 4 workers x 250 increments = 1000"
     # An EL0 fault now reports where it happened, not just that it did.
     req "[fault]   backtrace ("
 else

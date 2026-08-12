@@ -38,6 +38,35 @@ SECTIONS
      * (build.rs) makes lld start the RW LOAD segment exactly here. */
     . = ALIGN(0x1000);
 
+    /* Thread-local storage.
+     *
+     * These two sections are the *template* every thread's TLS block is built
+     * from: `.tdata` is copied into the block, `.tbss` is the zeroed tail. The
+     * symbols around them are how `crates/staros-libc` finds the template at run
+     * time — there is no dynamic loader here to hand it a `PT_TLS` header, and a
+     * program that guessed the size would give every thread a block that is right
+     * until somebody adds a variable.
+     *
+     * `.tbss` is NOBITS and occupies no file space, so `__tbss_end` measures the
+     * block's *memory* size while `__tdata_end - __tdata_start` measures how much
+     * of it is initialised.
+     *
+     * The 16-byte alignment matters: on AArch64 (TLS variant I) the thread pointer
+     * points at a 16-byte TCB and the block starts right after it, so the linker's
+     * `tprel` offsets assume that alignment. A TLS variable wanting more than 16
+     * would shift them, and `services/hello-c` checks by value that it has not. */
+    . = ALIGN(16);
+    .tdata : {
+        __tdata_start = .;
+        *(.tdata .tdata.*)
+        __tdata_end = .;
+    }
+    .tbss : {
+        *(.tbss .tbss.*)
+        *(.tcommon)
+        __tbss_end = .;
+    }
+
     .data : {
         *(.data .data.*)
     }

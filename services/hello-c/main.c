@@ -50,6 +50,29 @@ struct timespec {
 int clock_gettime(int clock, struct timespec *out);
 int nanosleep(const struct timespec *req, struct timespec *rem);
 
+/* Threads. The opaque types are 32 bytes each and all-zero is a valid initialised
+ * state, so a static mutex or condition variable needs no constructor — which is
+ * what PTHREAD_MUTEX_INITIALIZER means and what the library was built to match. */
+typedef unsigned long pthread_t;
+typedef struct { long _opaque[4]; } pthread_mutex_t;
+typedef struct { long _opaque[4]; } pthread_cond_t;
+typedef struct { long _opaque[4]; } pthread_attr_t;
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                   void *(*start)(void *), void *arg);
+int pthread_join(pthread_t thread, void **retval);
+pthread_t pthread_self(void);
+int pthread_mutex_lock(pthread_mutex_t *m);
+int pthread_mutex_unlock(pthread_mutex_t *m);
+int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m);
+int pthread_cond_broadcast(pthread_cond_t *c);
+int pthread_key_create(int *key, void *dtor);
+int pthread_setspecific(int key, const void *value);
+void *pthread_getspecific(int key);
+int pthread_once(unsigned *once, void (*routine)(void));
+int sched_yield(void);
+unsigned long staros_thread_pointer(void);
+unsigned long staros_threads_live(void);
+
 #define SEEK_SET 0
 #define SEEK_END 2
 
@@ -187,6 +210,157 @@ static void check_files(void)
            path, text);
 }
 
+/* Layer 5: threads, locks and thread-local storage.
+ *
+ * Two thread-locals with different homes: one initialised (it lives in .tdata and
+ * must be *copied* into every thread's block) and one not (.tbss, which must be
+ * zeroed). A runtime that mapped one block for everybody passes nothing here — the
+ * seeds would collide — and one that forgot the .tdata copy would give every thread
+ * a zero where 0xAB belongs. */
+static _Thread_local int tls_seed = 0xAB;
+static _Thread_local int tls_scratch;
+
+#define WORKERS 4
+/* Enough contention to be a test, few enough to be a test that *finishes*: every
+ * iteration yields inside the critical section and every contended acquisition
+ * costs a park and a wake, so this is thousands of syscalls per worker on a machine
+ * emulating four cores. Raising it does not make the checks stronger; it only makes
+ * the smoke matrix slower. */
+#define BUMPS 250
+
+static pthread_mutex_t counter_lock;
+static pthread_cond_t go_signal;
+static pthread_mutex_t go_lock;
+static int go;
+static long shared_counter;
+/* How many threads are inside the critical section, and whether that was ever
+ * more than one. */
+static int inside;
+static int exclusion_violated;
+static unsigned long worker_tp[WORKERS];
+static int worker_seed_ok[WORKERS];
+static int worker_alloc_ok[WORKERS] = { 1, 1, 1, 1 };
+static int specific_key;
+static unsigned once_state;
+static int once_count;
+
+static void run_once(void)
+{
+    once_count++;
+}
+
+static void *worker(void *arg)
+{
+    long id = (long)arg;
+
+    /* Our own copies: the seed arrived from the template, the scratch was zeroed. */
+    int seed_ok = (tls_seed == 0xAB) && (tls_scratch == 0);
+    tls_seed = (int)(0x100 + id);
+    tls_scratch = (int)(id * 7);
+    worker_tp[id] = staros_thread_pointer();
+
+    pthread_once(&once_state, run_once);
+    pthread_setspecific(specific_key, (void *)(id + 1));
+
+    /* Wait for main to release everybody, so the increments below actually
+     * contend rather than running one thread at a time. */
+    pthread_mutex_lock(&go_lock);
+    while (!go)
+        pthread_cond_wait(&go_signal, &go_lock);
+    pthread_mutex_unlock(&go_lock);
+
+    /* The critical section is deliberately awkward: read, *yield*, write. A plain
+     * `shared_counter++` is three instructions and a preempting scheduler almost
+     * never lands inside it — a lock that does nothing at all passes that test,
+     * which was checked before this comment was written. Yielding in the middle
+     * makes interleaving certain, so the count and the occupancy flag below can
+     * only come out right if the lock actually excludes. */
+    for (int i = 0; i < BUMPS; i++) {
+        pthread_mutex_lock(&counter_lock);
+        inside++;
+        long seen = shared_counter;
+        sched_yield();
+        if (inside != 1)
+            exclusion_violated = 1;
+        shared_counter = seen + 1;
+        inside--;
+        pthread_mutex_unlock(&counter_lock);
+    }
+
+    /* Hammer the library's own statics from every thread at once: the heap and the
+     * console are process-wide, and before layer 5 they had no locks at all. Each
+     * block is filled with a byte only this thread writes, so an allocator that
+     * hands the same block to two threads is caught by the check rather than by a
+     * crash somewhere later. */
+    for (int i = 0; i < 64; i++) {
+        unsigned char *p = malloc(96);
+        if (!p) {
+            worker_alloc_ok[id] = 0;
+            break;
+        }
+        memset(p, (int)(0x40 + id), 96);
+        sched_yield();
+        for (int j = 0; j < 96; j++)
+            if (p[j] != (unsigned char)(0x40 + id))
+                worker_alloc_ok[id] = 0;
+        free(p);
+    }
+
+    /* After all that contention, our thread-locals must still be ours. */
+    seed_ok = seed_ok && tls_seed == (int)(0x100 + id) && tls_scratch == (int)(id * 7);
+    seed_ok = seed_ok && (long)pthread_getspecific(specific_key) == id + 1;
+    worker_seed_ok[id] = seed_ok;
+    return (void *)(id * 11);
+}
+
+static void check_threads(void)
+{
+    pthread_t threads[WORKERS];
+
+    check(tls_seed == 0xAB, "main's thread-local came from the .tdata template");
+    check(tls_scratch == 0, "main's .tbss thread-local starts zeroed");
+    tls_seed = 0x1234; /* if the workers share our block, this leaks into them */
+
+    check(pthread_key_create(&specific_key, 0) == 0, "pthread_key_create");
+
+    for (long i = 0; i < WORKERS; i++)
+        check(pthread_create(&threads[i], 0, worker, (void *)i) == 0, "pthread_create");
+
+    /* Release them together. */
+    pthread_mutex_lock(&go_lock);
+    go = 1;
+    pthread_cond_broadcast(&go_signal);
+    pthread_mutex_unlock(&go_lock);
+
+    for (int i = 0; i < WORKERS; i++) {
+        void *retval = 0;
+        check(pthread_join(threads[i], &retval) == 0, "pthread_join");
+        check((long)retval == (long)i * 11, "the thread's return value survived the join");
+        check(worker_seed_ok[i], "each thread kept its own thread-locals");
+        check(worker_alloc_ok[i], "malloc from four threads at once handed out distinct memory");
+    }
+
+    check(shared_counter == (long)WORKERS * BUMPS, "the mutex serialised every increment");
+    check(!exclusion_violated, "no two threads were inside the critical section at once");
+    check(tls_seed == 0x1234, "main's thread-local was not touched by any worker");
+    check(once_count == 1, "pthread_once ran the routine exactly once");
+
+    /* Every thread pointer must be distinct — this is the check that fails if the
+     * kernel stops switching TPIDR_EL0, and the one the roadmap names. */
+    int distinct = 1;
+    for (int i = 0; i < WORKERS; i++) {
+        if (worker_tp[i] == 0 || worker_tp[i] == staros_thread_pointer())
+            distinct = 0;
+        for (int j = i + 1; j < WORKERS; j++)
+            if (worker_tp[i] == worker_tp[j])
+                distinct = 0;
+    }
+    check(distinct, "every thread ran on its own thread pointer");
+
+    printf("[hello-c] threads: %d workers x %d increments = %ld, %lu thread(s) live at the end\n",
+           WORKERS, BUMPS, shared_counter, staros_threads_live());
+}
+
 int main(void)
 {
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
@@ -195,6 +369,7 @@ int main(void)
     check_heap();
     check_time();
     check_files();
+    check_threads();
 
     if (failures == 0)
         puts("[hello-c] C RUNTIME OK - every check passed");
