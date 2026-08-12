@@ -30,30 +30,10 @@ use crate::sys::{self, Message};
 const EP_REQUEST: u64 = 1;
 const EP_REPLY: u64 = 2;
 
-/// How many files a program may have open. Small and fixed: the table is a static,
-/// so this is also the promise that `open` never allocates.
-const MAX_FDS: usize = 16;
-
-/// The first descriptor `open` hands out. 0, 1 and 2 are the standard streams,
-/// which are not files here.
-const FIRST_FD: c_int = 3;
-
-/// One open file, from this side.
-#[derive(Clone, Copy)]
-struct Fd {
-    /// The server's handle. Zero means the slot is free.
-    handle: u64,
-    /// Size at open time. The archive is read-only, so it cannot change under us —
-    /// which is exactly why this may be cached, and why that stops being true the
-    /// day a writable filesystem appears.
-    size: u64,
-    /// The read cursor, kept here (see the module docs).
-    offset: u64,
-}
-
-/// The process-wide file state.
+/// The connection to the file server. Descriptors themselves live in
+/// [`crate::fd`]: a file is one kind of descriptor among several now, and one table
+/// is what lets `poll` and `dup2` see all of them.
 struct Files {
-    fds: [Fd; MAX_FDS],
     /// The shared buffer every request travels through: capability and mapping.
     buffer_cap: u32,
     buffer: *mut u8,
@@ -69,7 +49,6 @@ struct Files {
 /// and could take each other's replies. Serialising file I/O per process is the
 /// cost of that arrangement, and it is written down here rather than discovered.
 static mut FILES: Files = Files {
-    fds: [Fd { handle: 0, size: 0, offset: 0 }; MAX_FDS],
     buffer_cap: 0,
     buffer: core::ptr::null_mut(),
     buffer_len: 0,
@@ -166,44 +145,33 @@ pub(crate) fn open(path: &[u8]) -> c_int {
     if reply.tag == TAG_ERROR {
         return -1;
     }
-    // SAFETY: single-threaded.
-    let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
-    let Some(slot) = files.fds.iter().position(|f| f.handle == 0) else {
+    let fd = crate::fd::install_file(reply.words[0], reply.words[1]);
+    if fd < 0 {
         // Out of descriptors: the handle the server just opened would leak, so
         // close it before failing. A libc that forgets this runs a server out of
         // handles by failing.
         let _ = request(TAG_CLOSE, [reply.words[0], 0, 0], false);
         return -1;
-    };
-    files.fds[slot] = Fd { handle: reply.words[0], size: reply.words[1], offset: 0 };
-    slot as c_int + FIRST_FD
+    }
+    fd
 }
 
-/// Look a descriptor up.
-fn slot(fd: c_int) -> Option<usize> {
-    let index = usize::try_from(fd - FIRST_FD).ok()?;
-    // SAFETY: single-threaded.
-    let files = unsafe { &*core::ptr::addr_of!(FILES) };
-    (index < MAX_FDS && files.fds[index].handle != 0).then_some(index)
-}
-
-/// `read`: fill `dst` from the current offset, and advance it.
+/// `read`: fill `dst` from the descriptor's cursor, and advance it.
 pub(crate) fn read(fd: c_int, dst: &mut [u8]) -> isize {
     let _guard = FILES_LOCK.lock();
-    let Some(index) = slot(fd) else {
+    let Some(crate::fd::Kind::File { handle, mut offset, .. }) = crate::fd::get(fd) else {
         return -1;
     };
-    // SAFETY: single-threaded.
-    let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
+    // SAFETY: read under the file lock.
+    let files = unsafe { &*core::ptr::addr_of!(FILES) };
     let mut done = 0;
     while done < dst.len() {
         let want = (dst.len() - done).min(files.buffer_len);
-        let entry = files.fds[index];
-        let Some(reply) = request(TAG_READ, [entry.handle, entry.offset, want as u64], true) else {
-            return if done == 0 { -1 } else { done as isize };
+        let Some(reply) = request(TAG_READ, [handle, offset, want as u64], true) else {
+            break;
         };
         if reply.tag == TAG_ERROR {
-            return if done == 0 { -1 } else { done as isize };
+            break;
         }
         let got = reply.words[0] as usize;
         if got == 0 {
@@ -213,7 +181,13 @@ pub(crate) fn read(fd: c_int, dst: &mut [u8]) -> isize {
         // is bounded by the size we asked for and by the page itself.
         unsafe { core::ptr::copy_nonoverlapping(files.buffer, dst.as_mut_ptr().add(done), got) };
         done += got;
-        files.fds[index].offset += got as u64;
+        offset += got as u64;
+    }
+    crate::fd::set_offset(fd, offset);
+    if done == 0 && !dst.is_empty() {
+        // Nothing read: end of file is zero, and a refusal is an error. The
+        // difference is what a caller loops on.
+        return 0;
     }
     done as isize
 }
@@ -221,16 +195,13 @@ pub(crate) fn read(fd: c_int, dst: &mut [u8]) -> isize {
 /// `lseek`, with the three C whences.
 pub(crate) fn seek(fd: c_int, offset: i64, whence: c_int) -> i64 {
     let _guard = FILES_LOCK.lock();
-    let Some(index) = slot(fd) else {
+    let Some(crate::fd::Kind::File { size, offset: current, .. }) = crate::fd::get(fd) else {
         return -1;
     };
-    // SAFETY: single-threaded.
-    let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
-    let entry = files.fds[index];
     let base = match whence {
-        0 => 0,                    // SEEK_SET
-        1 => entry.offset as i64,  // SEEK_CUR
-        2 => entry.size as i64,    // SEEK_END
+        0 => 0,                   // SEEK_SET
+        1 => current as i64,      // SEEK_CUR
+        2 => size as i64,         // SEEK_END
         _ => return -1,
     };
     let Some(target) = base.checked_add(offset).filter(|t| *t >= 0) else {
@@ -238,7 +209,7 @@ pub(crate) fn seek(fd: c_int, offset: i64, whence: c_int) -> i64 {
     };
     // Seeking past the end is legal in C and simply reads nothing later; clamping
     // it here would silently turn a wrong offset into a plausible one.
-    files.fds[index].offset = target as u64;
+    crate::fd::set_offset(fd, target as u64);
     target
 }
 
@@ -252,27 +223,20 @@ pub(crate) fn size_of_path(path: &[u8]) -> Option<u64> {
 
 /// The size behind an open descriptor.
 pub(crate) fn size_of_fd(fd: c_int) -> Option<u64> {
-    let _guard = FILES_LOCK.lock();
-    let index = slot(fd)?;
-    // SAFETY: single-threaded.
-    let files = unsafe { &*core::ptr::addr_of!(FILES) };
-    Some(files.fds[index].size)
+    match crate::fd::get(fd)? {
+        crate::fd::Kind::File { size, .. } => Some(size),
+        _ => None,
+    }
 }
 
-/// `close`.
-pub(crate) fn close(fd: c_int) -> c_int {
+/// Tell the server a handle is finished with. The descriptor itself is released by
+/// [`crate::fd::release`], which is what knows about the other kinds.
+pub(crate) fn close_handle(handle: u64) -> c_int {
     let _guard = FILES_LOCK.lock();
-    let Some(index) = slot(fd) else {
-        return -1;
-    };
-    // SAFETY: single-threaded.
-    let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
-    let handle = files.fds[index].handle;
-    files.fds[index] = Fd { handle: 0, size: 0, offset: 0 };
     match request(TAG_CLOSE, [handle, 0, 0], false) {
         Some(reply) if reply.tag != TAG_ERROR => 0,
-        // The slot is released either way: a server that refuses to close a handle
-        // must not also cost this process a descriptor forever.
+        // The descriptor is released either way: a server that refuses to close a
+        // handle must not also cost this process a descriptor forever.
         _ => -1,
     }
 }
@@ -306,6 +270,11 @@ pub mod exports {
 
     /// # Safety
     /// C ABI: `buf` is valid for `count` bytes.
+    ///
+    /// One `read` for every kind of descriptor: a file goes to the file server, an
+    /// eventfd or a pipe to [`crate::fd`]. Programs do not know which they were
+    /// handed — that is the point of a descriptor — so the dispatch belongs here
+    /// rather than in the caller.
     #[no_mangle]
     pub unsafe extern "C" fn read(fd: c_int, buf: *mut core::ffi::c_void, count: usize) -> isize {
         if fd <= 2 {
@@ -315,12 +284,37 @@ pub mod exports {
         }
         // SAFETY: forwarded from the caller.
         let dst = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), count) };
-        super::read(fd, dst)
+        match crate::fd::get(fd) {
+            Some(crate::fd::Kind::File { .. }) => super::read(fd, dst),
+            Some(kind) => crate::fd::read(kind, dst),
+            None => -1,
+        }
+    }
+
+    /// # Safety
+    /// C ABI: `buf` is valid for `count` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn write(fd: c_int, buf: *const core::ffi::c_void, count: usize) -> isize {
+        // SAFETY: forwarded from the caller.
+        let src = unsafe { core::slice::from_raw_parts(buf.cast::<u8>(), count) };
+        if fd == 1 || fd == 2 {
+            crate::stdio::write_bytes(src);
+            return count as isize;
+        }
+        match crate::fd::get(fd) {
+            // The file server is read-only, and saying so beats accepting bytes
+            // that go nowhere.
+            Some(crate::fd::Kind::File { .. }) | None => -1,
+            Some(kind) => crate::fd::write(kind, src),
+        }
     }
 
     #[no_mangle]
     pub extern "C" fn close(fd: c_int) -> c_int {
-        super::close(fd)
+        match crate::fd::release(fd) {
+            Some(handle) => super::close_handle(handle),
+            None => 0,
+        }
     }
 
     #[no_mangle]

@@ -47,6 +47,7 @@
 // guard, several function calls away from anything that looks related.
 #![cfg_attr(not(test), no_builtins)]
 
+pub mod fd;
 pub mod fmt;
 pub mod file;
 pub mod heap;
@@ -126,6 +127,9 @@ pub unsafe extern "C" fn _start() -> ! {
     // thread exists is one that thread cannot see. It also gives `main` its thread
     // pointer, so `_Thread_local` works in `main` and not only in what it spawns.
     thread::init();
+    // Waitable descriptors take their notifications from a pool for the same reason
+    // threads do: one created after a thread exists is invisible to it.
+    fd::init();
     file::init();
     // No arguments to pass yet: there is no shell to pass them. `argv[0]` exists
     // because a C program is entitled to read it.

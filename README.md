@@ -19,8 +19,9 @@ address space, processes loaded from a file rather than from the kernel image, a
 display server in user space that owns the screen, a virtio-input driver that
 decodes real key events without the kernel seeing one, a file server that hands
 files to processes holding no archive, and a **C program** — compiled by clang
-against this tree's own libc — that prints, allocates, sleeps, reads files and runs
-`pthread`s with real thread-local storage, without a syscall in sight.
+against this tree's own libc — that prints, allocates, sleeps, reads files, runs
+`pthread`s with real thread-local storage and blocks in `poll` until another thread
+writes to an eventfd, without a syscall in sight.
 
 ## Layout
 
@@ -38,7 +39,7 @@ against this tree's own libc — that prints, allocates, sleeps, reads files and
 | `crates/videocore` | Raspberry Pi VideoCore property-mailbox **messages** (no MMIO) |
 | `crates/virtio` | Split-virtqueue layout, MMIO register map, input event format (no MMIO) |
 | `crates/iommu` | SMMUv3 descriptor/queue bit layouts (no MMIO) |
-| `crates/staros-libc` | The C library EL0 programs link against: `str*`/`mem*`/`printf`, `malloc` over `MapAnon`, time over `ClockNow`, files over the file server, and `pthread`s with real thread-local storage over `SpawnThread` |
+| `crates/staros-libc` | The C library EL0 programs link against: `str*`/`mem*`/`printf`, `malloc` over `MapAnon`, time over `ClockNow`, files over the file server, `pthread`s with real thread-local storage over `SpawnThread`, and `poll`/`eventfd`/`pipe` over `WaitAny` |
 
 The split is deliberate and repeated: every subsystem whose bugs hide in *layout*
 gets a pure crate with exact-value tests, and only the doorbell-ringing half is
@@ -193,6 +194,7 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
+[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 22302288 ns
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 7 requests, 44 bytes of file data, and refused 1 - the archive never left this address space
 clock: the demo took 13520 ms on the monotonic clock, during which core 0 took 106 tick(s)
@@ -221,7 +223,7 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **202 assertions, exit=0** on `--quick` (229 on the
+  failure signals. Currently **203 assertions, exit=0** on `--quick` (230 on the
   full matrix).
 - **`./scripts/input-check.sh`** — the only check that makes the *outside world*
   act: QEMU synthesises a real key event, and the assertion is that a driver in EL0

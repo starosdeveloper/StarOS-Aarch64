@@ -73,6 +73,21 @@ int sched_yield(void);
 unsigned long staros_thread_pointer(void);
 unsigned long staros_threads_live(void);
 
+/* Waitable descriptors: what Qt's event loop is built on. */
+struct pollfd {
+    int fd;
+    short events;
+    short revents;
+};
+#define POLLIN 0x001
+#define POLLOUT 0x004
+int poll(struct pollfd *fds, unsigned long nfds, int timeout_ms);
+int eventfd(int initial, int flags);
+int eventfd_read(int fd, unsigned long *value);
+int eventfd_write(int fd, unsigned long value);
+int pipe(int fds[2]);
+ssize_t write(int fd, const void *buf, size_t count);
+
 #define SEEK_SET 0
 #define SEEK_END 2
 
@@ -361,6 +376,89 @@ static void check_threads(void)
            WORKERS, BUMPS, shared_counter, staros_threads_live());
 }
 
+/* Layer 6: descriptors you can wait on.
+ *
+ * This is the shape of an event loop — block in poll until something happens, with
+ * a deadline — so the checks are about *waiting* rather than about data: that a
+ * timeout is really honoured, that a poll blocked until another thread acted, and
+ * that a descriptor stops being ready once its event is consumed. */
+static int event_fd;
+static int pipe_fds[2];
+static int pipe_message_ok;
+
+static void *io_worker(void *arg)
+{
+    (void)arg;
+    char buf[16];
+    struct pollfd wait_read = { pipe_fds[0], POLLIN, 0 };
+
+    /* Block until main writes. If poll returned early or spuriously, the read
+     * below would come back short and the check would fail. */
+    if (poll(&wait_read, 1, 5000) == 1 && (wait_read.revents & POLLIN)) {
+        ssize_t got = read(pipe_fds[0], buf, sizeof buf);
+        pipe_message_ok = (got == 4) && (memcmp(buf, "ping", 4) == 0);
+    }
+    /* Tell main we are done, the way a worker thread signals an event loop. */
+    eventfd_write(event_fd, 1);
+    return 0;
+}
+
+static void check_poll(void)
+{
+    struct timespec before, after;
+    pthread_t worker_id;
+
+    event_fd = eventfd(0, 0);
+    check(event_fd >= 0, "eventfd");
+    check(pipe(pipe_fds) == 0, "pipe");
+
+    struct pollfd watch_event = { event_fd, POLLIN, 0 };
+
+    /* Nothing has happened yet: a zero timeout must report nothing ready and must
+     * not block. */
+    check(poll(&watch_event, 1, 0) == 0, "poll with a zero timeout reports nothing");
+
+    /* A timeout must be *waited out*. Measured, because a poll that returns
+     * immediately reports the same zero. */
+    clock_gettime(0, &before);
+    check(poll(&watch_event, 1, 20) == 0, "poll timed out with nothing ready");
+    clock_gettime(0, &after);
+    long long waited = (long long)(after.tv_sec - before.tv_sec) * 1000000000LL
+                       + (after.tv_nsec - before.tv_nsec);
+    check(waited >= 20 * 1000 * 1000, "poll actually waited for its timeout");
+
+    check(pthread_create(&worker_id, 0, io_worker, 0) == 0, "pthread_create for the io worker");
+    check(write(pipe_fds[1], "ping", 4) == 4, "write to the pipe");
+
+    /* Block until the worker signals. Nothing here spins: the wake comes from the
+     * other thread's eventfd_write. */
+    check(poll(&watch_event, 1, 5000) == 1, "poll woke on another thread's eventfd");
+    check(watch_event.revents & POLLIN, "poll reported the eventfd readable");
+
+    unsigned long value = 0;
+    check(eventfd_read(event_fd, &value) == 0, "eventfd_read");
+    check(value == 1, "the eventfd carried the value written");
+    /* Consumed: the descriptor must stop being ready. A readiness bit that is
+     * remembered rather than recomputed is how an event loop comes to spin. */
+    check(poll(&watch_event, 1, 0) == 0, "the eventfd is not ready once it is read");
+
+    /* The counter accumulates until read, which is the whole difference between an
+     * eventfd and a flag. */
+    eventfd_write(event_fd, 2);
+    eventfd_write(event_fd, 3);
+    check(eventfd_read(event_fd, &value) == 0, "eventfd_read again");
+    check(value == 5, "the eventfd summed the writes it had not delivered");
+
+    check(pthread_join(worker_id, 0) == 0, "join the io worker");
+    check(pipe_message_ok, "the worker read exactly what the pipe was given");
+
+    close(event_fd);
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    printf("[hello-c] poll: a thread slept on an eventfd and a pipe, and a %d ms timeout took %lld ns\n",
+           20, waited);
+}
+
 int main(void)
 {
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
@@ -370,6 +468,7 @@ int main(void)
     check_time();
     check_files();
     check_threads();
+    check_poll();
 
     if (failures == 0)
         puts("[hello-c] C RUNTIME OK - every check passed");

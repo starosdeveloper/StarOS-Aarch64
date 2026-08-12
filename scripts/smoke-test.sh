@@ -268,6 +268,11 @@ if [ -n "$INITRAMFS" ]; then
     # through a mutex whose critical section yields in the middle — a lock that does
     # nothing passes a plain `counter++` loop and fails this one.
     req "[hello-c] threads: 4 workers x 250 increments = 1000"
+    # The event-loop layer: a thread blocked in poll until another thread wrote to
+    # an eventfd, a pipe carried bytes between them, and a timeout was waited out
+    # rather than returned from. The number in the line is measured, so only the
+    # prefix is asserted.
+    req "[hello-c] poll: a thread slept on an eventfd and a pipe"
     # An EL0 fault now reports where it happened, not just that it did.
     req "[fault]   backtrace ("
 else

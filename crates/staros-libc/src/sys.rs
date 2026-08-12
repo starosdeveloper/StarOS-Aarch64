@@ -185,9 +185,16 @@ pub(crate) fn wait(handle: u32) {
 /// Block until a notification is signalled or the absolute deadline passes.
 /// Returns `true` if the notification fired.
 pub(crate) fn wait_until(handle: u32, deadline_ns: u64) -> bool {
-    let handles = [handle];
+    wait_any(&[handle], deadline_ns)
+}
+
+/// Block until any of `handles` is signalled, or the absolute deadline passes.
+/// Returns `true` if one fired. A deadline of zero means "no deadline" — the
+/// kernel's convention, because a deadline already in the past would otherwise turn
+/// every wait into a poll that never waits.
+pub(crate) fn wait_any(handles: &[u32], deadline_ns: u64) -> bool {
     // SAFETY: `WaitAny` reads `len` handles from the pointer and parks with a
-    // deadline; the array outlives the call.
+    // deadline; the slice outlives the call.
     let rc = unsafe {
         syscall3(Syscall::WaitAny, handles.as_ptr() as u64, handles.len() as u64, deadline_ns)
     };
