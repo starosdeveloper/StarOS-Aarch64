@@ -23,7 +23,7 @@ use crate::uart::Pl011;
 
 /// The register/state snapshot captured on every exception.
 ///
-/// Layout is `#[repr(C)]` and its size (288 bytes, 16-aligned) is mirrored
+/// Layout is `#[repr(C)]` and its size (816 bytes, 16-aligned) is mirrored
 /// byte-for-byte by the offsets in `__exc_common` below — keep the two in sync.
 #[repr(C)]
 #[derive(Debug)]
@@ -48,7 +48,42 @@ pub struct TrapFrame {
     /// which is what makes preemption of a task running in EL0 (rather than parked
     /// in a syscall) sound. Also keeps the frame 16-byte aligned.
     pub sp_el0: u64,
+    /// The FP/SIMD register file, `q0`..=`q31`.
+    ///
+    /// Saved on *every* exception, which is the expensive-looking choice and the
+    /// only correct one available here. The cheaper design is Linux's — keep the
+    /// FP state per thread and swap it in the context switch — and it requires
+    /// that no kernel code between the trap and the switch touch these registers.
+    /// That is not true of this kernel: the compiler emits `dup v0.16b, w0` for a
+    /// byte fill and `fmov` for integer-to-float conversions, so by the time the
+    /// scheduler runs, a preempted thread's `v0` is already somebody else's.
+    ///
+    /// The bug this fixes was found from user space, not from reading the code: on
+    /// four cores, hello-c's `exp(log(x)) == x` and `snprintf` checks failed
+    /// intermittently while single-core runs passed every time. Floating point had
+    /// simply never been under contention before this phase's `libm`.
+    pub fpregs: [u128; 32],
+    /// `FPSR` — the cumulative exception flags, which are per-thread state.
+    pub fpsr: u64,
+    /// `FPCR` — rounding mode and trap enables, likewise.
+    pub fpcr: u64,
 }
+
+// The frame's size and the offset of every field are written out twice: once in
+// Rust above and once as literals in `__exc_common`. These assertions are what
+// stops the two from drifting — a field added in the middle would otherwise shift
+// everything after it and be found as a corrupted `elr` on some later exception.
+const _: () = {
+    assert!(core::mem::size_of::<TrapFrame>() == 816);
+    assert!(core::mem::offset_of!(TrapFrame, esr) == 248);
+    assert!(core::mem::offset_of!(TrapFrame, elr) == 256);
+    assert!(core::mem::offset_of!(TrapFrame, spsr) == 264);
+    assert!(core::mem::offset_of!(TrapFrame, far) == 272);
+    assert!(core::mem::offset_of!(TrapFrame, sp_el0) == 280);
+    assert!(core::mem::offset_of!(TrapFrame, fpregs) == 288);
+    assert!(core::mem::offset_of!(TrapFrame, fpsr) == 800);
+    assert!(core::mem::offset_of!(TrapFrame, fpcr) == 808);
+};
 
 /// Exception class value in `ESR_EL1[31:26]` for an `SVC` executed from
 /// AArch64 — the trap a userspace (or, for now, kernel) `svc` instruction
@@ -379,7 +414,7 @@ fn fatal(frame: &TrapFrame, kind: u64) -> ! {
     halt();
 }
 
-// The vector table and the shared save/restore trampoline. The 288-byte frame
+// The vector table and the shared save/restore trampoline. The 816-byte frame
 // and every offset here must match `TrapFrame` exactly.
 global_asm!(
     r#"
@@ -387,7 +422,7 @@ global_asm!(
 // trampoline. Four instructions — comfortably inside the 128-byte slot.
 .macro VECTOR kind
     .p2align 7
-    sub     sp, sp, #288
+    sub     sp, sp, #816
     str     x0, [sp, #0]
     mov     x0, #\kind
     b       __exc_common
@@ -458,6 +493,29 @@ __exc_common:
     mrs     x1, sp_el0
     str     x1, [sp, #280]
 
+    // The FP/SIMD file, before any kernel code runs: the compiler uses v0 for
+    // byte fills, so waiting until the scheduler would be too late.
+    stp     q0,  q1,  [sp, #288]
+    stp     q2,  q3,  [sp, #320]
+    stp     q4,  q5,  [sp, #352]
+    stp     q6,  q7,  [sp, #384]
+    stp     q8,  q9,  [sp, #416]
+    stp     q10, q11, [sp, #448]
+    stp     q12, q13, [sp, #480]
+    stp     q14, q15, [sp, #512]
+    stp     q16, q17, [sp, #544]
+    stp     q18, q19, [sp, #576]
+    stp     q20, q21, [sp, #608]
+    stp     q22, q23, [sp, #640]
+    stp     q24, q25, [sp, #672]
+    stp     q26, q27, [sp, #704]
+    stp     q28, q29, [sp, #736]
+    stp     q30, q31, [sp, #768]
+    mrs     x1, fpsr
+    str     x1, [sp, #800]
+    mrs     x1, fpcr
+    str     x1, [sp, #808]
+
     mov     x1, x0          // arg1 = kind
     mov     x0, sp          // arg0 = &TrapFrame
     bl      rust_exception_handler
@@ -472,6 +530,29 @@ __exc_common:
     msr     spsr_el1, x1
     ldr     x1, [sp, #280]
     msr     sp_el0, x1
+
+    // The FP/SIMD file belongs to whichever task this frame now describes — after
+    // a preempting switch that is not the task that built it.
+    ldr     x1, [sp, #808]
+    msr     fpcr, x1
+    ldr     x1, [sp, #800]
+    msr     fpsr, x1
+    ldp     q0,  q1,  [sp, #288]
+    ldp     q2,  q3,  [sp, #320]
+    ldp     q4,  q5,  [sp, #352]
+    ldp     q6,  q7,  [sp, #384]
+    ldp     q8,  q9,  [sp, #416]
+    ldp     q10, q11, [sp, #448]
+    ldp     q12, q13, [sp, #480]
+    ldp     q14, q15, [sp, #512]
+    ldp     q16, q17, [sp, #544]
+    ldp     q18, q19, [sp, #576]
+    ldp     q20, q21, [sp, #608]
+    ldp     q22, q23, [sp, #640]
+    ldp     q24, q25, [sp, #672]
+    ldp     q26, q27, [sp, #704]
+    ldp     q28, q29, [sp, #736]
+    ldp     q30, q31, [sp, #768]
 
     ldr     x30, [sp, #240]
     ldr     x29, [sp, #232]
@@ -504,7 +585,7 @@ __exc_common:
     ldr     x2,  [sp, #16]
     ldr     x1,  [sp, #8]
     ldr     x0,  [sp, #0]
-    add     sp, sp, #288
+    add     sp, sp, #816
     eret
 "#
 );

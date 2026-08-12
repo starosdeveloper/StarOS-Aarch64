@@ -470,6 +470,327 @@ pub mod exports {
     pub extern "C" fn isdigit(c: c_int) -> c_int {
         c_int::from(digit(c as u8, 10).is_some())
     }
+
+    /// The name glibc's headers give `strtol` when a program is compiled as C23.
+    /// The C23 change is that base 2 gets a `0b` prefix; everything else, including
+    /// this implementation, is the same function.
+    ///
+    /// # Safety
+    /// As [`strtol`].
+    #[no_mangle]
+    pub unsafe extern "C" fn __isoc23_strtol(
+        s: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> i64 {
+        // SAFETY: forwarded from the caller.
+        unsafe { strtol(s, end, base) }
+    }
+
+    /// # Safety
+    /// C ABI: `dst` is NUL-terminated and has room for `n` more bytes and a NUL.
+    #[no_mangle]
+    pub unsafe extern "C" fn strncat(dst: *mut c_char, src: *const c_char, n: usize) -> *mut c_char {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let at = super::strlen(dst);
+            let bytes = as_bytes(src);
+            let take = bytes.len().min(n);
+            for (i, &b) in bytes[..take].iter().enumerate() {
+                *dst.add(at + i) = b as c_char;
+            }
+            // `strncat` always terminates — unlike `strncpy`, which is the source of
+            // half the confusion between them.
+            *dst.add(at + take) = 0;
+        }
+        dst
+    }
+
+    /// `strtok_r`: the reentrant one, and the only one worth having. The state lives
+    /// in the caller's variable rather than in a static, so two threads tokenising
+    /// two strings do not interleave.
+    ///
+    /// # Safety
+    /// C ABI: `save` points at a pointer this function owns between calls.
+    #[no_mangle]
+    pub unsafe extern "C" fn strtok_r(
+        s: *mut c_char,
+        delim: *const c_char,
+        save: *mut *mut c_char,
+    ) -> *mut c_char {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let mut cur = if s.is_null() { *save } else { s };
+            if cur.is_null() {
+                return core::ptr::null_mut();
+            }
+            let delims = as_bytes(delim);
+            // Skip leading delimiters; a run of them is one separator.
+            while *cur != 0 && delims.contains(&(*cur as u8)) {
+                cur = cur.add(1);
+            }
+            if *cur == 0 {
+                *save = cur;
+                return core::ptr::null_mut();
+            }
+            let start = cur;
+            while *cur != 0 && !delims.contains(&(*cur as u8)) {
+                cur = cur.add(1);
+            }
+            if *cur != 0 {
+                // Cut the token out of the caller's buffer, which is what makes this
+                // destructive and why a string literal must never be passed to it.
+                *cur = 0;
+                cur = cur.add(1);
+            }
+            *save = cur;
+            start
+        }
+    }
+
+    /// # Safety
+    /// C ABI: both regions valid for their lengths.
+    #[no_mangle]
+    pub unsafe extern "C" fn memmem(
+        haystack: *const c_void,
+        haystack_len: usize,
+        needle: *const c_void,
+        needle_len: usize,
+    ) -> *mut c_void {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let h = core::slice::from_raw_parts(haystack.cast::<u8>(), haystack_len);
+            let n = core::slice::from_raw_parts(needle.cast::<u8>(), needle_len);
+            match super::find(h, n) {
+                Some(i) => haystack.cast::<u8>().add(i).cast_mut().cast::<c_void>(),
+                None => core::ptr::null_mut(),
+            }
+        }
+    }
+
+    /// # Safety
+    /// C ABI: `s` valid for `n` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn memrchr(s: *const c_void, byte: c_int, n: usize) -> *mut c_void {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let bytes = core::slice::from_raw_parts(s.cast::<u8>(), n);
+            match bytes.iter().rposition(|&b| b == byte as u8) {
+                Some(i) => s.cast::<u8>().add(i).cast_mut().cast::<c_void>(),
+                None => core::ptr::null_mut(),
+            }
+        }
+    }
+
+    /// # Safety
+    /// C ABI: NUL-terminated wide string.
+    #[no_mangle]
+    pub unsafe extern "C" fn wcslen(s: *const u32) -> usize {
+        let mut n = 0;
+        // SAFETY: forwarded from the caller; `wchar_t` is 32-bit on this target.
+        while unsafe { *s.add(n) } != 0 {
+            n += 1;
+        }
+        n
+    }
+
+    /// `strerror`. The strings are the real messages for the codes this library
+    /// actually produces; anything else says so with its number rather than
+    /// claiming to be "Unknown error", which tells the reader nothing.
+    #[no_mangle]
+    pub extern "C" fn strerror(code: c_int) -> *mut c_char {
+        // Static storage, because C says the result stays valid until the next call.
+        // Not thread-safe, and neither is glibc's — `strerror_r` exists for that.
+        static mut UNKNOWN: [u8; 32] = [0; 32];
+        let text: &[u8] = match code {
+            0 => b"Success\0",
+            1 => b"Operation not permitted\0",
+            2 => b"No such file or directory\0",
+            9 => b"Bad file descriptor\0",
+            11 => b"Resource temporarily unavailable\0",
+            12 => b"Cannot allocate memory\0",
+            13 => b"Permission denied\0",
+            14 => b"Bad address\0",
+            16 => b"Device or resource busy\0",
+            17 => b"File exists\0",
+            21 => b"Is a directory\0",
+            22 => b"Invalid argument\0",
+            23 => b"Too many open files in system\0",
+            24 => b"Too many open files\0",
+            28 => b"No space left on device\0",
+            32 => b"Broken pipe\0",
+            38 => b"Function not implemented\0",
+            110 => b"Connection timed out\0",
+            _ => {
+                // SAFETY: single-threaded use of a static, matching C's own rule
+                // about the lifetime of this result.
+                unsafe {
+                    let buf = &mut *core::ptr::addr_of_mut!(UNKNOWN);
+                    let prefix = b"Error ";
+                    buf[..prefix.len()].copy_from_slice(prefix);
+                    let mut n = prefix.len();
+                    let mut digits = [0u8; 10];
+                    let mut d = 0;
+                    let mut v = code.unsigned_abs();
+                    loop {
+                        digits[d] = b'0' + (v % 10) as u8;
+                        v /= 10;
+                        d += 1;
+                        if v == 0 {
+                            break;
+                        }
+                    }
+                    while d > 0 {
+                        d -= 1;
+                        buf[n] = digits[d];
+                        n += 1;
+                    }
+                    buf[n] = 0;
+                    return buf.as_mut_ptr().cast::<c_char>();
+                }
+            }
+        };
+        text.as_ptr().cast::<c_char>().cast_mut()
+    }
+
+    /// # Safety
+    /// C ABI: `buf` valid for `len` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn strerror_r(code: c_int, buf: *mut c_char, len: usize) -> c_int {
+        let src = strerror(code);
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let bytes = as_bytes(src);
+            if bytes.len() + 1 > len {
+                return 34; // ERANGE
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                *buf.add(i) = b as c_char;
+            }
+            *buf.add(bytes.len()) = 0;
+        }
+        0
+    }
+
+    // The fortified variants. `_FORTIFY_SOURCE` makes the compiler pass the
+    // destination's size — which it often knows and the callee never does — so the
+    // overflow can be caught before it happens rather than found afterwards as a
+    // corrupted neighbour. Qt is built with it on, which is why these are in the
+    // contract; each one checks and then defers to the function it guards.
+
+    /// # Safety
+    /// C ABI: as `memcpy`, plus `size` describing `dst`.
+    #[no_mangle]
+    pub unsafe extern "C" fn __memcpy_chk(
+        dst: *mut c_void,
+        src: *const c_void,
+        n: usize,
+        size: usize,
+    ) -> *mut c_void {
+        if n > size {
+            crate::chk_fail("memcpy");
+        }
+        // SAFETY: checked above, then forwarded.
+        unsafe { memcpy(dst, src, n) }
+    }
+
+    /// # Safety
+    /// C ABI: as `memmove`, plus `size` describing `dst`.
+    #[no_mangle]
+    pub unsafe extern "C" fn __memmove_chk(
+        dst: *mut c_void,
+        src: *const c_void,
+        n: usize,
+        size: usize,
+    ) -> *mut c_void {
+        if n > size {
+            crate::chk_fail("memmove");
+        }
+        // SAFETY: checked above, then forwarded.
+        unsafe { memmove(dst, src, n) }
+    }
+
+    /// # Safety
+    /// C ABI: as `memset`, plus `size` describing `dst`.
+    #[no_mangle]
+    pub unsafe extern "C" fn __memset_chk(
+        dst: *mut c_void,
+        byte: c_int,
+        n: usize,
+        size: usize,
+    ) -> *mut c_void {
+        if n > size {
+            crate::chk_fail("memset");
+        }
+        // SAFETY: checked above, then forwarded.
+        unsafe { memset(dst, byte, n) }
+    }
+
+    /// # Safety
+    /// C ABI: as `strcpy`, plus `size` describing `dst`.
+    #[no_mangle]
+    pub unsafe extern "C" fn __strcpy_chk(
+        dst: *mut c_char,
+        src: *const c_char,
+        size: usize,
+    ) -> *mut c_char {
+        // SAFETY: forwarded from the caller.
+        if unsafe { super::strlen(src) } + 1 > size {
+            crate::chk_fail("strcpy");
+        }
+        // SAFETY: checked above, then forwarded.
+        unsafe { strcpy(dst, src) }
+    }
+
+    /// # Safety
+    /// C ABI: as `strcat`, plus `size` describing `dst`.
+    #[no_mangle]
+    pub unsafe extern "C" fn __strcat_chk(
+        dst: *mut c_char,
+        src: *const c_char,
+        size: usize,
+    ) -> *mut c_char {
+        // SAFETY: forwarded from the caller.
+        if unsafe { super::strlen(dst) + super::strlen(src) } + 1 > size {
+            crate::chk_fail("strcat");
+        }
+        // SAFETY: checked above, then forwarded.
+        unsafe { strcat(dst, src) }
+    }
+
+    /// # Safety
+    /// C ABI: as `strncat`, plus `size` describing `dst`.
+    #[no_mangle]
+    pub unsafe extern "C" fn __strncat_chk(
+        dst: *mut c_char,
+        src: *const c_char,
+        n: usize,
+        size: usize,
+    ) -> *mut c_char {
+        // SAFETY: forwarded from the caller.
+        let need = unsafe { super::strlen(dst) + super::strlen(src).min(n) } + 1;
+        if need > size {
+            crate::chk_fail("strncat");
+        }
+        // SAFETY: checked above, then forwarded.
+        unsafe { strncat(dst, src, n) }
+    }
+
+    /// # Safety
+    /// C ABI: as `strncpy`, plus `size` describing `dst`.
+    #[no_mangle]
+    pub unsafe extern "C" fn __strncpy_chk(
+        dst: *mut c_char,
+        src: *const c_char,
+        n: usize,
+        size: usize,
+    ) -> *mut c_char {
+        if n > size {
+            crate::chk_fail("strncpy");
+        }
+        // SAFETY: checked above, then forwarded.
+        unsafe { strncpy(dst, src, n) }
+    }
 }
 
 #[cfg(test)]

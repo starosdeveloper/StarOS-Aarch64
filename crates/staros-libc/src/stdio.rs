@@ -281,6 +281,149 @@ pub mod exports {
         0
     }
 
+    // The fortified `printf` family. The extra `flag` argument says whether the
+    // compiler wants `%n` rejected; the extra size argument on the buffer forms is
+    // the destination's real length. Qt is built with `_FORTIFY_SOURCE`, so these
+    // are the names its object files actually reference — `printf` itself may not
+    // appear anywhere in the link.
+
+    /// # Safety
+    /// As [`printf`].
+    #[no_mangle]
+    pub unsafe extern "C" fn __printf_chk(_flag: c_int, format: *const c_char, args: ...) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let mut source = VaArgs(args);
+            super::with_out(|out| {
+                fmt::format(&mut ConsoleSink { out }, bytes, &mut source) as c_int
+            })
+        }
+    }
+
+    /// # Safety
+    /// As [`fprintf`].
+    #[no_mangle]
+    pub unsafe extern "C" fn __fprintf_chk(
+        _stream: *mut File,
+        _flag: c_int,
+        format: *const c_char,
+        args: ...
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let mut source = VaArgs(args);
+            super::with_out(|out| {
+                fmt::format(&mut ConsoleSink { out }, bytes, &mut source) as c_int
+            })
+        }
+    }
+
+    /// # Safety
+    /// As [`snprintf`]. `size` is what the caller asked for and `have` is what the
+    /// compiler knows the buffer to be; a `size` beyond it is the bug this catches.
+    #[no_mangle]
+    pub unsafe extern "C" fn __snprintf_chk(
+        buf: *mut c_char,
+        size: usize,
+        _flag: c_int,
+        have: usize,
+        format: *const c_char,
+        args: ...
+    ) -> c_int {
+        if size > have {
+            crate::chk_fail("snprintf");
+        }
+        // SAFETY: checked above; the rest is `snprintf`'s own contract.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let out = core::slice::from_raw_parts_mut(buf.cast::<u8>(), size);
+            let mut sink = BufSink { buf: out, written: 0 };
+            let mut source = VaArgs(args);
+            let n = fmt::format(&mut sink, bytes, &mut source);
+            if size > 0 {
+                *buf.add(n.min(size - 1)) = 0;
+            }
+            n as c_int
+        }
+    }
+
+    /// # Safety
+    /// As [`sprintf`], with `have` describing the buffer. Unlike the unchecked
+    /// `sprintf` this one can refuse: the result's length is known once it has been
+    /// formatted, so a run that would have overflowed stops instead.
+    #[no_mangle]
+    pub unsafe extern "C" fn __sprintf_chk(
+        buf: *mut c_char,
+        _flag: c_int,
+        have: usize,
+        format: *const c_char,
+        args: ...
+    ) -> c_int {
+        // SAFETY: forwarded from the caller; the buffer is `have` bytes, which is
+        // exactly what the fortified form exists to tell us.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let out = core::slice::from_raw_parts_mut(buf.cast::<u8>(), have);
+            let mut sink = BufSink { buf: out, written: 0 };
+            let mut source = VaArgs(args);
+            let n = fmt::format(&mut sink, bytes, &mut source);
+            if n + 1 > have {
+                crate::chk_fail("sprintf");
+            }
+            *buf.add(n) = 0;
+            n as c_int
+        }
+    }
+
+    /// # Safety
+    /// As [`__snprintf_chk`], with the list already started by the caller.
+    #[no_mangle]
+    pub unsafe extern "C" fn __vsnprintf_chk(
+        buf: *mut c_char,
+        size: usize,
+        _flag: c_int,
+        have: usize,
+        format: *const c_char,
+        args: core::ffi::VaList,
+    ) -> c_int {
+        if size > have {
+            crate::chk_fail("vsnprintf");
+        }
+        // SAFETY: as above.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let out = core::slice::from_raw_parts_mut(buf.cast::<u8>(), size);
+            let mut sink = BufSink { buf: out, written: 0 };
+            let mut source = VaArgs(args);
+            let n = fmt::format(&mut sink, bytes, &mut source);
+            if size > 0 {
+                *buf.add(n.min(size - 1)) = 0;
+            }
+            n as c_int
+        }
+    }
+
+    /// # Safety
+    /// As [`__fprintf_chk`], with the list already started by the caller.
+    #[no_mangle]
+    pub unsafe extern "C" fn __vfprintf_chk(
+        _stream: *mut File,
+        _flag: c_int,
+        format: *const c_char,
+        args: core::ffi::VaList,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let mut source = VaArgs(args);
+            super::with_out(|out| {
+                fmt::format(&mut ConsoleSink { out }, bytes, &mut source) as c_int
+            })
+        }
+    }
+
     /// # Safety
     /// C ABI: NUL-terminated string or null.
     #[no_mangle]

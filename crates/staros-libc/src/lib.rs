@@ -53,7 +53,10 @@ pub mod fmt;
 pub mod file;
 pub mod heap;
 pub(crate) mod lock;
+pub mod locale;
 pub mod math;
+pub mod mmap;
+pub mod scan;
 pub mod stdio;
 pub mod string;
 pub mod sys;
@@ -105,10 +108,25 @@ impl heap::Pages for KernelPages {
 static mut HEAP: heap::Heap<KernelPages> = heap::Heap::new(KernelPages);
 static HEAP_LOCK: lock::Spin = lock::Spin::new();
 
-/// `errno`, such as it is. Nothing sets a meaningful value yet: the syscalls this
-/// library makes return their own errors, and inventing `ENOENT`/`EIO` codes to
-/// throw away would be decoration.
+/// `errno`.
+///
+/// It is one word for the whole process rather than one per thread, which is a real
+/// difference from a POSIX libc: two threads failing at once can overwrite each
+/// other's code. Making it thread-local is a one-line change once something needs
+/// it — the thread-local ABI has existed since layer 5 — and until a caller reads
+/// `errno` across a thread boundary the change would be untested.
 static mut ERRNO: c_int = 0;
+
+/// Set `errno` and return the failure value the caller wants, in one expression.
+///
+/// Every failing entry point in this library goes through here, so "which calls set
+/// errno" has one answer that can be read off the call sites rather than guessed.
+#[cfg(not(test))]
+pub(crate) fn fail<T>(code: c_int, value: T) -> T {
+    // SAFETY: a single word; see the note on `ERRNO` about threads.
+    unsafe { ERRNO = code };
+    value
+}
 
 /// The C runtime entry point.
 ///
@@ -163,6 +181,22 @@ fn exit_process(status: c_int) -> ! {
     stdio::flush();
     file::shutdown();
     sys::exit(status)
+}
+
+/// Stop the program because a fortified call was about to write past the end of a
+/// buffer whose size the compiler knew.
+///
+/// This is what `_FORTIFY_SOURCE` buys: the caller passed the destination's size
+/// alongside the pointer, so the overflow is detectable *before* it happens rather
+/// than being found later as a corrupted neighbour. Continuing after detecting it
+/// would throw that away, so this does not return.
+#[cfg(not(test))]
+pub(crate) fn chk_fail(name: &str) -> ! {
+    stdio::write_bytes(b"[libc] ");
+    stdio::write_bytes(name.as_bytes());
+    stdio::write_bytes(b": buffer overflow detected\n");
+    stdio::flush();
+    sys::exit(134) // 128 + SIGABRT, as `abort` reports
 }
 
 /// The C entry points that belong to no single module.

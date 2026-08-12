@@ -265,6 +265,12 @@ if [ -n "$INITRAMFS" ]; then
     # argument reduction from a naive one: glibc says sin(1e15) is 0.858273, and
     # Cody-Waite with two 33-bit halves of pi/2 says 0.833149.
     req "[hello-c] math: sin(1e15)=0.858273"
+    # The calendar, which is UTC and says so. The date is fixed in the program, so
+    # the whole line is asserted rather than a prefix.
+    req "[hello-c] calendar: 2025-08-13 00:00:00 UTC (Wed)"
+    # Pages rather than bytes, including the count of what munmap could not give
+    # back — the kernel has no unmap syscall and this is where that shows.
+    req "[hello-c] mmap: 12305 bytes mapped and returned, 16384 retained by the kernel"
     # The C program reaches the same file through the same server as fsclient, but
     # through open/read/lseek rather than raw IPC.
     req "[hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: $GREETING"

@@ -106,6 +106,47 @@ double fabs(double x);
 void sincos(double x, double *sine, double *cosine);
 float sqrtf(float x);
 
+/* Parsing, the mirror of printf. */
+int sscanf(const char *input, const char *format, ...);
+double strtod(const char *s, char **end);
+double atof(const char *s);
+
+/* Text, the parts that were missing until the contract named them. */
+char *strncat(char *dst, const char *src, size_t n);
+char *strtok_r(char *s, const char *delim, char **save);
+void *memmem(const void *haystack, size_t hn, const void *needle, size_t nn);
+char *strerror(int code);
+
+/* One locale, named "C". */
+char *setlocale(int category, const char *locale);
+char *nl_langinfo(int item);
+#define LC_ALL 6
+#define CODESET 14
+
+/* Pages rather than bytes. */
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
+int munmap(void *addr, size_t length);
+int mprotect(void *addr, size_t length, int prot);
+size_t staros_mmap_retained(void);
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define PROT_EXEC 4
+#define MAP_PRIVATE 2
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED ((void *)-1)
+
+/* The calendar. */
+struct tm {
+    int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst;
+    long tm_gmtoff;
+    const char *tm_zone;
+};
+struct tm *gmtime_r(const long *when, struct tm *out);
+long mktime(struct tm *broken_down);
+size_t strftime(char *s, size_t n, const char *format, const struct tm *broken_down);
+void tzset(void);
+extern char *tzname[2];
+
 #define SEEK_SET 0
 #define SEEK_END 2
 
@@ -211,6 +252,147 @@ static void check_math(void)
 
     printf("[hello-c] math: sin(1e15)=%.6f, pow(1.0000001,1e7)=%.6f, hypot(3,4)=%.1f\n",
            sin(1e15), pow(1.0000001, 1e7), hypot(3.0, 4.0));
+}
+
+/* Layer 1, third part: reading text back. printf has been checked since the first
+ * C program ran here; nothing checked the inverse until the contract named
+ * __isoc23_sscanf, which is what a C23 compiler turns a call to sscanf into. */
+static void check_scan(void)
+{
+    int day = 0, month = 0, year = 0;
+    check(sscanf("2025-08-13", "%d-%d-%d", &year, &month, &day) == 3, "sscanf assigned three");
+    check(year == 2025 && month == 8 && day == 13, "sscanf parsed the date");
+
+    /* A width splits digits no separator splits, and %n reports the position. */
+    int a = 0, b = 0, consumed = 0;
+    check(sscanf("20260813", "%4d%2d%n", &a, &b, &consumed) == 2, "widths split a digit run");
+    check(a == 2026 && b == 8, "the widths took the right digits");
+    check(consumed == 6, "%n reported six bytes consumed");
+
+    /* Failure has two shapes and C distinguishes them: nothing to read is EOF,
+     * something unreadable is zero. A loop that treats them alike either spins or
+     * stops early. */
+    check(sscanf("", "%d", &a) == -1, "sscanf on empty input is EOF");
+    check(sscanf("abc", "%d", &a) == 0, "sscanf on unmatchable input is zero");
+
+    char word[16];
+    check(sscanf("  hello world", "%s", word) == 1, "%s");
+    check(strcmp(word, "hello") == 0, "%s stopped at the space");
+
+    double d = 0;
+    char *end = 0;
+    d = strtod("  -12.5e2rest", &end);
+    check(d == -1250.0, "strtod value");
+    check(end != 0 && strcmp(end, "rest") == 0, "strtod reported where it stopped");
+    /* The literal on the right is the compiler's own: this is the claim that the
+     * parser and the compiler agree bit for bit. */
+    check(strtod("0.1", 0) == 0.1, "strtod of 0.1 is the same double the compiler makes");
+    check(atof("3.5") == 3.5, "atof");
+}
+
+/* The text functions the contract asked for after the first pass. */
+static void check_text(void)
+{
+    char buf[32];
+    strcpy(buf, "qml");
+    strncat(buf, "-runtime-and-more", 8);
+    check(strcmp(buf, "qml-runtime") == 0, "strncat took exactly n bytes and terminated");
+
+    char line[] = "one,two,,three";
+    char *save = 0;
+    char *tok = strtok_r(line, ",", &save);
+    check(tok && strcmp(tok, "one") == 0, "strtok_r first token");
+    tok = strtok_r(0, ",", &save);
+    check(tok && strcmp(tok, "two") == 0, "strtok_r second token");
+    /* A run of delimiters is one separator, so the empty field disappears — which
+     * is what C says and what surprises everyone once. */
+    tok = strtok_r(0, ",", &save);
+    check(tok && strcmp(tok, "three") == 0, "strtok_r skipped the empty field");
+    check(strtok_r(0, ",", &save) == 0, "strtok_r ended");
+
+    const char *hay = "the needle is here";
+    check(memmem(hay, 18, "needle", 6) == hay + 4, "memmem found the needle");
+    check(memmem(hay, 18, "thread", 6) == 0, "memmem reports a miss as null");
+
+    check(strcmp(strerror(2), "No such file or directory") == 0, "strerror names a real code");
+
+    /* One locale, and the refusal is the point: a program told "C" when it asked
+     * for German formats numbers wrongly with no way to find out. */
+    check(strcmp(setlocale(LC_ALL, "C"), "C") == 0, "setlocale accepts C");
+    check(setlocale(LC_ALL, "de_DE.UTF-8") == 0, "setlocale refuses a locale we do not have");
+    check(strcmp(nl_langinfo(CODESET), "UTF-8") == 0, "nl_langinfo names the encoding");
+}
+
+/* Layer 2's other half: pages rather than bytes. */
+static void check_mmap(void)
+{
+    size_t len = 3 * 4096 + 17; /* deliberately not a whole number of pages */
+    char *p = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(p != MAP_FAILED, "mmap of anonymous memory");
+    /* Touch both ends: a mapping one page short would fault on the second write,
+     * and a rounding error in the page count is otherwise invisible. */
+    p[0] = 'a';
+    p[len - 1] = 'z';
+    check(p[0] == 'a' && p[len - 1] == 'z', "the whole mapping is writable");
+
+    /* The two refusals, which are the honest part of this layer. */
+    check(mmap(0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED,
+          "mmap refuses to hand out an executable page");
+    check(mprotect(p, 4096, PROT_READ | PROT_EXEC) == -1, "mprotect refuses PROT_EXEC");
+    check(mmap(0, 4096, PROT_READ, MAP_PRIVATE, 3, 0) == MAP_FAILED, "mmap refuses a file mapping");
+
+    size_t before = staros_mmap_retained();
+    check(munmap(p, len) == 0, "munmap");
+    /* And the price of a kernel with no unmap, counted rather than hidden. */
+    check(staros_mmap_retained() == before + 4 * 4096, "munmap accounted for the pages it kept");
+
+    printf("[hello-c] mmap: %lu bytes mapped and returned, %lu retained by the kernel\n",
+           (unsigned long)len, (unsigned long)staros_mmap_retained());
+}
+
+/* Layer 3's other half: the calendar. */
+static void check_calendar(void)
+{
+    tzset();
+    check(tzname[0] && strcmp(tzname[0], "UTC") == 0, "the only time zone says what it is");
+
+    /* A date with a known answer, and the two rules a hand-rolled calendar gets
+     * wrong: 2000 was a leap year and 2100 is not. */
+    struct tm t;
+    long when = 1755043200L; /* 2025-08-13 00:00:00 UTC, a Wednesday */
+    check(gmtime_r(&when, &t) != 0, "gmtime_r");
+    check(t.tm_year == 125 && t.tm_mon == 7 && t.tm_mday == 13, "gmtime_r split the date");
+    check(t.tm_wday == 3, "gmtime_r knew the weekday");
+    check(t.tm_yday == 224, "gmtime_r counted the day of the year");
+    check(mktime(&t) == when, "mktime is the inverse of gmtime_r");
+
+    long leap = 951782400L; /* 2000-02-29 */
+    check(gmtime_r(&leap, &t) != 0, "gmtime_r again");
+    check(t.tm_mon == 1 && t.tm_mday == 29, "2000 had a 29 February");
+    long century = 4107542400L; /* 2100-03-01 */
+    check(gmtime_r(&century, &t) != 0, "gmtime_r once more");
+    check(t.tm_mon == 2 && t.tm_mday == 1, "2100 did not");
+
+    /* mktime normalises, which is how C programs do date arithmetic. */
+    struct tm plus = {0};
+    plus.tm_year = 125;
+    plus.tm_mon = 0;
+    plus.tm_mday = 45;
+    mktime(&plus);
+    check(plus.tm_mon == 1 && plus.tm_mday == 14, "day 45 of January became 14 February");
+
+    char stamp[64];
+    gmtime_r(&when, &t);
+    size_t n = strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S %Z (%a)", &t);
+    check(n == strlen(stamp), "strftime returned the length it wrote");
+    check(strcmp(stamp, "2025-08-13 00:00:00 UTC (Wed)") == 0, "strftime formatted the date");
+    /* Too small a buffer must refuse rather than truncate: a truncated timestamp
+     * looks like a real one. */
+    char tiny[8];
+    check(strftime(tiny, sizeof tiny, "%Y-%m-%d", &t) == 0, "strftime refused a short buffer");
+    check(tiny[0] == 0, "and left nothing behind to be printed");
+
+    printf("[hello-c] calendar: %s\n", stamp);
 }
 
 /* Layer 2: the heap. */
@@ -552,6 +734,10 @@ int main(void)
 
     check_format();
     check_math();
+    check_scan();
+    check_text();
+    check_mmap();
+    check_calendar();
     check_heap();
     check_time();
     check_files();

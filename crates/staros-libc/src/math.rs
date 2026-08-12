@@ -399,14 +399,14 @@ fn split(a: f64) -> (f64, f64) {
 
 /// An exact sum as `(rounded, error)`: `a + b == s + e` with no rounding lost.
 /// Knuth's algorithm, which needs no ordering assumption between the two.
-fn two_sum(a: f64, b: f64) -> (f64, f64) {
+pub(crate) fn two_sum(a: f64, b: f64) -> (f64, f64) {
     let s = a + b;
     let bb = s - a;
     (s, (a - (s - bb)) + (b - bb))
 }
 
 /// An exact product as `(rounded, error)`.
-fn two_prod(a: f64, b: f64) -> (f64, f64) {
+pub(crate) fn two_prod(a: f64, b: f64) -> (f64, f64) {
     let p = a * b;
     let (ah, al) = split(a);
     let (bh, bl) = split(b);
