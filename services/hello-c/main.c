@@ -88,6 +88,24 @@ int eventfd_write(int fd, unsigned long value);
 int pipe(int fds[2]);
 ssize_t write(int fd, const void *buf, size_t count);
 
+/* The mathematics. Qt reaches these through every transform and every gradient;
+ * this program reaches them directly so that a failure names the function. */
+double sqrt(double x);
+double cbrt(double x);
+double exp(double x);
+double log(double x);
+double log2(double x);
+double pow(double x, double y);
+double sin(double x);
+double cos(double x);
+double atan2(double y, double x);
+double fmod(double x, double y);
+double hypot(double x, double y);
+double floor(double x);
+double fabs(double x);
+void sincos(double x, double *sine, double *cosine);
+float sqrtf(float x);
+
 #define SEEK_SET 0
 #define SEEK_END 2
 
@@ -124,6 +142,75 @@ static void check_format(void)
      * narrow it back. A printf that ignores the modifier prints 200. */
     snprintf(buf, sizeof buf, "%hhd", 200);
     check(strcmp(buf, "-56") == 0, "length modifiers narrow");
+}
+
+/* Layer 1, second half: the mathematics.
+ *
+ * The checks are the ones a wrong implementation fails and a right one cannot: the
+ * exact results (integer powers, remainders, powers of two), the identities that
+ * hold at every argument, and the three cases that are hard on purpose — an
+ * argument too large for naive reduction, an exponent that multiplies the
+ * logarithm's error, and a magnitude that overflows the obvious spelling of hypot. */
+static void near(double got, double want, double tol, const char *what)
+{
+    double err = fabs(got - want);
+    if (fabs(want) > 1e-12)
+        err = err / fabs(want);
+    check(err <= tol, what);
+}
+
+static void check_math(void)
+{
+    /* Exact, not close. A library that routes these through a logarithm returns
+     * 99.99999999999999 and every layout built on it drifts. */
+    check(pow(10.0, 2.0) == 100.0, "pow of an integer exponent is exact");
+    check(pow(2.0, 10.0) == 1024.0, "pow of a power of two is exact");
+    check(sqrt(64.0) == 8.0, "sqrt of a perfect square is exact");
+    check(log2(4096.0) == 12.0, "log2 of a power of two is exact");
+    check(fmod(7.0, 3.0) == 1.0, "fmod is exact");
+    check(floor(-2.5) == -3.0 && floor(2.5) == 2.0, "floor rounds toward minus infinity");
+
+    /* Identities: true for every argument, so they catch a coefficient that is
+     * wrong in the last digits as well as one that is wrong entirely. */
+    for (int i = -60; i <= 60; i++) {
+        double x = (double)i * 0.37;
+        double s, c;
+        sincos(x, &s, &c);
+        near(s * s + c * c, 1.0, 1e-14, "sin^2 + cos^2 == 1");
+        near(exp(log(fabs(x) + 1.0)), fabs(x) + 1.0, 1e-14, "exp(log(x)) == x");
+        near(cbrt(x * x * x), x, 1e-14, "cbrt(x^3) == x");
+        /* atan2 must undo sincos, up to the turn the angle wrapped through. The
+         * guard skips angles that land on the ±pi seam, where the two spellings
+         * legitimately disagree by a full turn. */
+        double turns = floor((x + 3.141592653589793) / 6.283185307179586);
+        double wrapped = x - 6.283185307179586 * turns;
+        if (fabs(fabs(wrapped) - 3.141592653589793) > 1e-6)
+            near(atan2(s, c), wrapped, 1e-13, "atan2(sin, cos) recovers the angle");
+    }
+
+    /* The hard three. */
+    /* The two constants are what the host's glibc returns for these arguments,
+     * checked rather than remembered. A naive Cody-Waite reduction gets the first
+     * one right to nine digits; a single-double logarithm gets the second one
+     * right to nine. Both tolerances below are tighter than that. */
+    near(sin(1e15), 0.85827279317023586, 1e-13, "sin reduces an argument of 1e15");
+    near(pow(1.0000001, 1e7), 2.71828169413208176, 1e-12, "pow keeps its digits when y is large");
+    /* The other half of the same problem: here the logarithm is large rather than
+     * the exponent, so the error being multiplied is the one in `k*ln2` rather than
+     * the one in the series. A pow that carries only one of the two comes back with
+     * eleven digits and passes the check above. */
+    /* The other half of the same problem: here the logarithm is large rather than
+     * the exponent, so what gets multiplied is the rounding in `k*ln2 + ln(m)`
+     * rather than the one in the series. Dropping that word alone still passes the
+     * check above and fails this one, by 1.4e-14. */
+    near(pow(3.0, 100.0), 5.15377520732011324e47, 1e-14, "pow keeps its digits when the base is far from one");
+    near(hypot(3e300, 4e300), 5e300, 1e-14, "hypot does not overflow");
+
+    /* The float entry points exist and are not the double ones under another name. */
+    check(sqrtf(2.25f) == 1.5f, "sqrtf");
+
+    printf("[hello-c] math: sin(1e15)=%.6f, pow(1.0000001,1e7)=%.6f, hypot(3,4)=%.1f\n",
+           sin(1e15), pow(1.0000001, 1e7), hypot(3.0, 4.0));
 }
 
 /* Layer 2: the heap. */
@@ -464,6 +551,7 @@ int main(void)
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
 
     check_format();
+    check_math();
     check_heap();
     check_time();
     check_files();

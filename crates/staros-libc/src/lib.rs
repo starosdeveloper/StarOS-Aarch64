@@ -53,6 +53,7 @@ pub mod fmt;
 pub mod file;
 pub mod heap;
 pub(crate) mod lock;
+pub mod math;
 pub mod stdio;
 pub mod string;
 pub mod sys;

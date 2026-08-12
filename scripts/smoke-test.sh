@@ -261,6 +261,10 @@ if [ -n "$INITRAMFS" ]; then
     req "[hello-c] C RUNTIME OK - every check passed"
     forbid "[hello-c] FAIL"
     forbid "C RUNTIME BROKEN"
+    # The mathematics, with the printed value being the one that separates a real
+    # argument reduction from a naive one: glibc says sin(1e15) is 0.858273, and
+    # Cody-Waite with two 33-bit halves of pi/2 says 0.833149.
+    req "[hello-c] math: sin(1e15)=0.858273"
     # The C program reaches the same file through the same server as fsclient, but
     # through open/read/lseek rather than raw IPC.
     req "[hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: $GREETING"
