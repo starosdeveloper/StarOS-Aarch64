@@ -1300,16 +1300,10 @@ pub mod exports {
     #[no_mangle]
     pub extern "C" fn pthread_testcancel() {}
 
-    /// # Safety
-    /// C ABI: signal masks are ignored — there are no signals.
-    #[no_mangle]
-    pub unsafe extern "C" fn pthread_sigmask(
-        _how: c_int,
-        _set: *const c_void,
-        _old: *mut c_void,
-    ) -> c_int {
-        0
-    }
+    // `pthread_sigmask` used to live here and ignored everything it was given. It
+    // is in `crate::proc` now, over the same one process-wide mask `sigprocmask`
+    // reads and writes — there is one mask because there is one signal state, and a
+    // program that sets a mask and reads it back is entitled to what it set.
 
     /// # Safety
     /// C ABI: `set` receives the affinity mask.

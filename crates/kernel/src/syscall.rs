@@ -435,6 +435,11 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             None => KError::BadHandle.as_raw(),
         },
 
+        // The caller's own process id — its task id, or its creator's if it is a
+        // thread. Needs no capability: the number names no object and grants
+        // nothing, and it is the caller's own.
+        Some(Syscall::TaskId) => sched::current_pid() as isize,
+
         // Allocate a physically-contiguous, non-cacheable DMA buffer of `x0`
         // pages and hand the caller a DMA capability for it.
         Some(Syscall::CreateDma) => create_dma(req.args[0] as usize),

@@ -219,6 +219,19 @@ pub enum Syscall {
     /// The page count is not a secret from anyone holding the capability: it is the
     /// size of memory that holder may already read and write in full.
     SharedPages = 28,
+    /// The caller's own process id. No arguments; always succeeds.
+    ///
+    /// A program had no way to name itself. That is fine until a C library has to
+    /// answer `getpid`, and it is answered here rather than invented there: a libc
+    /// that returned a constant would give two processes the same id, and one that
+    /// returned a thread's scheduling id would give two threads of one program
+    /// different ones. Both are wrong in ways that only show up in a file name
+    /// collision much later.
+    ///
+    /// Nothing is disclosed by it. The number is the caller's own, it names no
+    /// object, and holding it grants nothing — every authority in this system is a
+    /// capability, and an id is not one.
+    TaskId = 29,
 }
 
 impl Syscall {
@@ -255,6 +268,7 @@ impl Syscall {
             26 => Some(Syscall::SpawnImage),
             27 => Some(Syscall::DmaPhys),
             28 => Some(Syscall::SharedPages),
+            29 => Some(Syscall::TaskId),
             _ => None,
         }
     }
@@ -266,11 +280,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=28 {
+        for n in 0..=29 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(29), None);
+        assert_eq!(Syscall::from_raw(30), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

@@ -19,9 +19,11 @@ address space, processes loaded from a file rather than from the kernel image, a
 display server in user space that owns the screen, a virtio-input driver that
 decodes real key events without the kernel seeing one, a file server that hands
 files to processes holding no archive, and a **C program** — compiled by clang
-against this tree's own libc — that prints, allocates, sleeps, reads files, runs
-`pthread`s with real thread-local storage and blocks in `poll` until another thread
-writes to an eventfd, without a syscall in sight. And a **C++ program** on top of
+against this tree's own libc — that prints, computes `sin(10¹⁵)` correctly,
+allocates, sleeps, reads files through `FILE*`, lists a directory that exists only
+as a prefix in a flat archive, runs `pthread`s with real thread-local storage and
+blocks in `poll` until another thread writes to an eventfd, without a syscall in
+sight. And a **C++ program** on top of
 that, with `std::vector`, `std::string`, `std::thread` and a static object whose
 destructor runs at exit.
 
@@ -41,7 +43,7 @@ destructor runs at exit.
 | `crates/videocore` | Raspberry Pi VideoCore property-mailbox **messages** (no MMIO) |
 | `crates/virtio` | Split-virtqueue layout, MMIO register map, input event format (no MMIO) |
 | `crates/iommu` | SMMUv3 descriptor/queue bit layouts (no MMIO) |
-| `crates/staros-libc` | The C library EL0 programs link against: `str*`/`mem*`/`printf`, `malloc` over `MapAnon`, time over `ClockNow`, files over the file server, `pthread`s with real thread-local storage over `SpawnThread`, and `poll`/`eventfd`/`pipe` over `WaitAny` |
+| `crates/staros-libc` | The C library EL0 programs link against, all 282 symbols a real Qt 6 build needs: `str*`/`mem*`/`printf`/`scanf` and the whole of libm written from scratch, `malloc` over `MapAnon`, time and the calendar over `ClockNow`, files and `FILE*` and directories over the file server, `pthread`s with real thread-local storage over `SpawnThread`, `poll`/`eventfd`/`pipe` over `WaitAny`, and the process layer — `getpid`, `uname`, `setjmp`/`longjmp`, `backtrace` |
 
 The split is deliberate and repeated: every subsystem whose bugs hide in *layout*
 gets a pure crate with exact-value tests, and only the doorbell-ringing half is
@@ -63,9 +65,9 @@ board `unsafe`.
 | `services/devicemgr` | Device manager: parses the DTB **in user space**, mints device/IRQ capabilities from an authority cap, delegates them to drivers over IPC |
 | `services/displaysrv` | Display server: owns the framebuffer, composites client surfaces delivered as shared-memory capabilities |
 | `services/inputsrv` | virtio-input driver: virtqueue, interrupt and event decoding, all in EL0 |
-| `services/fssrv` | File server: owns the initramfs, answers `Open`/`Read`/`Stat`/`Close` over IPC through a client-supplied shared buffer |
+| `services/fssrv` | File server: owns the initramfs, answers `Open`/`Read`/`Stat`/`List`/`Close` over IPC through a client-supplied shared buffer |
 | `services/fsclient` | A process with no archive and no device, reading a file anyway — the only way "these bytes arrived over IPC" means anything |
-| `services/hello-c` | A program written in **C**, compiled by clang and linked against `crates/staros-libc` — the toolchain Qt will arrive through, exercised by something small enough to debug: formatting, the heap, the clock, files, four threads with their own TLS, and `poll` |
+| `services/hello-c` | A program written in **C**, compiled by clang and linked against `crates/staros-libc` — the toolchain Qt will arrive through, exercised by something small enough to debug: formatting, mathematics, number parsing, the heap, `mmap`, the calendar, the clock, files through `FILE*`, a directory listing over a flat archive, the process layer, four threads with their own TLS, and `poll` |
 | `services/hello-cpp` | A program written in **C++** with the real standard library: `std::vector<std::string>`, `std::sort`, three `std::thread`s under a `std::mutex`, a namespace-scope constructor and a function-local static whose destructor runs at exit |
 
 All eight EL0 programs are built by `crates/kernel/build.rs` and embedded in the
@@ -101,7 +103,7 @@ intrinsics); prefer them over a bare `cargo build`.
 cargo kbuild                 # build the kernel ELF for aarch64
 cargo krun                   # build + boot it in QEMU (with a framebuffer)
 cargo kclippy                # clippy across the workspace
-cargo ktest-host             # portable-crate unit tests on the host (147 tests)
+cargo ktest-host             # portable-crate unit tests on the host (183 tests)
 ./scripts/smoke-test.sh      # boot the whole matrix and assert on the output
 ./scripts/fb-check.sh        # assert on the *pixels* the display server composited
 ./scripts/input-check.sh     # press a key on the emulated keyboard and check the driver decoded it
@@ -137,18 +139,18 @@ device tree at 0x48200000 (1048576 bytes): linux,dummy-virt
 exception vectors installed (VBAR_EL1)
 privileged access never (PAN): not implemented on this CPU
 MMU enabled: true (kernel in TTBR1 at 0xffff000000000000; RAM 0x40000000..0x50000000 Normal in the linear map; 44-bit PA per ID_AA64MMFR0_EL1)
-memory: 256 MiB RAM, 126 MiB usable, heap 1280 KiB @ 0x401b5000, 125 MiB of frames @ 0x402f5000
+memory: 256 MiB RAM, 126 MiB usable, heap 1280 KiB @ 0x401d8000, 124 MiB of frames @ 0x40318000
 kernel heap: Vec of 8 squares (last 64) sums to 204 — global allocator live
 dynamic tables: 64 objects (old max 8), 64 caps in one task (old max 4), 64 notifications (old max 4) — all grew past the old fixed limits
 framebuffer: ramfb 640x480 online (mirroring the console to the screen)
 syscall Yield -> 0; syscall 0xdead -> -6
 clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
 interrupt controller: GICv2 online
-clock: one tick interval (6250000 counter ticks) measured 101643 us against an expected 100000 us (agrees with the tick interval)
+clock: one tick interval (6250000 counter ticks) measured 101797 us against an expected 100000 us (agrees with the tick interval)
 smp: 1 core(s) online (PSCI v1.1)
 smp: 1 cores x 20000 locked increments = 20000 (expected 20000) — no increments lost
 smp: single core — no inter-processor interrupt to send
-loaded init ELF: 13240 bytes, entry 0x80000000
+loaded init ELF: 13648 bytes, entry 0x80000000
 scheduler: capability delegation (client + server) + user-space IRQ driver
 framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [fault] task 3 killed: EL0 fault at 0x40000000 (ec 0x24) — isolated, kernel continues
@@ -157,72 +159,78 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [devicemgr] delegated UART device+irq to the driver and a device to the server
 [devicemgr] found a virtio-input device at a003e00 intid 79 and delegated it to the input driver
 [devicemgr] no IOMMU on this machine; DMA capability stands but is unenforced
-[devicemgr] unpacked the initramfs in user space: 3 files, no storage driver
+[devicemgr] unpacked the initramfs in user space: 5 files, no storage driver
 [devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
 [displaysrv] the screen is mine: kernel output stopped, pixels are a process's now
-[fssrv] the files are mine: 3 of them, served over IPC to processes that hold no archive
+[fssrv] the files are mine: 5 of them, served over IPC to processes that hold no archive
 [fsclient] two endpoint capabilities and one page of my own memory - no archive, no device
-[fssrv] the files are mine: 3 of them, served over IPC to processes that hold no archive
+[fssrv] the files are mine: 5 of them, served over IPC to processes that hold no archive
 [hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight
+[hello-c] math: sin(1e15)=0.858273, pow(1.0000001,1e7)=2.718282, hypot(3,4)=5.0
+[hello-c] mmap: 12305 bytes mapped and returned, 16384 retained by the kernel
+[hello-c] calendar: 2025-08-13 00:00:00 UTC (Wed)
 [hello-c] heap: 103 allocations, 368 bytes live at the end
+[hello-cpp] a namespace-scope constructor ran before main
+[hello-cpp] a C++ program in EL0: vector, string, thread, and a static with a destructor
 [stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand
-[fault] task 18 killed: EL0 fault at 0x7fffaffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
+[fault] task 19 killed: EL0 fault at 0x7fffaffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
 [fault]   backtrace (2 frames, x29 chain): 0x8000080c 0x80000804
 [child] hello - I was created at runtime, not by the kernel
 [loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
 [client] monotonic clock: two ClockNow reads from EL0, the second strictly later - no capability needed
 [driver] user-space UART-RX driver waiting for input
-[driver] newline received; user-space IRQ driver exiting
 [inputsrv] virtio-input driver up in EL0: queue armed, waiting for the device
 [devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
 [devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
 [displaysrv] composited a client surface onto a screen the client cannot touch
 [fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen
 [fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
-[hello-c] clock: 201651840 ns across a 20 ms nanosleep
-[hello-cpp] a namespace-scope constructor ran before main
-[hello-cpp] a C++ program in EL0: vector, string, thread, and a static with a destructor
-[hello-cpp] a static local was constructed on first use
-[hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads
-[hello-cpp] the static local's destructor ran at exit, holding 2 entries
+[hello-c] clock: 407402608 ns across a 20 ms nanosleep
+[child] hello - I was created at runtime, not by the kernel
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 #server drove the UART, then revoked it for everyone
 [child] hello - I was created at runtime, not by the kernel
 [client] read from shared memory: shared-memory works: written by the server, read by the client
 [client] read the marker from the SECOND page of a 2-page shared buffer
+[hello-cpp] a static local was constructed on first use
+[hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads
+[hello-cpp] the static local's destructor ran at exit, holding 2 entries
+[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
 [fsclient] read 'greeting.txt' through fssrv in 2 chunks: hello from the initramfs
 [fsclient] 25 of 25 bytes in 2 reads, the second one from offset 6
 [client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block
-[child] hello - I was created at runtime, not by the kernel
 [client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
 [cap] task 0 denied MapMemory(handle 0): no such capability
 [client] kernel refused a syscall pointer into an unmapped page - it walks our tables, not a range
-[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
-[fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length
-[fsclient] asked for all 13240 bytes of 'init.elf' into a 4096-byte buffer and got 4096, with 9144 left
 [hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: hello from the initramfs
+[fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length
+[fsclient] asked for all 13648 bytes of 'init.elf' into a 4096-byte buffer and got 4096, with 9552 left
 [fsclient] the archive is at 0x900000000 in fssrv; touching it here must fault
 [fault] task 12 killed: EL0 fault at 0x900000000 (ec 0x24) — isolated, kernel continues
 [fault]   backtrace (3 frames, x29 chain): 0x80000014 0x800016c8 0x80000004
 [fssrv] served 12 requests, 4121 bytes of file data, and refused 4 - the archive never left this address space
-[ipc-storm] receiver drained every message from 3 concurrent senders, sequence sum exact - no message lost or duplicated
+[hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell
 [memtest] MapAnon(0) refused - a zero-page request is an error, not a page
 [memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back
+[ipc-storm] receiver drained every message from 3 concurrent senders, sequence sum exact - no message lost or duplicated
+[hello-c] listed 'docs': 1 file, 1 directory, over a flat archive
+[hello-c] sendfile: from the initramfs
+[hello-c] process 14: uname StarOS 0.2.0, stack limit 256 KiB, backtrace 3 frames
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
-[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 22007440 ns
+[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 21432080 ns
 [hello-c] C RUNTIME OK - every check passed
-[fssrv] served 7 requests, 44 bytes of file data, and refused 1 - the archive never left this address space
-clock: the demo took 11438 ms on the monotonic clock, during which core 0 took 95 tick(s)
-sleep: 4 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 6 clock wake-up(s), worst overshoot 13077 us
-scheduler: all tasks finished after 95 timer ticks; task table grew to 34 (old fixed max 8)
-task teardown: reaped 33 dead-task kernel stacks (1056 KiB returned to the heap)
-user stacks: 40 page(s) mapped on demand (160 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=95
+[fssrv] served 72 requests, 157 bytes of file data, and refused 10 - the archive never left this address space
+clock: the demo took 5250 ms on the monotonic clock, during which core 0 took 50 tick(s)
+sleep: 4 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 6 clock wake-up(s), worst overshoot 11792 us
+scheduler: all tasks finished after 50 timer ticks; task table grew to 34 (old fixed max 8)
+task teardown: reaped 32 dead-task kernel stacks (1024 KiB returned to the heap)
+user stacks: 41 page(s) mapped on demand (164 KiB), 1 mapped up front per task, limit 256 KiB
+preemption: timer ticks per core — cpu0=50
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x40306000 (exited client's root was 0x40306000)
+frame reclaim: post-teardown alloc 0x40328000 (exited client's root was 0x40319000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
-  (1 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
+  (2 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
 shutting down (PSCI SYSTEM_OFF)
 ```
 
@@ -230,7 +238,7 @@ shutting down (PSCI SYSTEM_OFF)
 
 Two layers, deliberately different in kind:
 
-- **`cargo ktest-host`** — 147 tests over the portable crates (`abi`, `hal`,
+- **`cargo ktest-host`** — 183 tests over the portable crates (`abi`, `hal`,
   `cpio`, `fdt`, `framebuffer`, `videocore`, `virtio`, `iommu`, `mm`, `ipc`,
   `staros-libc`, `init`), including `fdt` against real `.dtb` blobs, `cpio` against a
   real archive, `hal`'s tick↔nanosecond arithmetic against the frequencies real
@@ -239,7 +247,7 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **209 assertions, exit=0** on `--quick` (236 on the
+  failure signals. Currently **217 assertions, exit=0** on `--quick` (244 on the
   full matrix).
 - **`./scripts/input-check.sh`** — the only check that makes the *outside world*
   act: QEMU synthesises a real key event, and the assertion is that a driver in EL0
@@ -275,9 +283,15 @@ stages a card, and [`docs/PI5-BRINGUP.md`](docs/PI5-BRINGUP.md) is the checklist
 
 The graphical stack is planned separately, in
 [`docs/ROADMAP-QML.md`](docs/ROADMAP-QML.md): what a QML UI actually demands of a
-microkernel, which of those pieces already exist here, and the ABI gaps (monotonic
-time, multiplexed waiting, threads inside one address space) that block a Qt event
-loop long before any Qt code enters the tree.
+microkernel, which of those pieces already exist here, and the ABI gaps that block
+a Qt event loop long before any Qt code enters the tree. Its phase G5 — the C and
+C++ runtime — is closed: the contract is **282 of 282 symbols**, measured by
+`./scripts/libc-progress.sh` against the list a real Qt 6 build leaves undefined.
+That number counts symbols the archive defines, not operations this system has:
+`fork` answers `ENOSYS` and writing to a file answers `EROFS`, each decision
+written down with its reason in
+[`docs/LIBC-CONTRACT.md`](docs/LIBC-CONTRACT.md). The next phase is the QPA
+plugin, where Qt's own linker gets to check the list.
 
 Design rationale, the SMP/IPC/IOMMU write-ups, and an honest "not yet
 implemented" list live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

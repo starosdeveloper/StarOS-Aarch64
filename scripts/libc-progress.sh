@@ -76,6 +76,8 @@ echo
 printf '  total     %3d/%-3d  (%d%%)\n' "$total_have" "$total_want" \
     "$((total_have * 100 / total_want))"
 echo
-echo "  Layers 5–7 are unimplemented on purpose (threads, poll, the C++ runtime);"
-echo "  docs/LIBC-CONTRACT.md says which of their symbols will be refused outright"
-echo "  rather than written. Run with --missing <layer> to list a layer's gaps."
+echo "  A symbol counts here when the archive defines it, which is not the same as"
+echo "  the call doing what its name suggests on another system: fork, dlopen and"
+echo "  the System V IPC calls are present and refuse, each with the errno that says"
+echo "  why. docs/LIBC-CONTRACT.md lists every one of those and its reason."
+echo "  Run with --missing <layer> to list a layer's gaps."

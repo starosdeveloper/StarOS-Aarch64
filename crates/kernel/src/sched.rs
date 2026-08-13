@@ -102,6 +102,15 @@ struct Task {
     stack: Box<[u64]>,
     state: State,
     id: u64,
+    /// The id of the *process* this task belongs to: its own for a task that owns
+    /// its address space, its creator's for a thread.
+    ///
+    /// A thread is a task here, with its own slot and its own id, which is what
+    /// makes preemption uniform. But POSIX's `getpid` must give every thread of a
+    /// program the same answer — a program that writes `/tmp/cache-<pid>` from two
+    /// threads is entitled to have them agree — so the process identity is carried
+    /// separately from the scheduling identity rather than derived from it.
+    pid: u64,
     /// `TTBR0_EL1` value to install when switching into this task.
     ttbr0: u64,
     /// The user address space this task runs in, if any. `None` for kernel
@@ -422,11 +431,11 @@ fn post_switch() {
 ///   capability minted *after* the thread starts is not visible to it.
 pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
     let cpu = me();
-    let (cur, _old_space, caps) = {
+    let (cur, _old_space, caps, pid) = {
         let sched = SCHED.lock();
         let cur = sched.current[cpu];
         match sched.tasks[cur].space {
-            Some(s) => (cur, s, sched.tasks[cur].caps.clone()),
+            Some(s) => (cur, s, sched.tasks[cur].caps.clone(), sched.tasks[cur].pid),
             None => return KError::InvalidArgument.as_raw(),
         }
     };
@@ -467,6 +476,9 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
         stack: kstack,
         state: State::Ready,
         id: 0,
+        // The creator's process id, not a new one: that is what makes this a thread
+        // of that program rather than another program.
+        pid,
         ttbr0: space.ttbr0(),
         // The same space value, not a new one: `AddressSpace` is a handle, and two
         // tasks holding it is exactly what a thread is. Teardown is what has to
@@ -541,6 +553,8 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         stack,
         state: State::Ready,
         id: 0,
+        pid: 0, // filled in with the task's own id below: this task owns its space
+
         ttbr0: space.ttbr0(),
         space: Some(space),
         caps,
@@ -564,6 +578,7 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
     let mut task = task;
     let id = sched.tasks.len() as u64;
     task.id = id;
+    task.pid = id;
     sched.tasks.push(task);
     drop(sched);
     // A task is runnable now — ring the doorbell so an idle core picks it up at
@@ -854,6 +869,15 @@ pub fn current_user_entry() -> u64 {
 pub fn current_id() -> usize {
     let sched = SCHED.lock();
     sched.current[me()]
+}
+
+/// The process id of the currently running task: its own id, or its creator's if
+/// it is a thread. What `getpid` in EL0 answers with.
+#[must_use]
+pub fn current_pid() -> u64 {
+    let sched = SCHED.lock();
+    let cur = sched.current[me()];
+    sched.tasks[cur].pid
 }
 
 /// How many task slots the table holds.

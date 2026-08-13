@@ -210,6 +210,12 @@ pub(crate) fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> 
     unsafe { syscall4(Syscall::SpawnThread, entry, stack_pages, tls, arg) }
 }
 
+/// This process's id, the same number in every one of its threads.
+pub(crate) fn task_id() -> i64 {
+    // SAFETY: `TaskId` takes no arguments and always returns.
+    unsafe { syscall0(Syscall::TaskId) as i64 }
+}
+
 /// Give up the rest of this timeslice.
 pub(crate) fn yield_now() {
     // SAFETY: `Yield` reschedules and returns.

@@ -260,6 +260,83 @@ extern int *__errno_location(void);
 #define errno (*__errno_location())
 #define EROFS 30
 
+/* Layer 7: the process, and the system it runs on. */
+extern char **environ;
+char *getenv(const char *name);
+int setenv(const char *name, const char *value, int overwrite);
+int unsetenv(const char *name);
+int getpid(void);
+int getppid(void);
+int getuid(void);
+int geteuid(void);
+int setuid(int uid);
+unsigned long getauxval(unsigned long kind);
+int getentropy(void *buf, size_t len);
+long sysconf(int name);
+#define _SC_PAGESIZE 30
+#define AT_PAGESZ 6
+#define AT_RANDOM 25
+#define AT_HWCAP 16
+
+struct utsname {
+    char sysname[65], nodename[65], release[65], version[65], machine[65], domainname[65];
+};
+int uname(struct utsname *out);
+
+struct rlimit {
+    unsigned long rlim_cur, rlim_max;
+};
+int getrlimit(int resource, struct rlimit *out);
+int setrlimit(int resource, const struct rlimit *limit);
+#define RLIMIT_STACK 3
+#define RLIMIT_NOFILE 7
+
+int prctl(int option, ...);
+#define PR_SET_NAME 15
+#define PR_GET_NAME 16
+
+/* Signals: the sets are real bit arithmetic, the dispositions are recorded and
+ * never delivered, and `kill` to this process is the one path that reaches them. */
+typedef struct { unsigned long bits[16]; } sigset_t;
+int sigemptyset(sigset_t *set);
+int sigfillset(sigset_t *set);
+int sigaddset(sigset_t *set, int signal);
+int sigdelset(sigset_t *set, int signal);
+int sigismember(const sigset_t *set, int signal);
+struct sigaction {
+    void *sa_handler;
+    sigset_t sa_mask;
+    int sa_flags;
+    void *sa_restorer;
+};
+int sigaction(int signal, const struct sigaction *act, struct sigaction *old);
+int sigprocmask(int how, const sigset_t *set, sigset_t *old);
+int kill(int pid, int signal);
+#define SIGINT 2
+#define SIGPIPE 13
+#define SIG_BLOCK 0
+#define SIG_SETMASK 2
+
+/* The Unix that is not here. */
+int fork(void);
+int execv(const char *path, const char *const argv[]);
+int waitpid(int pid, int *status, int options);
+void *dlopen(const char *path, int flags);
+const char *dlerror(void);
+int shmget(int key, size_t size, int flags);
+long syscall(long number, ...);
+#define ENOSYS 38
+#define ECHILD 10
+#define EACCES 13
+
+/* setjmp/longjmp: glibc's jmp_buf is 312 bytes; this program only needs storage of
+ * the right size and alignment, since nothing here reads its fields. */
+typedef struct { unsigned long __opaque[39]; } jmp_buf_t;
+int _setjmp(jmp_buf_t *buf);
+void longjmp(jmp_buf_t *buf, int value) __attribute__((noreturn));
+
+int backtrace(void **buf, int size);
+
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
@@ -771,6 +848,203 @@ static void check_transfer(void)
           "copy_file_range refuses with EXDEV");
 }
 
+/* A jump target that must be reached exactly twice: once by falling through and
+ * once by longjmp. `volatile` because a variable modified between setjmp and its
+ * second return is otherwise allowed to be in a register the jump discards. */
+static volatile int jumps;
+
+static void jump_back(jmp_buf_t *target)
+{
+    jumps++;
+    longjmp(target, 7);
+}
+
+/* Layer 7: the process, and the system it runs on.
+ *
+ * Three kinds of claim here, and they are checked differently. What is real is
+ * checked by round-tripping it. What is true of this system is checked against the
+ * value that makes it true. What is refused is checked for the *errno*, because a
+ * refusal that sets the wrong one sends a caller down the wrong fallback. */
+static void check_process(void)
+{
+    /* The environment, which starts empty and is this process's own. */
+    check(environ != 0, "environ is an array, not a null pointer");
+    check(getenv("NOTHING_SET_THIS") == 0, "an unset variable reads back as NULL");
+    check(setenv("QT_QPA_PLATFORM", "staros", 1) == 0, "setenv");
+    char *value = getenv("QT_QPA_PLATFORM");
+    check(value != 0 && strcmp(value, "staros") == 0, "getenv returns what setenv stored");
+    check(setenv("QT_QPA_PLATFORM", "other", 0) == 0, "setenv without overwrite succeeds");
+    value = getenv("QT_QPA_PLATFORM");
+    check(value != 0 && strcmp(value, "staros") == 0, "…and left the old value alone");
+    check(setenv("QT_QPA_PLATFORM", "other", 1) == 0, "setenv with overwrite");
+    value = getenv("QT_QPA_PLATFORM");
+    check(value != 0 && strcmp(value, "other") == 0, "…and replaced it");
+    /* A value containing '=' belongs to the value, not the name. */
+    check(setenv("PAIR", "a=b", 1) == 0, "setenv with an = in the value");
+    value = getenv("PAIR");
+    check(value != 0 && strcmp(value, "a=b") == 0, "the value keeps its own =");
+    check(setenv("A=B", "c", 1) == -1, "a name containing = is refused");
+    check(unsetenv("QT_QPA_PLATFORM") == 0, "unsetenv");
+    check(getenv("QT_QPA_PLATFORM") == 0, "…and the variable is gone");
+    check(getenv("PAIR") != 0, "…while its neighbour survived the removal");
+    /* environ must still be a walkable NULL-terminated array after all of that. */
+    int walked = 0;
+    for (char **e = environ; *e; e++) {
+        walked++;
+    }
+    check(walked == 1, "environ walks to exactly the variables that are set");
+
+    /* Identity. The interesting claim is that every thread agrees, which is checked
+     * in check_threads; here it is that the number exists and the parent differs. */
+    int pid = getpid();
+    check(pid > 0, "getpid returns a real id");
+    check(getppid() != pid, "the parent is not this process");
+    check(getuid() == 0 && geteuid() == 0, "one user, and it is root");
+    check(setuid(0) == 0, "becoming the user we already are succeeds");
+    check(setuid(1000) == -1, "becoming another user is refused");
+
+    /* The system. */
+    struct utsname u;
+    check(uname(&u) == 0, "uname");
+    check(strcmp(u.sysname, "StarOS") == 0, "uname names this system");
+    check(strcmp(u.machine, "aarch64") == 0, "uname names this architecture");
+    check(sysconf(_SC_PAGESIZE) == 4096, "sysconf reports the page size");
+    check(getauxval(AT_PAGESZ) == 4096, "getauxval reports the page size");
+    check(getauxval(AT_HWCAP) == 0, "getauxval claims no optional CPU features");
+    unsigned long random_at = getauxval(AT_RANDOM);
+    check(random_at != 0, "getauxval provides AT_RANDOM bytes");
+    check(getauxval(AT_RANDOM) == random_at, "…at a stable address");
+
+    /* Limits the kernel actually enforces: the stack really does stop at 256 KiB,
+     * which is the number the fault line in this very log reports. */
+    struct rlimit rl;
+    check(getrlimit(RLIMIT_STACK, &rl) == 0, "getrlimit");
+    check(rl.rlim_cur == 256 * 1024, "the stack limit is the one the kernel enforces");
+    check(getrlimit(RLIMIT_NOFILE, &rl) == 0, "getrlimit for descriptors");
+    check(rl.rlim_cur >= 16, "the descriptor limit is the table's real size");
+    struct rlimit bigger = { 8 * 1024 * 1024, 8 * 1024 * 1024 };
+    check(setrlimit(RLIMIT_STACK, &bigger) == -1, "raising a limit is refused");
+
+    /* Entropy: not cryptographic here, and the property that matters to a caller is
+     * that two draws differ and the whole buffer is written. */
+    unsigned char bytes[32], again[32];
+    memset(bytes, 0, sizeof bytes);
+    memset(again, 0, sizeof again);
+    check(getentropy(bytes, sizeof bytes) == 0, "getentropy");
+    check(getentropy(again, sizeof again) == 0, "getentropy again");
+    check(memcmp(bytes, again, sizeof bytes) != 0, "two draws differ");
+    int nonzero = 0;
+    for (size_t i = 0; i < sizeof bytes; i++) {
+        if (bytes[i]) {
+            nonzero++;
+        }
+    }
+    check(nonzero > 16, "the whole buffer was written, not just the first word");
+    check(getentropy(bytes, 512) == -1, "a request past 256 bytes is refused");
+
+    /* The process name. */
+    char name[16];
+    check(prctl(PR_SET_NAME, "hello-c") == 0, "prctl set the process name");
+    memset(name, 0, sizeof name);
+    check(prctl(PR_GET_NAME, name) == 0, "prctl read it back");
+    check(strcmp(name, "hello-c") == 0, "…and it is what was set");
+
+    /* Signal sets: real bit arithmetic. The off-by-one this catches is numbering
+     * from zero, which would make sigaddset(SIGINT) set the wrong bit. */
+    sigset_t set;
+    check(sigemptyset(&set) == 0, "sigemptyset");
+    check(sigismember(&set, SIGINT) == 0, "an empty set holds nothing");
+    check(sigaddset(&set, SIGINT) == 0, "sigaddset");
+    check(sigismember(&set, SIGINT) == 1, "…and the signal is in the set");
+    check(sigismember(&set, SIGPIPE) == 0, "…and only that signal");
+    check(sigdelset(&set, SIGINT) == 0, "sigdelset");
+    check(sigismember(&set, SIGINT) == 0, "…and it is gone again");
+    check(sigfillset(&set) == 0, "sigfillset");
+    check(sigismember(&set, SIGINT) == 1 && sigismember(&set, SIGPIPE) == 1,
+          "a full set holds every signal");
+    check(sigaddset(&set, 0) == -1, "signal 0 is not a set member");
+    /* The numbering itself, and not merely its self-consistency. Signals count from
+     * one, so SIGINT is bit 1 of the first word — an implementation that numbered
+     * from zero would round-trip through its own sigaddset/sigismember perfectly and
+     * still disagree with every other system about what a mask means. */
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    check(set.bits[0] == (1UL << (SIGINT - 1)), "SIGINT is the bit Linux says it is");
+    /* The highest signal there is fills the top of that same word: there are 64
+     * signals, so the first word holds all of them and the other fifteen words of a
+     * glibc sigset_t are room this system will never use. */
+    sigaddset(&set, 64);
+    check(set.bits[0] == ((1UL << (SIGINT - 1)) | (1UL << 63)) && set.bits[1] == 0,
+          "signal 64 is the last bit of the first word");
+    check(sigaddset(&set, 65) == -1, "there is no signal 65");
+
+    /* The mask round-trips even though nothing is ever delivered. */
+    sigset_t blocked, previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGPIPE);
+    check(sigprocmask(SIG_SETMASK, &blocked, 0) == 0, "sigprocmask set the mask");
+    check(sigprocmask(SIG_BLOCK, 0, &previous) == 0, "sigprocmask read it back");
+    check(sigismember(&previous, SIGPIPE) == 1, "…and it is the mask that was set");
+
+    /* sigaction succeeds and reports the disposition it replaced. Nothing is ever
+     * delivered to it — this kernel raises no signals — and that is why installing
+     * one must not fail: Qt treats the failure as fatal during start-up. */
+    struct sigaction act, old;
+    memset(&act, 0, sizeof act);
+    act.sa_handler = (void *)1; /* SIG_IGN */
+    check(sigaction(SIGPIPE, &act, 0) == 0, "sigaction installed a disposition");
+    memset(&old, 0, sizeof old);
+    check(sigaction(SIGPIPE, 0, &old) == 0, "sigaction read the disposition back");
+    check(old.sa_handler == (void *)1, "…and it is the one installed");
+    check(kill(pid, 0) == 0, "kill(pid, 0) finds this process");
+    check(kill(pid + 1000, 0) == -1, "…and no other");
+
+    /* The refusals, each checked for its errno rather than for -1. */
+    check(fork() == -1 && errno == ENOSYS, "fork refuses with ENOSYS");
+    const char *const argv[] = { "x", 0 };
+    check(execv("/bin/sh", argv) == -1 && errno == EACCES, "execv refuses with EACCES");
+    check(waitpid(-1, 0, 0) == -1 && errno == ECHILD, "waitpid refuses with ECHILD");
+    check(syscall(64, 1, "x", 1) == -1 && errno == ENOSYS, "raw syscall refuses with ENOSYS");
+    check(shmget(1, 4096, 0) == -1 && errno == ENOSYS, "System V shm refuses with ENOSYS");
+    check(dlopen("libfoo.so", 2) == 0, "dlopen fails");
+    const char *why = dlerror();
+    check(why != 0 && strlen(why) > 16, "…and dlerror says why in a sentence");
+    check(dlerror() == 0, "…and the error is consumed by reading it");
+
+    /* setjmp/longjmp, which is the assembly. The value arrives as given; a longjmp
+     * of zero would arrive as 1, which is C's rule and not this program's. */
+    jmp_buf_t target;
+    jumps = 0;
+    int landed = _setjmp(&target);
+    if (landed == 0) {
+        jump_back(&target);
+    }
+    check(landed == 7, "longjmp delivered its value to setjmp");
+    check(jumps == 1, "…having gone through the jumping function once");
+
+    /* A longjmp of zero must arrive as 1: setjmp's own return is 0, and a caller
+     * that could not tell them apart would take the "first time through" branch
+     * after the jump and jump again forever. */
+    jmp_buf_t zero_target;
+    jumps = 0;
+    int zero_landed = _setjmp(&zero_target);
+    if (zero_landed == 0 && jumps == 0) {
+        jumps++;
+        longjmp(&zero_target, 0);
+    }
+    check(zero_landed == 1, "a longjmp of zero arrives as one");
+
+    /* backtrace: this frame, its caller, and so on. Two frames at minimum — this
+     * function and main — and every address inside the program's text. */
+    void *frames[16];
+    int depth = backtrace(frames, 16);
+    check(depth >= 2, "backtrace walked at least this frame and its caller");
+    check(frames[0] != 0, "…and recorded a return address");
+
+    printf("[hello-c] process %d: uname %s %s, stack limit %lu KiB, backtrace %d frames\n",
+           pid, u.sysname, u.release, (unsigned long)(256), depth);
+}
+
 /* Layer 5: threads, locks and thread-local storage.
  *
  * Two thread-locals with different homes: one initialised (it lives in .tdata and
@@ -799,6 +1073,7 @@ static long shared_counter;
 static int inside;
 static int exclusion_violated;
 static unsigned long worker_tp[WORKERS];
+static int worker_pid[WORKERS];
 static int worker_seed_ok[WORKERS];
 static int worker_alloc_ok[WORKERS] = { 1, 1, 1, 1 };
 static int specific_key;
@@ -819,6 +1094,10 @@ static void *worker(void *arg)
     tls_seed = (int)(0x100 + id);
     tls_scratch = (int)(id * 7);
     worker_tp[id] = staros_thread_pointer();
+    /* Every thread of a program is a separate task to the scheduler and must still
+     * be one process to POSIX. The kernel carries the two identities apart for
+     * exactly this line. */
+    worker_pid[id] = getpid();
 
     pthread_once(&once_state, run_once);
     pthread_setspecific(specific_key, (void *)(id + 1));
@@ -917,6 +1196,16 @@ static void check_threads(void)
                 distinct = 0;
     }
     check(distinct, "every thread ran on its own thread pointer");
+
+    /* The mirror image of that claim: distinct thread pointers, one process id.
+     * A `getpid` derived from the scheduling id would give four different answers
+     * here, and a program writing one file per process would write four. */
+    int same_pid = 1;
+    for (int i = 0; i < WORKERS; i++) {
+        if (worker_pid[i] != getpid())
+            same_pid = 0;
+    }
+    check(same_pid, "every thread reported the same process id as main");
 
     printf("[hello-c] threads: %d workers x %d increments = %ld, %lu thread(s) live at the end\n",
            WORKERS, BUMPS, shared_counter, staros_threads_live());
@@ -1021,6 +1310,7 @@ int main(void)
     check_streams();
     check_dirs();
     check_transfer();
+    check_process();
     check_threads();
     check_poll();
 

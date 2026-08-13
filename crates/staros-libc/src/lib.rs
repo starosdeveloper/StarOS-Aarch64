@@ -8,23 +8,32 @@
 //! from the score rather than from memory.
 //!
 //! ## What is here
-//! Layers 1–4 of the contract, which are exactly the layers that need nothing new
-//! from the kernel:
+//! All seven layers, 282 of 282:
 //!
-//! * **1, pure computation** — `mem*`, `str*`, `strtol`, and the `printf` family.
+//! * **1, pure computation** — `mem*`, `str*`, `strtol`, `strtod`, the `printf` and
+//!   `scanf` engines, and the whole of libm ([`math`]), written rather than borrowed.
 //! * **2, memory** — `malloc`/`free`/`calloc`/`realloc`/`aligned_alloc` over
-//!   `MapAnon`.
-//! * **3, time** — `clock_gettime`/`nanosleep`/`time` over `ClockNow`/`SleepUntil`.
+//!   `MapAnon`, plus [`mmap`] for the callers that want pages rather than bytes.
+//! * **3, time** — `clock_gettime`/`nanosleep`/`time` over `ClockNow`/`SleepUntil`,
+//!   and the calendar (`gmtime_r`, `mktime`, `strftime`).
 //! * **4, files** — `open`/`read`/`lseek`/`fstat`/`close` as IPC to `services/fssrv`,
-//!   plus `stdout`/`stderr` through `DebugWrite`.
+//!   the buffered `FILE*` layer over them ([`stream`]), directories over a flat
+//!   archive ([`dir`]), and `stdout`/`stderr` through `DebugWrite`.
+//! * **5, threads and TLS** — `pthread_*` over `SpawnThread`, with the AArch64
+//!   variant-I thread-local layout the linker's offsets assume.
+//! * **6, multiplexing** — `poll`/`eventfd`/`pipe` over `WaitAny`, which is what
+//!   `QEventDispatcherUNIX` is built on.
+//! * **7, process and system** — the environment, `getpid`, `uname`, `getrlimit`,
+//!   `setjmp`/`longjmp`, `backtrace`, the signal-set arithmetic ([`proc`]).
 //!
-//! ## What is not, and why it is not pretended
-//! Layers 5 (threads and TLS), 6 (`poll`/`eventfd`/`pipe`) and 7 (the C++ runtime)
-//! are absent. They are the expensive half and each needs a decision this crate
-//! cannot make alone — `pthread_create` needs a thread-local ABI, `poll` needs file
-//! descriptors that can be waited on, `libc++` needs `-fno-exceptions` to be settled
-//! first. A stub that returns success would let a program link and then fail
-//! somewhere unrelated, which is the failure mode this whole tree is built to avoid.
+//! ## What is refused, and why that is not the same as missing
+//! A symbol being present is not a claim that the operation exists here. `fork`
+//! returns `ENOSYS`, `dlopen` fails and `dlerror` explains why in a sentence,
+//! writing to a file is `EROFS`, `wait` is `ECHILD`. Every one of those is a
+//! decision recorded in `docs/LIBC-CONTRACT.md` with its reason, and every one sets
+//! the errno that tells a caller which fallback to take. A stub that returned
+//! success would let a program link and then fail somewhere unrelated, which is the
+//! failure mode this whole tree is built to avoid.
 //!
 //! ## Testing
 //! Everything that can be tested without a kernel is: the string functions, the
@@ -57,6 +66,7 @@ pub(crate) mod lock;
 pub mod locale;
 pub mod math;
 pub mod mmap;
+pub mod proc;
 pub mod scan;
 pub mod stdio;
 pub mod stream;
@@ -343,21 +353,9 @@ mod exports {
         4096
     }
 
-    /// `sysconf`, for the two names a program is likely to ask about. Anything else
-    /// answers -1, which C says means "no limit / unknown" — better than a
-    /// confident wrong number.
-    #[no_mangle]
-    pub extern "C" fn sysconf(name: c_int) -> i64 {
-        const SC_PAGESIZE: c_int = 30;
-        const SC_NPROCESSORS_ONLN: c_int = 84;
-        match name {
-            SC_PAGESIZE => 4096,
-            // One, until this library has threads to run on the others.
-            SC_NPROCESSORS_ONLN => 1,
-            _ => -1,
-        }
-    }
-
+    // `sysconf` used to live here and answered two names. It moved to
+    // `crate::proc` with layer 7, where the descriptor limit and the clock tick it
+    // now also answers are the same numbers the rest of that module reports.
 }
 
 /// Nothing in this library panics deliberately; the lang item has to exist for the

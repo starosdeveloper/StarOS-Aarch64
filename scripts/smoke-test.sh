@@ -311,6 +311,12 @@ if [ -n "$INITRAMFS" ]; then
     # Threads: four of them, each with its own thread pointer, sharing a counter
     # through a mutex whose critical section yields in the middle — a lock that does
     # nothing passes a plain `counter++` loop and fails this one.
+    # Layer 7: the process and the system around it. The pid is measured and the
+    # frame count depends on inlining, so only the fixed middle of the line is
+    # asserted — `uname` naming this system and the stack limit being the one the
+    # kernel actually enforces (the same 256 KiB the guard-page line above reports).
+    req "[hello-c] process "
+    req "uname StarOS 0.2.0, stack limit 256 KiB"
     req "[hello-c] threads: 4 workers x 250 increments = 1000"
     # The event-loop layer: a thread blocked in poll until another thread wrote to
     # an eventfd, a pipe carried bytes between them, and a timeout was waited out
