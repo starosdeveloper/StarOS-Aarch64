@@ -18,6 +18,8 @@
 //! tag = 3 Stat   words[0] = path length,  cap = buffer holding the path
 //!                -> words[0] = size, words[1] = mode bits
 //! tag = 4 Close  words[0] = handle
+//! tag = 5 List   words[0] = index, cap = buffer to receive the name
+//!                -> words[0] = name length, words[1] = size, words[2] = mode
 //! tag = 9 Bye    the last client is done; the server may exit
 //! ```
 //!
@@ -25,6 +27,12 @@
 //! zero-length read: "the file is empty" and "there is no such file" are different
 //! answers, and a client that cannot tell them apart will one day ship a blank
 //! screen instead of an error.
+//!
+//! `List` takes an index rather than opening a directory handle, which makes it
+//! stateless: the server holds nothing between calls, so a client that walks half a
+//! directory and dies costs nothing, and two clients listing at once cannot see each
+//! other's position. The price is that a listing is not a snapshot — but the archive
+//! is read-only and never changes, so there is nothing to be inconsistent about.
 
 /// Open a file by path.
 pub const TAG_OPEN: u64 = 1;
@@ -34,6 +42,8 @@ pub const TAG_READ: u64 = 2;
 pub const TAG_STAT: u64 = 3;
 /// Release a handle.
 pub const TAG_CLOSE: u64 = 4;
+/// The name, size and mode of the archive's `index`-th member.
+pub const TAG_LIST: u64 = 5;
 /// No more requests are coming; the server may report and exit.
 pub const TAG_BYE: u64 = 9;
 

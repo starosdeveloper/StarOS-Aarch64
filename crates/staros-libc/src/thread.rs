@@ -173,9 +173,9 @@ fn new_thread_block() -> Option<*mut Thread> {
     // SAFETY: `PARKERS` is written once in `init`.
     let parker = unsafe { (*ptr::addr_of!(PARKERS))[slot as usize] };
 
-    // The template: initialised bytes, then the zeroed tail.
-    // SAFETY: these are linker-provided addresses in our own image.
-    let (tdata, tdata_len, tls_len) = unsafe {
+    // The template: initialised bytes, then the zeroed tail. These are
+    // linker-provided addresses in our own image.
+    let (tdata, tdata_len, tls_len) = {
         let start = ptr::addr_of!(__tdata_start) as usize;
         let init_end = ptr::addr_of!(__tdata_end) as usize;
         let end = ptr::addr_of!(__tbss_end) as usize;
@@ -627,7 +627,7 @@ pub mod exports {
         // the thread being created.
         let rc = unsafe {
             sys::spawn_thread(
-                thread_entry as usize as u64,
+                thread_entry as *const () as usize as u64,
                 pages,
                 (*block).tls_block as u64,
                 block as u64,

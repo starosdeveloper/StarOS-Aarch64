@@ -46,8 +46,17 @@ if command -v cpio >/dev/null 2>&1 && [ -n "$init_elf" ]; then
     printf 'hello from the initramfs\n' >"$irdir/greeting.txt"
     printf 'STAR OS 0.2.0\n' >"$irdir/version"
     cp "$init_elf" "$irdir/init.elf"
+    # A subdirectory, and one below it. CPIO stores paths and not directories, so
+    # these members are the only thing that makes `docs` a directory at all — and
+    # they are what `opendir`/`readdir` in libc are tested against: `docs` holds one
+    # file and one directory, and `docs/deep` is reported once rather than once per
+    # file inside it.
+    mkdir -p "$irdir/docs/deep"
+    printf 'read me\n' >"$irdir/docs/readme.txt"
+    printf 'down here\n' >"$irdir/docs/deep/note.txt"
     initrd="${elf}.initrd.cpio"
-    ( cd "$irdir" && printf '%s\n' greeting.txt version init.elf |
+    ( cd "$irdir" && printf '%s\n' greeting.txt version init.elf \
+        docs/readme.txt docs/deep/note.txt |
         cpio -o -H newc --reproducible 2>/dev/null ) >"$initrd"
 fi
 

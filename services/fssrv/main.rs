@@ -56,8 +56,8 @@ use core::arch::{asm, naked_asm};
 use core::panic::PanicInfo;
 
 use staros_abi::fsproto::{
-    ERR_BAD_HANDLE, ERR_MALFORMED, ERR_NO_FILE, MAX_PATH, TAG_BYE, TAG_CLOSE, TAG_ERROR, TAG_OPEN,
-    TAG_READ, TAG_STAT,
+    ERR_BAD_HANDLE, ERR_MALFORMED, ERR_NO_FILE, MAX_PATH, TAG_BYE, TAG_CLOSE, TAG_ERROR, TAG_LIST,
+    TAG_OPEN, TAG_READ, TAG_STAT,
 };
 use staros_cpio::{Archive, Entry};
 
@@ -88,7 +88,7 @@ const MAX_OPEN: usize = 8;
 /// A rubbish message must not become an infinite loop, and neither must a client
 /// that never says goodbye: `Recv` returns immediately whenever a sender is
 /// queued, so an unbounded server spins as fast as the endpoint can feed it.
-const MAX_REQUESTS: u32 = 64;
+const MAX_REQUESTS: u32 = 512;
 /// How many malformed messages to answer before concluding the client is broken.
 const MAX_REJECTED: u32 = 8;
 
@@ -320,6 +320,33 @@ fn serve(
             }
             let mut reply = Message::new();
             reply.tag = TAG_CLOSE;
+            reply
+        }
+
+        TAG_LIST => {
+            let Some(buffer) = Buffer::map(msg.cap) else {
+                return error(ERR_MALFORMED);
+            };
+            // Past the end is `ERR_NO_FILE` rather than an empty name: the client
+            // stops on the refusal, and an empty name would be indistinguishable
+            // from a member the archive really does hold under an empty name.
+            let Some(entry) = archive.entries().nth(msg.words[0] as usize) else {
+                return error(ERR_NO_FILE);
+            };
+            let name = entry.name.as_bytes();
+            let len = name.len().min(MAX_PATH).min(buffer.len);
+            // SAFETY: `len` is bounded by the pages the capability names, and the
+            // buffer is mapped read/write into this address space.
+            unsafe {
+                for i in 0..len {
+                    buffer.base.add(i).write_volatile(name[i]);
+                }
+            }
+            let mut reply = Message::new();
+            reply.tag = TAG_LIST;
+            reply.words[0] = len as u64;
+            reply.words[1] = entry.data.len() as u64;
+            reply.words[2] = u64::from(entry.mode);
             reply
         }
 

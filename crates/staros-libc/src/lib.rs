@@ -48,6 +48,7 @@
 #![cfg_attr(not(test), no_builtins)]
 
 pub mod cxx;
+pub mod dir;
 pub mod fd;
 pub mod fmt;
 pub mod file;
@@ -58,6 +59,7 @@ pub mod math;
 pub mod mmap;
 pub mod scan;
 pub mod stdio;
+pub mod stream;
 pub mod string;
 pub mod sys;
 pub mod thread;

@@ -21,7 +21,7 @@ use crate::sys;
 /// go; a longer line is flushed in pieces rather than truncated.
 const LINE: usize = 1024;
 
-struct Stream {
+pub(crate) struct Stream {
     buf: [u8; LINE],
     len: usize,
 }
@@ -34,21 +34,12 @@ static mut OUT: Stream = Stream { buf: [0; LINE], len: 0 };
 /// against other *processes* — there, one `DebugWrite` per line is the guarantee.
 static OUT_LOCK: crate::lock::Spin = crate::lock::Spin::new();
 
-/// The `FILE` a C program passes around. It carries nothing: both streams go to the
-/// same place, and the only thing this library needs from a `FILE*` is to tell them
-/// apart — which it does not yet need to, because neither is redirectable.
-#[repr(C)]
-pub struct File {
-    _private: u8,
-}
-
-#[no_mangle]
-pub static mut stdout: *mut File = core::ptr::addr_of!(STDOUT) as *mut File;
-#[no_mangle]
-pub static mut stderr: *mut File = core::ptr::addr_of!(STDERR) as *mut File;
-
-static STDOUT: File = File { _private: 1 };
-static STDERR: File = File { _private: 2 };
+/// The `FILE` a C program passes around now lives in [`crate::stream`], which is
+/// where the descriptor, the read-ahead buffer and the `feof` flag are. This module
+/// keeps only the console side: the line buffer that makes one `printf` one
+/// `DebugWrite`.
+#[cfg(not(test))]
+pub use crate::stream::File;
 
 /// Run `f` with the console buffer, holding the lock for all of it.
 ///
@@ -238,20 +229,42 @@ pub mod exports {
     }
 
     /// # Safety
-    /// C ABI: NUL-terminated string.
+    /// C ABI: NUL-terminated string; `stream` is a stream or null.
     #[no_mangle]
-    pub unsafe extern "C" fn fputs(s: *const c_char, _stream: *mut File) -> c_int {
+    pub unsafe extern "C" fn fputs(s: *const c_char, stream: *mut File) -> c_int {
         // SAFETY: forwarded from the caller.
-        unsafe {
-            write_bytes(crate::string::as_bytes(s));
+        let bytes = unsafe { crate::string::as_bytes(s) };
+        // SAFETY: as above.
+        if unsafe { crate::stream::writable(stream) } {
+            write_bytes(bytes);
+            0
+        } else {
+            // The file server is read-only. Reporting EOF is what C says and what a
+            // caller checks; writing the bytes to the console instead would put a
+            // program's file output in the system log.
+            crate::stream::EOF
         }
-        0
     }
 
+    /// # Safety
+    /// C ABI: `stream` is a stream or null.
     #[no_mangle]
-    pub extern "C" fn fputc(c: c_int, _stream: *mut File) -> c_int {
-        write_bytes(&[c as u8]);
-        c
+    pub unsafe extern "C" fn fputc(c: c_int, stream: *mut File) -> c_int {
+        // SAFETY: forwarded from the caller.
+        if unsafe { crate::stream::writable(stream) } {
+            write_bytes(&[c as u8]);
+            c
+        } else {
+            crate::stream::EOF
+        }
+    }
+
+    /// # Safety
+    /// As [`fputc`].
+    #[no_mangle]
+    pub unsafe extern "C" fn putc(c: c_int, stream: *mut File) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { fputc(c, stream) }
     }
 
     #[no_mangle]
@@ -261,22 +274,12 @@ pub mod exports {
     }
 
     /// # Safety
-    /// C ABI: `ptr` is valid for `size * count` bytes.
+    /// C ABI: `stream` is a stream or null (which means "every stream").
     #[no_mangle]
-    pub unsafe extern "C" fn fwrite(
-        ptr: *const core::ffi::c_void,
-        size: usize,
-        count: usize,
-        _stream: *mut File,
-    ) -> usize {
-        let total = size.saturating_mul(count);
-        // SAFETY: forwarded from the caller.
-        write_bytes(unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), total) });
-        count
-    }
-
-    #[no_mangle]
-    pub extern "C" fn fflush(_stream: *mut File) -> c_int {
+    pub unsafe extern "C" fn fflush(_stream: *mut File) -> c_int {
+        // Only the console has anything buffered on the way *out*; a read stream's
+        // buffer is discarded by `fseek` and by nothing else, which is what C says
+        // about flushing an input stream.
         super::flush();
         0
     }

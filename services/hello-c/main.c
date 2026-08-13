@@ -147,7 +147,121 @@ size_t strftime(char *s, size_t n, const char *format, const struct tm *broken_d
 void tzset(void);
 extern char *tzname[2];
 
+/* The FILE* layer. `FILE` is opaque here on purpose: a C program is not allowed to
+ * know what is inside it, and Qt does not. */
+typedef struct _IO_FILE FILE;
+FILE *fopen(const char *path, const char *mode);
+size_t fread(void *dst, size_t size, size_t count, FILE *f);
+char *fgets(char *buf, int size, FILE *f);
+int fgetc(FILE *f);
+int ungetc(int c, FILE *f);
+int fseek(FILE *f, long offset, int whence);
+long ftell(FILE *f);
+int feof(FILE *f);
+int ferror(FILE *f);
+int fileno(FILE *f);
+int fclose(FILE *f);
+long getline(char **line, size_t *cap, FILE *f);
+
+/* Directories, over the flat archive. `DIR` is opaque for the same reason. */
+typedef struct _DIR DIR;
+struct dirent {
+    unsigned long d_ino;
+    long d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[256];
+};
+#define DT_DIR 4
+#define DT_REG 8
+DIR *opendir(const char *path);
+struct dirent *readdir(DIR *dir);
+void rewinddir(DIR *dir);
+int closedir(DIR *dir);
+
+/* `struct stat`, in the layout glibc's headers describe — the same one libstdc++
+ * and Qt were compiled against. Only the fields this program reads are named
+ * individually; the rest is padding to the right size. */
+struct stat {
+    unsigned long st_dev;
+    unsigned long st_ino;
+    unsigned int st_mode;
+    unsigned int st_nlink;
+    unsigned int st_uid;
+    unsigned int st_gid;
+    unsigned long st_rdev;
+    unsigned long __pad1;
+    long st_size;
+    int st_blksize;
+    int __pad2;
+    long st_blocks;
+    long st_atime_sec, st_atime_nsec;
+    long st_mtime_sec, st_mtime_nsec;
+    long st_ctime_sec, st_ctime_nsec;
+    unsigned int __unused[2];
+};
+int stat(const char *path, struct stat *out);
+int fstat(int fd, struct stat *out);
+
+/* `statx`, which is what a modern glibc's `stat` is a wrapper around — so Qt's
+ * objects reference this name and not the old one. The timestamps are nested
+ * structures in the ABI, and flattening them here would move every field after
+ * them. */
+struct statx_timestamp {
+    long tv_sec;
+    unsigned int tv_nsec;
+    int __reserved;
+};
+struct statx {
+    unsigned int stx_mask;
+    unsigned int stx_blksize;
+    unsigned long stx_attributes;
+    unsigned int stx_nlink;
+    unsigned int stx_uid;
+    unsigned int stx_gid;
+    unsigned short stx_mode;
+    unsigned short __spare0[1];
+    unsigned long stx_ino;
+    unsigned long stx_size;
+    unsigned long stx_blocks;
+    unsigned long stx_attributes_mask;
+    struct statx_timestamp stx_atime, stx_btime, stx_ctime, stx_mtime;
+    unsigned int stx_rdev_major, stx_rdev_minor;
+    unsigned int stx_dev_major, stx_dev_minor;
+    unsigned long stx_mnt_id;
+    unsigned int stx_dio_mem_align, stx_dio_offset_align;
+    unsigned long __spare3[12];
+};
+int statx(int dirfd, const char *path, int flags, unsigned mask, struct statx *out);
+#define STATX_BASIC_STATS 0x07ff
+#define STATX_SIZE 0x0200
+#define AT_EMPTY_PATH 0x1000
+
+/* The filesystem itself, and a copy that does not go through the caller. */
+struct statfs {
+    long f_type;
+    long f_bsize;
+    unsigned long f_blocks, f_bfree, f_bavail, f_files, f_ffree;
+    int f_fsid[2];
+    long f_namelen, f_frsize, f_flags, f_spare[4];
+};
+int statfs(const char *path, struct statfs *out);
+ssize_t sendfile(int out_fd, int in_fd, long *offset, size_t count);
+long copy_file_range(int in_fd, long *in_off, int out_fd, long *out_off,
+                     size_t len, unsigned flags);
+#define ST_RDONLY 1
+#define EXDEV 18
+int mkdir(const char *path, unsigned mode);
+int unlink(const char *path);
+#define S_IFMT  0170000
+#define S_IFDIR 0040000
+#define S_IFREG 0100000
+extern int *__errno_location(void);
+#define errno (*__errno_location())
+#define EROFS 30
+
 #define SEEK_SET 0
+#define SEEK_CUR 1
 #define SEEK_END 2
 
 static int failures;
@@ -494,6 +608,169 @@ static void check_files(void)
            path, text);
 }
 
+/* Layer 4, the FILE* half: buffering, push-back, and a position that means the same
+ * thing to `ftell` as it does to the descriptor underneath.
+ *
+ * The read-ahead is the whole difficulty here. A `FILE` reads 4 KiB at a time, so
+ * after one `fgetc` the descriptor's offset is at the end of the file while the
+ * program's position is 1. Every claim below is chosen so that a stream which
+ * forgot to subtract its buffer gets a different answer. */
+static void check_streams(void)
+{
+    FILE *f = fopen("greeting.txt", "r");
+    if (!f) {
+        puts("[hello-c] no file server on this machine; skipping the stream checks");
+        return;
+    }
+
+    int first = fgetc(f);
+    check(first == 'h', "fgetc read the first byte");
+    check(ftell(f) == 1, "ftell counts bytes consumed, not bytes buffered");
+
+    /* Push it back and take it again: the byte must reappear and the position must
+     * step back with it. */
+    check(ungetc(first, f) == 'h', "ungetc gives the byte back");
+    check(ftell(f) == 0, "ungetc moved the position back");
+    check(fgetc(f) == 'h', "the pushed-back byte is read again");
+
+    check(fseek(f, 0, SEEK_SET) == 0, "fseek to the start");
+    char line[64];
+    check(fgets(line, sizeof line, f) == line, "fgets returned its buffer");
+    check(strcmp(line, "hello from the initramfs\n") == 0, "fgets read the whole line");
+    check(fgets(line, sizeof line, f) == 0, "fgets at the end returns NULL");
+    check(feof(f) != 0, "feof is set at the end");
+    check(ferror(f) == 0, "no error was recorded");
+
+    /* fread with a record size that is not one: the return is a *count*, and a
+     * stream that returned bytes would say 25 here. */
+    check(fseek(f, 0, SEEK_SET) == 0, "fseek back for fread");
+    char buf[64];
+    size_t records = fread(buf, 5, 4, f);
+    check(records == 4, "fread returns records, not bytes");
+    check(memcmp(buf, "hello from the initr", 20) == 0, "fread read the right bytes");
+    check(ftell(f) == 20, "fread advanced the position by size*count");
+
+    /* SEEK_CUR relative to the *program's* position, which is what a stream with
+     * read-ahead has to correct for. */
+    check(fseek(f, -14, SEEK_CUR) == 0, "fseek backwards from here");
+    check(ftell(f) == 6, "SEEK_CUR is relative to the position, not the buffer");
+    check(fgetc(f) == 'f', "reading from there gives the right byte");
+
+    check(fclose(f) == 0, "fclose");
+    check(fopen("no-such-file", "r") == 0, "fopen of a missing file is NULL");
+    puts("[hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell");
+}
+
+/* Layer 4, the directory half. The archive is flat — it stores `docs/deep/note.txt`
+ * and has no entry for `docs` — so a listing is a filter, and the thing worth
+ * checking is that it filters at the separator and reports `deep` once. */
+static void check_dirs(void)
+{
+    struct stat st;
+    if (stat("greeting.txt", &st) != 0) {
+        puts("[hello-c] no file server on this machine; skipping the directory checks");
+        return;
+    }
+    check((st.st_mode & S_IFMT) == S_IFREG, "stat reports a regular file");
+    check(st.st_size == 25, "stat reports the file's size");
+    check(stat("docs", &st) == 0, "a directory that only exists as a prefix stats");
+    check((st.st_mode & S_IFMT) == S_IFDIR, "stat reports a directory");
+    check(stat("no-such-file", &st) != 0, "stat of a missing file fails");
+
+    int fd = open("greeting.txt", 0, 0);
+    check(fd >= 0, "open for fstat");
+    check(fstat(fd, &st) == 0 && st.st_size == 25, "fstat agrees with stat");
+    check(close(fd) == 0, "close after fstat");
+
+    DIR *dir = opendir("docs");
+    check(dir != 0, "opendir on a prefix-only directory");
+    if (!dir) {
+        return;
+    }
+    int files = 0, dirs = 0, saw_readme = 0, saw_deep = 0;
+    struct dirent *e;
+    while ((e = readdir(dir)) != 0) {
+        if (e->d_type == DT_DIR) {
+            dirs++;
+            if (strcmp(e->d_name, "deep") == 0) {
+                saw_deep++;
+            }
+        } else {
+            files++;
+            if (strcmp(e->d_name, "readme.txt") == 0) {
+                saw_readme++;
+            }
+        }
+    }
+    check(saw_readme == 1, "readdir found 'readme.txt' once");
+    check(saw_deep == 1, "readdir found the subdirectory 'deep' exactly once");
+    check(files == 1 && dirs == 1, "readdir listed nothing else under 'docs'");
+
+    /* Rewind and count again: a directory that kept its seen-list across a rewind
+     * would report the subdirectory zero times the second time round. */
+    rewinddir(dir);
+    int again = 0;
+    while (readdir(dir) != 0) {
+        again++;
+    }
+    check(again == files + dirs, "rewinddir starts the listing over");
+    check(closedir(dir) == 0, "closedir");
+    check(opendir("no-such-dir") == 0, "opendir of a missing directory is NULL");
+    check(opendir("greeting.txt") == 0, "a file is not a directory");
+
+    /* The refusals. Read-only is a property of this filesystem, not a gap in the
+     * library, and `EROFS` is how a caller is told which. */
+    check(mkdir("docs/new", 0755) == -1 && errno == EROFS, "mkdir refuses with EROFS");
+    check(unlink("greeting.txt") == -1 && errno == EROFS, "unlink refuses with EROFS");
+    printf("[hello-c] listed 'docs': %d file, %d directory, over a flat archive\n",
+           files, dirs);
+}
+
+/* Layer 4, the calls that do not go through a caller's buffer: `statx`, `statfs`
+ * and `sendfile`. The first two are what a modern glibc's `stat` and a program
+ * asking "can I write a cache here?" actually reach. */
+static void check_transfer(void)
+{
+    struct statx sx;
+    memset(&sx, 0, sizeof sx);
+    if (statx(0, "greeting.txt", 0, STATX_BASIC_STATS, &sx) != 0) {
+        puts("[hello-c] no file server on this machine; skipping the transfer checks");
+        return;
+    }
+    check(sx.stx_size == 25, "statx reports the size");
+    check((sx.stx_mode & S_IFMT) == S_IFREG, "statx reports the file type");
+    check((sx.stx_mask & STATX_SIZE) != 0, "statx says the size is among what it answered");
+
+    /* The empty path with AT_EMPTY_PATH is `fstat` spelled the modern way, and a
+     * program that gets it wrong stats the current directory instead of the file. */
+    int fd = open("greeting.txt", 0, 0);
+    memset(&sx, 0, sizeof sx);
+    check(statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &sx) == 0, "statx on a descriptor");
+    check(sx.stx_size == 25, "statx on a descriptor reports the same size");
+
+    struct statfs fs;
+    memset(&fs, 0, sizeof fs);
+    check(statfs("/", &fs) == 0, "statfs answers");
+    check(fs.f_files >= 5, "statfs counted the archive's members");
+    check(fs.f_bfree == 0 && fs.f_bavail == 0, "statfs reports no free space, because there is none");
+    check((fs.f_flags & ST_RDONLY) != 0, "statfs says the filesystem is read-only");
+
+    /* sendfile from the file to standard output: the copy is real, the bytes land
+     * on the console, and the explicit offset must be advanced without moving the
+     * descriptor's own position. */
+    check(lseek(fd, 3, SEEK_SET) == 3, "position the descriptor before sendfile");
+    long off = 6;
+    printf("[hello-c] sendfile: ");
+    ssize_t sent = sendfile(1, fd, &off, 19);
+    check(sent == 19, "sendfile copied every byte asked for");
+    check(off == 25, "sendfile advanced the caller's offset");
+    check(lseek(fd, 0, SEEK_CUR) == 3, "sendfile left the descriptor where it was");
+    check(close(fd) == 0, "close after sendfile");
+
+    check(copy_file_range(0, 0, 1, 0, 16, 0) == -1 && errno == EXDEV,
+          "copy_file_range refuses with EXDEV");
+}
+
 /* Layer 5: threads, locks and thread-local storage.
  *
  * Two thread-locals with different homes: one initialised (it lives in .tdata and
@@ -741,6 +1018,9 @@ int main(void)
     check_heap();
     check_time();
     check_files();
+    check_streams();
+    check_dirs();
+    check_transfer();
     check_threads();
     check_poll();
 

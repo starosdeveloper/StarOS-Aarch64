@@ -67,7 +67,14 @@ if command -v cpio >/dev/null 2>&1; then
     # process out of them. It is the same program the kernel also has built in,
     # which is what makes the test cheap — but it arrives the other way round, and
     # the id it is seeded with is one only this path uses.
-    MEMBERS="greeting.txt version"
+    # A subdirectory, and one below it. CPIO stores paths and not directories, so
+    # these two members are the only thing that makes `docs` a directory — which is
+    # the whole premise `opendir`/`readdir` are built on, and the reason the archive
+    # needs a nested path in it to be tested at all.
+    mkdir -p "$IRDIR/docs/deep"
+    printf 'read me\n'   >"$IRDIR/docs/readme.txt"
+    printf 'down here\n' >"$IRDIR/docs/deep/note.txt"
+    MEMBERS="greeting.txt version docs/readme.txt docs/deep/note.txt"
     HAVE_PROGRAM=""
     if [ -n "$INIT_ELF" ] && [ -f "$INIT_ELF" ]; then
         cp "$INIT_ELF" "$IRDIR/init.elf"
@@ -128,7 +135,20 @@ run() {
     fi
     # Assertions every healthy boot must satisfy, whatever the machine:
     req "shutting down (PSCI SYSTEM_OFF)"          # reached the end, no hang/crash
-    req "every frame returned"                     # no frame leak after teardown
+    # No frame leak after teardown. The kernel prints one of three verdicts, and
+    # only `LEAKED` is a failure: with no console input the UART driver is still
+    # blocked in `Wait`, and the frames it holds are not lost. On a machine with
+    # room to spare those tasks sit outside the longest free run and the verdict is
+    # the strict one; on the 128 MiB configuration the pool is small enough that
+    # they can land inside it, and demanding the strict verdict there tests where
+    # the allocator happened to place a live task. `RECLAIM_STRICT=0` says so for
+    # that machine; `forbid LEAKED` below carries the claim on every machine.
+    if [ "${RECLAIM_STRICT:-1}" = 1 ]; then
+        req "every frame returned"
+    else
+        req "frame reclaim: longest free run"
+    fi
+    RECLAIM_STRICT=1
     req "isolated, kernel continues"               # the canary EL0 fault was contained
     forbid "LEAKED"                                # the reclaim check did not fail
     forbid "did not initialise"                    # no half-configured device
@@ -274,6 +294,20 @@ if [ -n "$INITRAMFS" ]; then
     # The C program reaches the same file through the same server as fsclient, but
     # through open/read/lseek rather than raw IPC.
     req "[hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: $GREETING"
+    # The buffered layer on top of those: a stream reads a page ahead, so its
+    # position and its descriptor's are different numbers, and every claim behind
+    # this line is one where a stream that forgot to subtract its read-ahead gets a
+    # different answer.
+    req "[hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell"
+    # Directories over a flat archive. `docs` has no entry in the CPIO — it exists
+    # because `docs/readme.txt` does — and `docs/deep` must be listed once rather
+    # than once per file inside it. The counts are the whole claim, so the whole
+    # line is asserted.
+    req "[hello-c] listed 'docs': 1 file, 1 directory, over a flat archive"
+    # sendfile with an explicit offset: the bytes are the file's, copied to standard
+    # output by the library rather than by the program, and the text that lands here
+    # is the tail of the greeting.
+    req "[hello-c] sendfile: from the initramfs"
     # Threads: four of them, each with its own thread pointer, sharing a counter
     # through a mutex whose critical section yields in the middle — a lock that does
     # nothing passes a plain `counter++` loop and fails this one.
@@ -328,6 +362,7 @@ req "endpoint contended across cores"
 req "privileged access never (PAN): enabled" # -cpu max implements FEAT_PAN; the whole
                                              # user-copy demo runs under it via LDTR/STTR
 
+RECLAIM_STRICT=0  # see the note in `run`: 128 MiB is too small to place tasks by luck
 run gicv3-el2-smp4-128m 90 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 128M
 req "interrupt controller: GICv3 online"     # smallest RAM: the memory-map path
 req "no increments lost"

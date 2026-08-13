@@ -255,7 +255,6 @@ enum Width {
     Long,
     LongLong,
     Size,
-    Float,
     Double,
 }
 
@@ -566,7 +565,7 @@ unsafe fn store_int(dst: *mut c_void, value: i64, width: Width) {
         match width {
             Width::Char => *dst.cast::<i8>() = value as i8,
             Width::Short => *dst.cast::<i16>() = value as i16,
-            Width::Int | Width::Float => *dst.cast::<i32>() = value as i32,
+            Width::Int => *dst.cast::<i32>() = value as i32,
             Width::Long | Width::LongLong | Width::Size | Width::Double => {
                 *dst.cast::<i64>() = value;
             }
