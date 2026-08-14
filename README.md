@@ -223,7 +223,7 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [hello-c] endpoint in poll: a message from another process woke the loop in 1072240 ns
 [hello-c] shared buffers: 16 KiB of surface, mapped at 0x500001000 and 0x500005000
 [displaysrv] composited client surfaces onto a screen no client can touch
-[displaysrv] 3 surface(s) live, 6 commit(s), 15440 pixel(s) composited, 2 refused
+[displaysrv] 3 surface(s) live, 6 commit(s), 15440 pixel(s) composited, 5 refused
 [hello-c] window: a 32x32 surface on a 640x480 screen, from C through staros.h
 [hello-c] font: read 133796 bytes of IBM Plex Mono through fssrv, checksum 6016661948058288260
 [hello-c] C RUNTIME OK - every check passed

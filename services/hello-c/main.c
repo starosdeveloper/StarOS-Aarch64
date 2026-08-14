@@ -1608,6 +1608,54 @@ static void check_display(void)
     check(msg.tag == STAROS_DISPLAY_ERROR, "a made-up surface is refused");
     check(msg.words[0] == STAROS_DISPLAY_ERR_NO_SURFACE, "and the refusal says which");
 
+    /* Now lie about the geometry, which is the refusal that protects the *server*.
+     *
+     * A client claiming a 640x480 surface while delegating 32x32 worth of pixels
+     * would make displaysrv read 1.2 MB out of a 4 KiB mapping and take the fault —
+     * the wrong process punished for this one's arithmetic, and a display server
+     * that dies takes every other window with it. The server asks the kernel how
+     * big the buffer is and believes that instead of the message. Nothing had ever
+     * tested it, because no honest client lies.
+     *
+     * Removing the refusal does not fault the server *here* — it accepts the lie
+     * and keeps it, and the fault waits for the first commit that reads those
+     * pixels. That gap is the reason the refusal belongs at `Create`: by the time
+     * the fault arrives, the request that caused it is long gone from the log. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_CREATE;
+    msg.words[0] = 640;
+    msg.words[1] = 480;
+    msg.words[2] = 0;
+    msg.words[3] = 0;
+    msg.cap = cap; /* the 32x32 buffer, delegated again */
+    staros_msg_send(display, &msg);
+    staros_msg_recv(reply, &msg);
+    check(msg.tag == STAROS_DISPLAY_ERROR, "a surface larger than its buffer is refused");
+    check(msg.words[0] == STAROS_DISPLAY_ERR_BUFFER, "because the buffer is too small");
+
+    /* And a create with no buffer at all, which is the same lie told by omission. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_CREATE;
+    msg.words[0] = side;
+    msg.words[1] = side;
+    staros_msg_send(display, &msg);
+    staros_msg_recv(reply, &msg);
+    check(msg.tag == STAROS_DISPLAY_ERROR, "a surface with no pixels is refused");
+    check(msg.words[0] == STAROS_DISPLAY_ERR_MALFORMED, "as malformed");
+
+    /* Damage outside the surface. Clamping it silently would repaint the wrong
+     * region and read as a rendering bug three layers away from the arithmetic
+     * that caused it. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_COMMIT;
+    msg.words[0] = surface;
+    msg.words[1] = (unsigned long long)side << 32; /* y at the surface's height */
+    msg.words[2] = 1u | (1ull << 32);
+    staros_msg_send(display, &msg);
+    staros_msg_recv(reply, &msg);
+    check(msg.tag == STAROS_DISPLAY_ERROR, "damage past the bottom edge is refused");
+    check(msg.words[0] == STAROS_DISPLAY_ERR_MALFORMED, "as malformed");
+
     /* Say goodbye, so the server ends its loop rather than being killed inside it.
      * A server that only stops by dying has never proved it can stop. */
     memset(&msg, 0, sizeof msg);

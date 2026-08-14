@@ -433,9 +433,11 @@ req "[displaysrv] composited client surfaces onto a screen no client can touch"
 # 4096 pixels each, 64 for the 8x8 damage, then the C program's 1024, its 16, its
 # throwaway window's 1024 and the 1024 that repainted what closing it uncovered —
 # so a server quietly repainting whole surfaces on every commit fails this line
-# rather than merely being slow. The two refusals are the made-up surface id and
-# the destroyed one, both sent on purpose.
-req "[displaysrv] 3 surface(s) live, 6 commit(s), 15440 pixel(s) composited, 2 refused"
+# rather than merely being slow. All five refusals are provoked on purpose: a
+# made-up surface id, a destroyed one, a surface claiming more pixels than its
+# buffer holds, one with no buffer at all, and damage past the bottom edge. The
+# third of those is what keeps a lying client from making the *server* fault.
+req "[displaysrv] 3 surface(s) live, 6 commit(s), 15440 pixel(s) composited, 5 refused"
 # And that a second *process* was served: the C program's window, drawn through the
 # same header a platform plugin is given. Two clients on one server is where a
 # shared reply endpoint shows itself — as one of them hanging on an answer the

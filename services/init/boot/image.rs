@@ -1086,12 +1086,10 @@ extern "C" fn _start() -> ! {
         "ldr x20, [x11]",            // msg.tag = the event kind
         "cmp x20, #1",               // 1 = EV_KEY, the only kind published so far
         "b.ne .Lic_bad",
-        "adr x2, 29f",
-        "bl .Lputs",
+        "adr x2, 29f",               // prefix
+        "adr x3, 30f",               // suffix
         "ldr x0, [x11, #8]",         // words[0] = the key code
-        "bl .Lputdec",
-        "adr x2, 30f",
-        "bl .Lputs",
+        "bl .Lputline",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
         ".Lic_bad:",
@@ -1167,29 +1165,54 @@ extern "C" fn _start() -> ! {
         "svc #0",
         "ret",
 
-        // Print the unsigned value in x0 in decimal. Digits come out least
-        // significant first, so they are written backwards into a scratch buffer
-        // below the stack pointer and the whole run is sent in one `DebugWrite` —
-        // one call is one line as far as the console lock is concerned, and a
-        // number shredded across two cores' output is a number nobody can read.
-        // Clobbers x0..x6, x8 and the link register.
-        ".Lputdec:",
-        "sub sp, sp, #32",
-        "add x3, sp, #32",           // one past the end of the scratch buffer
-        "mov x4, #10",
-        ".Lputdec_digit:",
-        "udiv x5, x0, x4",
-        "msub x6, x5, x4, x0",       // x6 = x0 - (x0 / 10) * 10
-        "add w6, w6, #48",           // '0'
-        "strb w6, [x3, #-1]!",
-        "mov x0, x5",
-        "cbnz x0, .Lputdec_digit",
-        "add x1, sp, #32",
-        "sub x1, x1, x3",            // length
-        "mov x0, x3",                // ptr
+        // Print `prefix` (x2), the unsigned number in x0, and `suffix` (x3) as
+        // **one** line, in one `DebugWrite`.
+        //
+        // Composing it rather than making three calls is not tidiness. One call is
+        // one line as far as the kernel's console lock is concerned; three calls are
+        // three chances for another task to write between them, and the result reads
+        // `[inputclient] key code [inputsrv] input driver exiting`. That is what
+        // happened, and it passed several runs before it did — a shredded line is
+        // not a rare event, it is an uncommon one, which is worse.
+        //
+        // Clobbers x0..x7, x8, x9 and the link register. Uses 192 bytes of stack.
+        ".Lputline:",
+        "sub sp, sp, #192",
+        "mov x9, sp",                // x9 = write cursor
+        ".Lputline_prefix:",
+        "ldrb w4, [x2], #1",
+        "cbz w4, .Lputline_number",
+        "strb w4, [x9], #1",
+        "b .Lputline_prefix",
+        ".Lputline_number:",
+        // Digits come out least significant first, so they go backwards into the
+        // tail of the buffer and are then copied forward.
+        "add x5, sp, #192",          // one past the end
+        "mov x6, #10",
+        ".Lputline_digit:",
+        "udiv x7, x0, x6",
+        "msub x4, x7, x6, x0",       // x4 = x0 - (x0 / 10) * 10
+        "add w4, w4, #48",           // '0'
+        "strb w4, [x5, #-1]!",
+        "mov x0, x7",
+        "cbnz x0, .Lputline_digit",
+        ".Lputline_copy:",
+        "ldrb w4, [x5], #1",
+        "strb w4, [x9], #1",
+        "add x6, sp, #192",
+        "cmp x5, x6",
+        "b.lo .Lputline_copy",
+        ".Lputline_suffix:",
+        "ldrb w4, [x3], #1",
+        "cbz w4, .Lputline_out",
+        "strb w4, [x9], #1",
+        "b .Lputline_suffix",
+        ".Lputline_out:",
+        "mov x0, sp",                // ptr
+        "sub x1, x9, x0",            // length
         "mov x8, #19",               // Syscall::DebugWrite
         "svc #0",
-        "add sp, sp, #32",
+        "add sp, sp, #192",
         "ret",
 
         "8:",

@@ -394,11 +394,19 @@ extern "C" fn main() -> ! {
     let mut goodbyes = 0;
     let mut commits = 0u32;
     let mut pixels_drawn = 0usize;
-    // A malformed message must not become an infinite loop: `Recv` returns at once
-    // when a sender is queued, so a server that only `continue`s on rubbish spins
-    // as fast as the endpoint can feed it. Bound it.
+    // Refusals are counted for the report and **not** as a reason to stop.
+    //
+    // They used to bound the loop, from a version where a malformed message was
+    // answered with `continue` and nothing else: `Recv` returns at once when a
+    // sender is queued, so such a server spins as fast as the endpoint can feed it.
+    // Every path replies now, and a client waiting for a reply is a client that
+    // cannot flood — so the bound stopped protecting anything and started being a
+    // hazard. A well-behaved client that makes eight mistakes is normal; a display
+    // server that quits over them takes every other window down with it. This was
+    // found by writing a client that exercises the refusals on purpose and getting
+    // five of the eight in one run.
     let mut rejected = 0;
-    while goodbyes < CLIENTS_EXPECTED && rejected < 8 {
+    while goodbyes < CLIENTS_EXPECTED {
         let Some(client) = next_client(arrivals) else {
             puts("[displaysrv] woken with nothing queued\n");
             break;
