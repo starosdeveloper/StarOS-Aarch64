@@ -93,9 +93,12 @@ ssize_t write(int fd, const void *buf, size_t count);
  * given, and the only way to know it compiles is to compile it. */
 #include <staros.h>
 
-/* The capabilities the kernel installs for a file-server client, in order. */
+/* The capabilities the kernel installs for this program, in order: a file server's
+ * request/reply pair, then the display server's. */
 #define EP_REQUEST 1u
 #define EP_REPLY 2u
+#define EP_DISPLAY 3u
+#define EP_DISPLAY_REPLY 4u
 /* Two tags of the file protocol, borrowed here because a refusal needs no shared
  * buffer and is therefore the smallest request that provokes a real reply. */
 #define TAG_ERROR 0u
@@ -1439,6 +1442,132 @@ static void check_shared(void)
            (unsigned long)(bytes / 1024), (void *)pixels, (void *)other);
 }
 
+/* A window, from C.
+ *
+ * Everything a QPA plugin does, minus Qt: ask the screen its size, allocate pixels
+ * the display server can read, delegate them, commit a damage rectangle, and take
+ * the answer. Until now the only thing that had ever drawn was `fbclient`'s
+ * hand-written assembly inside the init image, which proves the protocol works and
+ * proves nothing about whether it can be *called* from the language the plugin is
+ * written in.
+ *
+ * Blocking send-then-receive, deliberately. An event loop would poll first, and
+ * this program has one — `check_endpoint` proves it. What is being proved here is
+ * the protocol, and a round trip that waits is the shortest way to say it. */
+static int display_send(int fd, int reply_fd, struct staros_message *msg)
+{
+    if (staros_msg_send(fd, msg) != 0)
+        return 0;
+    /* Wait with a bound, not for ever. A capability to talk to the display server
+     * is installed whether or not this machine has a screen — the kernel does not
+     * know what QEMU was started with — so a program that blocked in `recv` would
+     * hang on every machine without a framebuffer and would call it a deadlock.
+     * This is what the event loop is *for*: ask whether an answer is there. */
+    struct pollfd wait_reply = { reply_fd, POLLIN, 0 };
+    if (poll(&wait_reply, 1, 2000) != 1)
+        return 0;
+    return staros_msg_recv(reply_fd, msg) == 0;
+}
+
+static int display_call(int fd, int reply_fd, struct staros_message *msg)
+{
+    return display_send(fd, reply_fd, msg) && msg->tag == STAROS_DISPLAY_OK;
+}
+
+static void check_display(void)
+{
+    struct staros_message msg;
+
+    int display = staros_endpoint_fd(EP_DISPLAY);
+    check(display >= 0, "a descriptor for the display server");
+    int reply = staros_endpoint_fd(EP_DISPLAY_REPLY);
+    check(reply >= 0, "a descriptor for its replies");
+
+    /* The screen first, the way a plugin must: a buffer cannot be sized before its
+     * geometry is known, and this is the one thing a client cannot work out. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_SCREEN;
+    if (!display_call(display, reply, &msg)) {
+        /* No screen on this machine, which is a fact about the machine and not a
+         * failure of this program. Saying so beats both a hang and a passing
+         * silence: a plugin will meet the same answer on a headless board. */
+        close(display);
+        close(reply);
+        puts("[hello-c] window: no display server on this machine; nothing asked for a screen");
+        return;
+    }
+    unsigned long width = (unsigned long)msg.words[0];
+    unsigned long height = (unsigned long)msg.words[1];
+    check(width > 0 && height > 0, "the screen has a size");
+    check(msg.words[2] == 32, "32 bits per pixel");
+    check(msg.words[3] == STAROS_FORMAT_XRGB8888, "xRGB8888, as the header says");
+
+    /* A 32x32 green surface, placed clear of the two the assembly client draws so
+     * the screenshot can tell all three apart. */
+    const unsigned long side = 32;
+    const size_t bytes = side * side * 4;
+    unsigned int cap = staros_shared_create(bytes);
+    check(cap != 0, "pixels for a window");
+    unsigned int *pixels = (unsigned int *)staros_shared_map(cap);
+    check(pixels != 0, "and they mapped");
+    for (size_t i = 0; i < bytes / 4; i++)
+        pixels[i] = 0x0000FF00u;
+
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_CREATE;
+    msg.words[0] = side;
+    msg.words[1] = side;
+    msg.words[2] = 300;
+    msg.words[3] = 300;
+    msg.cap = cap;
+    check(display_call(display, reply, &msg), "the server took the surface");
+    unsigned long long surface = msg.words[0];
+    check(surface != 0, "and named it");
+
+    /* Commit it whole. The reply is the count of pixels that reached the screen,
+     * so a server that quietly repainted something else fails here and not later,
+     * in a screenshot nobody looks at until the end. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_COMMIT;
+    msg.words[0] = surface;
+    msg.words[2] = side | (side << 32);
+    check(display_call(display, reply, &msg), "the commit was accepted");
+    check(msg.words[0] == side * side, "every pixel of the surface reached the screen");
+
+    /* Damage smaller than the surface must repaint less than the surface. This is
+     * the number `flush()` will be judged by: if it equals the window's area rather
+     * than the damage rectangle's, the plugin is copying whole frames and 1080p is
+     * 8 MB of them. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_COMMIT;
+    msg.words[0] = surface;
+    msg.words[2] = 4u | (4ull << 32);
+    check(display_call(display, reply, &msg), "a partial commit was accepted");
+    check(msg.words[0] == 16, "and repainted 16 pixels, not 1024");
+
+    /* Refusals name themselves. A client that cannot tell "refused" from "did
+     * nothing" will one day show a blank window and call it a slow frame. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_COMMIT;
+    msg.words[0] = 4242; /* a surface the server never created */
+    msg.words[2] = 1u | (1ull << 32);
+    staros_msg_send(display, &msg);
+    staros_msg_recv(reply, &msg);
+    check(msg.tag == STAROS_DISPLAY_ERROR, "a made-up surface is refused");
+    check(msg.words[0] == STAROS_DISPLAY_ERR_NO_SURFACE, "and the refusal says which");
+
+    /* Say goodbye, so the server ends its loop rather than being killed inside it.
+     * A server that only stops by dying has never proved it can stop. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_BYE;
+    check(display_call(display, reply, &msg), "goodbye acknowledged");
+
+    close(display);
+    close(reply);
+    printf("[hello-c] window: a %lux%lu surface on a %lux%lu screen, from C through staros.h\n",
+           side, side, width, height);
+}
+
 int main(void)
 {
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
@@ -1460,6 +1589,7 @@ int main(void)
     check_poll();
     check_endpoint();
     check_shared();
+    check_display();
 
     if (failures == 0)
         puts("[hello-c] C RUNTIME OK - every check passed");

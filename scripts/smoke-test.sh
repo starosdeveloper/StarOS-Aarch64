@@ -399,12 +399,18 @@ req "framebuffer: ramfb 640x480 online"
 req "framebuffer: handed to displaysrv"
 req "[displaysrv] the screen is mine"
 req "[displaysrv] composited client surfaces onto a screen no client can touch"
-# The window-system half: two overlapping surfaces from one client, restacked, and
-# a commit that repainted only the rectangle it named. The tally is exact — two
-# full commits and a raise at 4096 pixels each, plus 64 for the 8x8 damage — so a
-# server quietly repainting whole surfaces on every commit fails this line rather
-# than merely being slow.
-req "[displaysrv] 2 surface(s) live, 3 commit(s), 12352 pixel(s) composited, 0 refused"
+# The window-system half: three surfaces from two clients, two of them overlapping
+# and restacked, and commits that repainted only the rectangles they named. The
+# tally is exact — two full 64x64 commits and a raise at 4096 pixels each, 64 for
+# the 8x8 damage, then the C program's 1024 and 16 — so a server quietly repainting
+# whole surfaces on every commit fails this line rather than merely being slow. The
+# one refusal is the made-up surface id the C program sends on purpose.
+req "[displaysrv] 3 surface(s) live, 5 commit(s), 13392 pixel(s) composited, 1 refused"
+# And that a second *process* was served: the C program's window, drawn through the
+# same header a platform plugin is given. Two clients on one server is where a
+# shared reply endpoint shows itself — as one of them hanging on an answer the
+# other took — so this line is also the routing assertion.
+req "[hello-c] window: a 32x32 surface on a 640x480 screen, from C through staros.h"
 req "[fbclient] asked the screen its size (640x480 xRGB8888)"
 forbid "[fbclient] SURFACE WRONG"
 forbid "SURFACE WRONG"

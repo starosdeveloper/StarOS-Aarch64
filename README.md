@@ -182,8 +182,6 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [inputsrv] virtio-input driver up in EL0: queue armed, waiting for the device
 [devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
 [devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
-[displaysrv] composited client surfaces onto a screen no client can touch
-[displaysrv] 2 surface(s) live, 3 commit(s), 12352 pixel(s) composited, 0 refused
 [fbclient] asked the screen its size (640x480 xRGB8888), then had two 64x64 surfaces composited - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096
 [fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
 [hello-c] clock: 407402608 ns across a 20 ms nanosleep
@@ -220,18 +218,21 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
 [hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 20990848 ns
-[hello-c] endpoint in poll: a message from another process woke the loop in 1996928 ns
+[hello-c] endpoint in poll: a message from another process woke the loop in 1072240 ns
 [hello-c] shared buffers: 16 KiB of surface, mapped at 0x500001000 and 0x500005000
+[displaysrv] composited client surfaces onto a screen no client can touch
+[displaysrv] 3 surface(s) live, 5 commit(s), 13392 pixel(s) composited, 1 refused
+[hello-c] window: a 32x32 surface on a 640x480 screen, from C through staros.h
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 73 requests, 157 bytes of file data, and refused 11 - the archive never left this address space
-clock: the demo took 6677 ms on the monotonic clock, during which core 0 took 64 tick(s)
-sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 12957 us
-scheduler: all tasks finished after 64 timer ticks; task table grew to 35 (old fixed max 8)
+clock: the demo took 6310 ms on the monotonic clock, during which core 0 took 61 tick(s)
+sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 12293 us
+scheduler: all tasks finished after 61 timer ticks; task table grew to 35 (old fixed max 8)
 task teardown: reaped 32 dead-task kernel stacks (1024 KiB returned to the heap)
 user stacks: 41 page(s) mapped on demand (164 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=64
+preemption: timer ticks per core — cpu0=61
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x4032e000 (exited client's root was 0x4031f000)
+frame reclaim: post-teardown alloc 0x40331000 (exited client's root was 0x40322000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
   (3 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
 shutting down (PSCI SYSTEM_OFF)

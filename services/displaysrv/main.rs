@@ -81,12 +81,27 @@ const SYS_RECV: usize = 2;
 const SYS_EXIT: usize = 4;
 const SYS_MAP_SHARED: usize = 15;
 const SYS_DEBUG_WRITE: usize = 19;
+const SYS_NOTIFY_CREATE: usize = 22;
+const SYS_WAIT_ANY: usize = 24;
 const SYS_SHARED_PAGES: usize = 28;
+const SYS_ENDPOINT_BIND: usize = 30;
+const SYS_ENDPOINT_PENDING: usize = 31;
 
-/// Our capability table, as the kernel granted it: receive on the client endpoint,
-/// reply on the other.
-const EP_REQUEST: u64 = 1;
-const EP_REPLY: u64 = 2;
+/// Our capability table, as the kernel granted it: request/reply pairs, one per
+/// client, so handle 1 is answered on handle 2 and handle 3 on handle 4.
+///
+/// A reply endpoint per client rather than one shared by all of them is not
+/// bookkeeping. Two clients receiving on one endpoint means either may take the
+/// other's answer, and the symptom is a program acting on the reply to a question
+/// it never asked — which looks like a rendering bug in whichever of them noticed
+/// first.
+const MAX_CLIENTS: usize = 2;
+fn request_handle(client: usize) -> u64 {
+    (client * 2 + 1) as u64
+}
+fn reply_handle(client: usize) -> u64 {
+    (client * 2 + 2) as u64
+}
 
 // Request tags.
 const TAG_CREATE: u64 = 1;
@@ -136,7 +151,7 @@ const BACKGROUND: u32 = 0x0010_2030;
 /// runs until the machine stops; this one has to end so the demo can print its
 /// tallies, and ending on a message rather than a commit count is what makes it a
 /// server loop instead of a script.
-const CLIENTS_EXPECTED: u32 = 1;
+const CLIENTS_EXPECTED: u32 = MAX_CLIENTS as u32;
 
 /// A message, laid out exactly as `staros_ipc::Message`: tag, `MESSAGE_WORDS`
 /// words, then the capability handle. Four words, not six — getting that wrong
@@ -354,6 +369,28 @@ extern "C" fn main() -> ! {
     compositor.composite(&mut screen, whole);
     puts("[displaysrv] the screen is mine: kernel output stopped, pixels are a process's now\n");
 
+    // One notification, both request endpoints bound to it. `Recv` blocks on one
+    // endpoint, which is a server with one client; the whole reason `EndpointBind`
+    // exists is that a server with two cannot be written any other way without a
+    // thread per client, parked in `Recv`, forwarding messages for the sole purpose
+    // of changing which primitive the wait is spelled with.
+    // SAFETY: `NotifyCreate` takes no arguments and installs a capability of ours.
+    let arrivals = unsafe { syscall1(SYS_NOTIFY_CREATE, 0) };
+    if arrivals <= 0 {
+        puts("[displaysrv] no notification to wait on\n");
+        exit();
+    }
+    let arrivals = arrivals as u64;
+    for client in 0..MAX_CLIENTS {
+        // SAFETY: both handles are ours; the request one carries receive rights,
+        // which is what the kernel requires here.
+        let rc = unsafe { syscall2(SYS_ENDPOINT_BIND, request_handle(client), arrivals) };
+        if rc < 0 {
+            puts("[displaysrv] a client endpoint would not bind\n");
+            exit();
+        }
+    }
+
     let mut goodbyes = 0;
     let mut commits = 0u32;
     let mut pixels_drawn = 0usize;
@@ -362,23 +399,31 @@ extern "C" fn main() -> ! {
     // as fast as the endpoint can feed it. Bound it.
     let mut rejected = 0;
     while goodbyes < CLIENTS_EXPECTED && rejected < 8 {
+        let Some(client) = next_client(arrivals) else {
+            puts("[displaysrv] woken with nothing queued\n");
+            break;
+        };
         let mut msg = Message::new();
-        // SAFETY: `Recv` writes one `Message` through this pointer and blocks until
-        // a client sends one.
-        let rc = unsafe { syscall2(SYS_RECV, EP_REQUEST, core::ptr::addr_of_mut!(msg) as u64) };
+        // SAFETY: `Recv` writes one `Message` through this pointer. A message is
+        // queued at this endpoint — that is what `next_client` established — so
+        // this cannot park us on an endpoint the other client is feeding.
+        let rc = unsafe {
+            syscall2(SYS_RECV, request_handle(client), core::ptr::addr_of_mut!(msg) as u64)
+        };
         if rc < 0 {
             puts("[displaysrv] receive failed\n");
             break;
         }
         if msg.tag == TAG_BYE {
             goodbyes += 1;
-            reply(TAG_OK, 0);
+            reply(client, TAG_OK, 0);
             continue;
         }
         // Answered here rather than through `outcome` below because it is the one
         // request whose answer does not fit in a single word.
         if msg.tag == TAG_SCREEN {
             reply_words(
+                client,
                 TAG_OK,
                 [
                     screen.width as u64,
@@ -403,11 +448,11 @@ extern "C" fn main() -> ! {
                     commits += 1;
                 }
                 pixels_drawn += if msg.tag == TAG_CREATE { 0 } else { result as usize };
-                reply(TAG_OK, result);
+                reply(client, TAG_OK, result);
             }
             Err(reason) => {
                 rejected += 1;
-                reply(TAG_ERROR, reason);
+                reply(client, TAG_ERROR, reason);
             }
         }
     }
@@ -502,18 +547,54 @@ fn high(word: u64) -> usize {
 
 /// Answer the client. A reply always goes out, refusals included: a client blocked
 /// waiting for one it will never get is a hang whose cause is three messages back.
-fn reply(tag: u64, result: u64) {
-    reply_words(tag, [result, 0, 0, 0]);
+fn reply(client: usize, tag: u64, result: u64) {
+    reply_words(client, tag, [result, 0, 0, 0]);
 }
 
 /// Answer with all four words, for the requests whose answer needs them.
-fn reply_words(tag: u64, words: [u64; 4]) {
+fn reply_words(client: usize, tag: u64, words: [u64; 4]) {
     let mut msg = Message::new();
     msg.tag = tag;
     msg.words = words;
-    // SAFETY: `Send` reads one `Message` through this pointer.
+    // SAFETY: `Send` reads one `Message` through this pointer, to the endpoint
+    // paired with the one the request came from.
     unsafe {
-        let _ = syscall2(SYS_SEND, EP_REPLY, core::ptr::addr_of!(msg) as u64);
+        let _ = syscall2(SYS_SEND, reply_handle(client), core::ptr::addr_of!(msg) as u64);
+    }
+}
+
+/// Wait until some client has a message queued, and return which.
+///
+/// The notification says *something* arrived, never what: `WaitAny` consumes the
+/// signal it reports, so treating it as a per-endpoint readiness would mean
+/// remembering a bit — and a remembered readiness is how a server comes to pick an
+/// endpoint that has nothing and block there while the other client waits for an
+/// answer. So the notification only ends the sleep, and the queues are asked
+/// afresh, in order, every time round.
+///
+/// Scanning from client zero every time is deliberately unfair: with two clients
+/// and a demo that ends, starving one would show up as a hang rather than as a
+/// slow window, which is the failure worth having. Real fairness is a scheduler
+/// question and belongs with the phase that has frames to be late for.
+fn next_client(arrivals: u64) -> Option<usize> {
+    loop {
+        for client in 0..MAX_CLIENTS {
+            // SAFETY: `EndpointPending` only reads the queue length of a handle we
+            // hold with receive rights.
+            let pending = unsafe { syscall1(SYS_ENDPOINT_PENDING, request_handle(client)) };
+            if pending > 0 {
+                return Some(client);
+            }
+        }
+        let handles = [arrivals as u32];
+        // SAFETY: `WaitAny` reads one handle from this array and parks with no
+        // deadline; the array outlives the call.
+        let rc = unsafe {
+            syscall3(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, 0)
+        };
+        if rc < 0 {
+            return None;
+        }
     }
 }
 
@@ -610,6 +691,26 @@ unsafe fn syscall2(number: usize, a0: u64, a1: u64) -> isize {
     // SAFETY: as `syscall1`, with a second argument in x1.
     unsafe {
         asm!("svc #0", in("x8") number, inout("x0") a0 => ret, in("x1") a1, options(nostack));
+    }
+    ret
+}
+
+/// A three-argument syscall. Only `WaitAny` needs the third register.
+///
+/// # Safety
+/// As [`syscall1`].
+unsafe fn syscall3(number: usize, a0: u64, a1: u64, a2: u64) -> isize {
+    let ret;
+    // SAFETY: as `syscall2`, with a third argument in x2.
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") number,
+            inout("x0") a0 => ret,
+            in("x1") a1,
+            in("x2") a2,
+            options(nostack),
+        );
     }
     ret
 }

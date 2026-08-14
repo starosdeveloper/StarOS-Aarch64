@@ -1262,6 +1262,12 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // input holds receive rights, and `staros_endpoint_fd` turns the second half
     // into a descriptor `poll` can wait on beside every other source.
     let ep_events = obj::create(obj::Object::Endpoint { id: 12 }).expect("ep_events object");
+    // The display server's second client. Its own request *and* reply endpoint: the
+    // reply must not be shared, or either client may take the other's answer, and
+    // the request is separate so the server can tell whose it was without a client
+    // id in the message that a client could get wrong.
+    let ep_fb2 = obj::create(obj::Object::Endpoint { id: 13 }).expect("ep_fb2 object");
+    let ep_fb2_reply = obj::create(obj::Object::Endpoint { id: 14 }).expect("ep_fb2_reply object");
     let ep_fs2 = obj::create(obj::Object::Endpoint { id: 10 }).expect("ep_fs2 object");
     let ep_fs2_reply = obj::create(obj::Object::Endpoint { id: 11 }).expect("ep_fs2_reply object");
 
@@ -1365,8 +1371,14 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
             Some(s)
         })?;
         let mut caps = cap::empty_caps()?;
+        // Two clients, four handles, in request/reply pairs: the server indexes
+        // them, so handle 1 answers on handle 2 and handle 3 on handle 4. The
+        // pairing is the ABI, and it is what lets the server route an answer
+        // without a client id in the message that a client could get wrong.
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb, send: false, recv: true });
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb_reply, send: true, recv: false });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb2, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb2_reply, send: true, recv: false });
 
         // Its client: an ordinary `init` role with no privilege at all beyond the
         // two endpoint capabilities. It cannot reach the screen; it can only ask.
@@ -1468,7 +1480,19 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         );
         None
     } else {
-        file_pair(HELLO_C_IMAGE, 18, 19, ep_fs2, ep_fs2_reply)
+        file_pair(HELLO_C_IMAGE, 18, 19, ep_fs2, ep_fs2_reply).map(|(server, mut client)| {
+            // Handles 3 and 4: the display server's second client. This is what a
+            // platform plugin will hold, so a C program reaching the screen through
+            // `staros.h` is the plugin's whole path minus Qt — and the piece that
+            // could not be tested at all while `fbclient`'s hand-written assembly
+            // was the only thing that had ever drawn.
+            cap::install(&mut client.1, cap::Cap::Endpoint { obj: ep_fb2, send: true, recv: false });
+            cap::install(
+                &mut client.1,
+                cap::Cap::Endpoint { obj: ep_fb2_reply, send: false, recv: true },
+            );
+            (server, client)
+        })
     };
 
     // The C++ program. It holds **no capabilities at all**: everything it does —

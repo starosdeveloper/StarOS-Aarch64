@@ -15,6 +15,10 @@ What this asserts, at named coordinates, is the claim the phase makes:
   * *in the overlap* the pixels are red, because the client raised the red surface
     after both were committed. Blue there means the stack order lives in the
     server's list and not on the screen;
+  * a 32x32 green surface at (300, 300) belongs to a *different process* — the C
+    program, drawing through the same header a platform plugin is given. Two
+    clients on one server is where a shared reply endpoint shows itself, as one of
+    them hanging on an answer the other took;
   * around them is the display server's background, which only the server draws;
   * the kernel's green console text is *gone* from the region the server owns —
     a kernel that kept mirroring would be writing over the composited frame.
@@ -33,10 +37,13 @@ import time
 # fbclient role in init's image.rs).
 SURFACE = (0xFF, 0x00, 0x00)  # the client's red square, raised to the top
 SECOND = (0x00, 0x00, 0xFF)  # its blue square, underneath and offset
+THIRD = (0x00, 0xFF, 0x00)  # the C program's green square, a second client
 BACKGROUND = (0x10, 0x20, 0x30)  # the server's background
 SURFACE_AT = (100, 80)
 SECOND_AT = (140, 110)
+THIRD_AT = (300, 300)
 SURFACE_SIZE = 64
+THIRD_SIZE = 32
 
 
 def parse_ppm(path):
@@ -114,6 +121,18 @@ def check(path):
         if not near(at(x, y), BACKGROUND):
             return (False, f"pixel ({x},{y}) beside the second surface is {at(x, y)}, not the background")
 
+    # The third surface belongs to a *different process* — the C program, through
+    # the same header a platform plugin is given. Two clients on one server is where
+    # a shared reply endpoint would have shown itself, as one of them hanging.
+    tx, ty = THIRD_AT
+    t = THIRD_SIZE
+    for x, y in [(tx + 1, ty + 1), (tx + t - 2, ty + t - 2), (tx + t // 2, ty + t // 2)]:
+        if not near(at(x, y), THIRD):
+            return (False, f"third-surface pixel ({x},{y}) is {at(x, y)}, not green")
+    for x, y in [(tx - 2, ty + t // 2), (tx + t + 2, ty + t // 2)]:
+        if not near(at(x, y), BACKGROUND):
+            return (False, f"pixel ({x},{y}) beside the third surface is {at(x, y)}, not the background")
+
     # And the server's background must cover the area the kernel's console used to
     # write in. Green text there means the kernel never stopped mirroring.
     greens = sum(1 for x in range(0, w, 4) for y in range(0, 40, 4) if at(x, y)[1] > 80)
@@ -121,8 +140,9 @@ def check(path):
         return (False, f"{greens} green console pixels remain in the top rows")
     return (
         True,
-        f"{w}x{h}: surfaces at {SURFACE_AT} and {SECOND_AT}, the raised one on top "
-        "in the overlap, background around them, no console text",
+        f"{w}x{h}: surfaces at {SURFACE_AT} and {SECOND_AT} from one client and "
+        f"{THIRD_AT} from another, the raised one on top in the overlap, background "
+        "around them, no console text",
     )
 
 
