@@ -125,7 +125,12 @@ extern "C" fn main() -> ! {
     let mmio = mmio as u64;
 
     // SAFETY: the page is Device memory mapped read/write for us.
-    let (magic, version, device_id) = unsafe {
+    // The version register is read and not checked: this driver speaks the legacy
+    // transport, and a device announcing the modern one would fail at the queue
+    // registers, which have moved. Reading it keeps the register map honest — the
+    // offsets are asserted by the crate's tests — without pretending to a check
+    // that is not made.
+    let (magic, _version, device_id) = unsafe {
         (
             read32(mmio, reg::MAGIC),
             read32(mmio, reg::VERSION),

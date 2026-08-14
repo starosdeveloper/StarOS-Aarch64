@@ -602,7 +602,7 @@ fn next_client(arrivals: u64) -> Option<usize> {
 fn report(surfaces: usize, commits: u32, pixels: usize, rejected: u32) {
     let mut line = [0u8; 160];
     let mut n = 0;
-    let mut put = |bytes: &[u8], line: &mut [u8; 160], n: &mut usize| {
+    let put = |bytes: &[u8], line: &mut [u8; 160], n: &mut usize| {
         for &b in bytes {
             if *n < line.len() {
                 line[*n] = b;

@@ -1568,6 +1568,103 @@ static void check_display(void)
            side, side, width, height);
 }
 
+/* The system font, read the way FreeType will read it.
+ *
+ * `QFreeTypeFontDatabase` opens a file by path and reads it whole. Every layer
+ * under that is already proved separately — the file server owns the archive, the
+ * bounce buffer is 4 KiB, `FILE*` buffers a page at a time — and none of those
+ * proofs is about a 130 KB binary. A text file fits in one buffer and hides every
+ * bug that only appears on the thirty-third refill.
+ *
+ * What is checked is the whole file, not that it opened: the TrueType magic at the
+ * start, a byte in the middle at an offset only a correct chunk sequence reaches,
+ * the size, and that reading past the end stops rather than repeating. A font
+ * loader given a file with one wrong page does not fail — it draws wrong glyphs. */
+static void check_font(void)
+{
+    const char *path = "fonts/IBMPlexMono-Regular.ttf";
+    FILE *font = fopen(path, "rb");
+    if (!font) {
+        /* The matrix builds an archive without the font when the host has not got
+         * it. Saying so beats a failure that blames the file server. */
+        puts("[hello-c] font: no system font in this initramfs");
+        return;
+    }
+
+    /* TrueType outlines: version 1.0 as four big-endian bytes. A file that opened
+     * but is not a font is the failure a path typo produces, and it is worth
+     * telling apart from a file that would not open at all. */
+    unsigned char head[4];
+    check(fread(head, 1, 4, font) == 4, "the font's first four bytes");
+    check(head[0] == 0x00 && head[1] == 0x01 && head[2] == 0x00 && head[3] == 0x00,
+          "and they are a TrueType version tag");
+    check(fseek(font, 0, SEEK_SET) == 0, "back to the start to read it whole");
+
+    /* Read the whole thing in 512-byte bites, which is neither the bounce buffer's
+     * size nor the stream's, so every boundary in the stack falls somewhere
+     * different. The checksum is the point: a chunk delivered twice, or a page of
+     * zeroes where a refill went wrong, changes it. */
+    unsigned char chunk[512];
+    size_t total = 0;
+    unsigned long sum = 0;
+    for (;;) {
+        size_t got = fread(chunk, 1, sizeof chunk, font);
+        if (got == 0)
+            break;
+        for (size_t i = 0; i < got; i++)
+            sum = sum * 31 + chunk[i];
+        total += got;
+    }
+    check(feof(font), "the read stopped at end of file, not at an error");
+    check(total == 133796, "the whole font arrived, byte for byte");
+
+    /* And the file server agrees about the size it just served. Two answers from
+     * two paths — the stat and the read — because a server that truncated would
+     * otherwise agree with itself. */
+    struct stat st;
+    check(stat(path, &st) == 0, "stat the font");
+    check((size_t)st.st_size == total, "and the size matches what was read");
+
+    /* Seek back and re-read one byte deep inside, at an offset no single buffer
+     * reaches. If the stream's position arithmetic is wrong this is where it
+     * shows, and not at the start where everything agrees. */
+    check(fseek(font, 100000, SEEK_SET) == 0, "seek deep into the font");
+    int deep = fgetc(font);
+    check(deep != -1, "and a byte is there");
+    check(ftell(font) == 100001, "the position followed the read");
+
+    /* Now the same file again, in one `read` of the whole 133 KB straight into one
+     * buffer — the descriptor, not the stream.
+     *
+     * That distinction is the point, and it took a falsification that *failed* to
+     * find it. Breaking the descriptor's chunk loop on purpose changed nothing
+     * above, because a `FILE*` refills 4096 bytes at a time and the bounce buffer is
+     * a page: the loop never had to run twice. Nothing in this system had ever asked
+     * a descriptor for more than one page at once. Here one request is thirty-three
+     * pages, so the loop runs, and a bug in it stops being invisible.
+     *
+     * This is also what FreeType does with a font it has decided to keep. */
+    int raw = open(path, 0, 0);
+    check(raw >= 0, "the font again, as a plain descriptor");
+    unsigned char *whole = malloc(total);
+    check(whole != 0, "a buffer for the whole font");
+    if (raw >= 0 && whole) {
+        ssize_t once = read(raw, whole, total);
+        check(once == (ssize_t)total, "the whole font in a single read of 33 pages");
+        unsigned long again = 0;
+        for (ssize_t i = 0; i < once && i >= 0; i++)
+            again = again * 31 + whole[i];
+        check(again == sum, "and byte for byte the same as reading it in pieces");
+        free(whole);
+    }
+    if (raw >= 0)
+        close(raw);
+
+    fclose(font);
+    printf("[hello-c] font: read %lu bytes of IBM Plex Mono through fssrv, checksum %lu\n",
+           (unsigned long)total, sum);
+}
+
 int main(void)
 {
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
@@ -1590,6 +1687,7 @@ int main(void)
     check_endpoint();
     check_shared();
     check_display();
+    check_font();
 
     if (failures == 0)
         puts("[hello-c] C RUNTIME OK - every check passed");

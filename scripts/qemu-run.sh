@@ -17,6 +17,11 @@ set -euo pipefail
 elf="$1"
 shift
 
+# This script's own directory, so the paths below do not depend on where `cargo`
+# was run from — the runner is invoked with the workspace as its cwd today and
+# that is not something to rely on.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # llvm-objcopy ships with the Rust toolchain, so there is no extra dependency to
 # install; fall back to a cross binutils if someone has one.
 objcopy="$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-objcopy 2>/dev/null | head -1 || true)"
@@ -54,9 +59,27 @@ if command -v cpio >/dev/null 2>&1 && [ -n "$init_elf" ]; then
     mkdir -p "$irdir/docs/deep"
     printf 'read me\n' >"$irdir/docs/readme.txt"
     printf 'down here\n' >"$irdir/docs/deep/note.txt"
+    # The system font. Qt's `QFreeTypeFontDatabase` opens files by path, and this is
+    # where they will be — so it is put here now, and read now, rather than becoming
+    # the first thing that fails during a Qt build for a reason nobody can see.
+    #
+    # All fourteen weights and not just the four a toolkit resolves by default: a
+    # QML `font.weight: Font.Light` that finds nothing does not fail, it silently
+    # picks the nearest match, and a UI drawn in the wrong weight looks like a
+    # rendering bug. Two megabytes against 124 usable, and the archive is excluded
+    # from the frame pool either way.
+    fonts="$here/../../IBM_Plex_Mono"
+    font_members=""
+    if [ -d "$fonts" ]; then
+        mkdir -p "$irdir/fonts"
+        cp "$fonts"/*.ttf "$fonts/OFL.txt" "$irdir/fonts/" 2>/dev/null || true
+        # The licence travels with the font, which the SIL OFL requires and which is
+        # also the only way anyone reading the archive can tell where it came from.
+        font_members="$(cd "$irdir" && ls fonts/* 2>/dev/null || true)"
+    fi
     initrd="${elf}.initrd.cpio"
     ( cd "$irdir" && printf '%s\n' greeting.txt version init.elf \
-        docs/readme.txt docs/deep/note.txt |
+        docs/readme.txt docs/deep/note.txt $font_members |
         cpio -o -H newc --reproducible 2>/dev/null ) >"$initrd"
 fi
 

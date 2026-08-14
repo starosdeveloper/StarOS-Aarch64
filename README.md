@@ -159,12 +159,12 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [devicemgr] delegated UART device+irq to the driver and a device to the server
 [devicemgr] found a virtio-input device at a003e00 intid 79 and delegated it to the input driver
 [devicemgr] no IOMMU on this machine; DMA capability stands but is unenforced
-[devicemgr] unpacked the initramfs in user space: 5 files, no storage driver
+[devicemgr] unpacked the initramfs in user space: 20 files, no storage driver
 [devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
 [displaysrv] the screen is mine: kernel output stopped, pixels are a process's now
-[fssrv] the files are mine: 5 of them, served over IPC to processes that hold no archive
+[fssrv] the files are mine: 20 of them, served over IPC to processes that hold no archive
 [fsclient] two endpoint capabilities and one page of my own memory - no archive, no device
-[fssrv] the files are mine: 5 of them, served over IPC to processes that hold no archive
+[fssrv] the files are mine: 20 of them, served over IPC to processes that hold no archive
 [hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight
 [hello-c] math: sin(1e15)=0.858273, pow(1.0000001,1e7)=2.718282, hypot(3,4)=5.0
 [hello-c] mmap: 12305 bytes mapped and returned, 16384 retained by the kernel
@@ -224,16 +224,17 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [displaysrv] composited client surfaces onto a screen no client can touch
 [displaysrv] 3 surface(s) live, 5 commit(s), 13392 pixel(s) composited, 1 refused
 [hello-c] window: a 32x32 surface on a 640x480 screen, from C through staros.h
+[hello-c] font: read 133796 bytes of IBM Plex Mono through fssrv, checksum 6016661948058288260
 [hello-c] C RUNTIME OK - every check passed
-[fssrv] served 73 requests, 157 bytes of file data, and refused 11 - the archive never left this address space
-clock: the demo took 3197 ms on the monotonic clock, during which core 0 took 39 tick(s)
-sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 6085 us
-scheduler: all tasks finished after 39 timer ticks; task table grew to 35 (old fixed max 8)
+[fssrv] served 239 requests, 275941 bytes of file data, and refused 11 - the archive never left this address space
+clock: the demo took 5598 ms on the monotonic clock, during which core 0 took 56 tick(s)
+sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 12150 us
+scheduler: all tasks finished after 56 timer ticks; task table grew to 35 (old fixed max 8)
 task teardown: reaped 32 dead-task kernel stacks (1024 KiB returned to the heap)
 user stacks: 41 page(s) mapped on demand (164 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=39
+preemption: timer ticks per core — cpu0=56
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x40332000 (exited client's root was 0x40323000)
+frame reclaim: post-teardown alloc 0x40333000 (exited client's root was 0x40324000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
   (3 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
 shutting down (PSCI SYSTEM_OFF)

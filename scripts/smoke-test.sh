@@ -25,6 +25,7 @@ QUICK=0
 [ "${1:-}" = "--quick" ] && QUICK=1
 
 cd "$(dirname "$0")/.."
+ROOT="$PWD"
 LOGDIR="$(mktemp -d)"
 
 # --- colours (only if stdout is a terminal) ----------------------------------
@@ -75,6 +76,19 @@ if command -v cpio >/dev/null 2>&1; then
     printf 'read me\n'   >"$IRDIR/docs/readme.txt"
     printf 'down here\n' >"$IRDIR/docs/deep/note.txt"
     MEMBERS="greeting.txt version docs/readme.txt docs/deep/note.txt"
+    # The system font, where Qt's font database will look for it. One weight here
+    # rather than all fourteen: the matrix boots seven machines and the archive is
+    # copied into each, while what the assertions need is that a 130 KB binary file
+    # comes back byte for byte through a 4 KB bounce buffer. `cargo krun` ships the
+    # whole family — see qemu-run.sh, and the reason there.
+    FONT="$ROOT/../IBM_Plex_Mono/IBMPlexMono-Regular.ttf"
+    HAVE_FONT=""
+    if [ -f "$FONT" ]; then
+        mkdir -p "$IRDIR/fonts"
+        cp "$FONT" "$IRDIR/fonts/IBMPlexMono-Regular.ttf"
+        MEMBERS="$MEMBERS fonts/IBMPlexMono-Regular.ttf"
+        HAVE_FONT=1
+    fi
     HAVE_PROGRAM=""
     if [ -n "$INIT_ELF" ] && [ -f "$INIT_ELF" ]; then
         cp "$INIT_ELF" "$IRDIR/init.elf"
@@ -299,6 +313,15 @@ if [ -n "$INITRAMFS" ]; then
     # this line is one where a stream that forgot to subtract its read-ahead gets a
     # different answer.
     req "[hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell"
+    # The system font, read the way FreeType will read it: 133796 bytes through a
+    # 4 KiB bounce buffer, twice — once in 512-byte bites through FILE*, once as a
+    # single 33-page read of the descriptor — and the two agree byte for byte. The
+    # checksum is in the line, so a page delivered twice or a refill that came back
+    # zeroed changes it. Everything above reads files that fit in one buffer, which
+    # is why the descriptor's chunk loop had no coverage until this line existed.
+    if [ -n "$HAVE_FONT" ]; then
+        req "[hello-c] font: read 133796 bytes of IBM Plex Mono through fssrv, checksum 6016661948058288260"
+    fi
     # Directories over a flat archive. `docs` has no entry in the CPIO — it exists
     # because `docs/readme.txt` does — and `docs/deep` must be listed once rather
     # than once per file inside it. The counts are the whole claim, so the whole
