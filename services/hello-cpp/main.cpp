@@ -13,9 +13,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <list>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // The header a platform plugin is handed. It has been compiled as C since it was
@@ -201,6 +204,128 @@ int main() {
     std::thread scribe([&built, &words] { built = words.front() + "/" + words.back(); });
     scribe.join();
     check(built.find('/') != std::string::npos, "a thread built a string the main thread reads");
+
+    // ---- the containers whose other half this tree wrote ------------------
+    //
+    // `std::map`, `std::set`, `std::list` and `std::unordered_map` are templates,
+    // but the parts that do not depend on the element type are compiled once and
+    // normally come from libstdc++.a: the red-black tree's rebalancing, the list's
+    // splice, the hash table's bucket growth. Qt uses all four, so
+    // `scripts/cxx-progress.sh` named them and `cxx/runtime.cpp` has them.
+    //
+    // The insertions below are *ascending*, which is the input a naive tree
+    // degrades on and the one a real program supplies — a map of timestamps, of
+    // file names, of ids. A rebalance written the wrong way round still produces a
+    // container that answers correctly; it produces one shaped like a list, so the
+    // check is on the shape as well as the answers.
+    //
+    // Three insertion orders, and the third is not decoration. The rebalance has
+    // two mirror-image halves, and *ascending* keys reach only one of them: every
+    // parent is a right child, so the branch for a parent that is a left child
+    // never runs. Reversing a rotation in that half was falsified and nothing
+    // failed — the test could not see it. Descending keys reach it; the
+    // interleaved order reaches both within one tree, which is where the two
+    // halves have to agree about the same nodes.
+    {
+        std::map<int, std::string> descending;
+        for (int i = 400; i > 0; i--) {
+            descending[i] = std::to_string(i);
+        }
+        check(descending.size() == 400, "four hundred descending keys");
+        int previous_key = 0;
+        for (const auto &entry : descending) {
+            check(entry.first > previous_key, "and they come back ascending");
+            previous_key = entry.first;
+        }
+        check(previous_key == 400, "all the way to the last");
+    }
+    {
+        // Alternating outward from the middle: each insert lands on the opposite
+        // side of the root from the one before, so both halves of the rebalance run
+        // against the same tree.
+        std::map<int, int> zigzag;
+        for (int i = 0; i < 200; i++) {
+            zigzag[200 + i] = i;
+            zigzag[199 - i] = i;
+        }
+        check(zigzag.size() == 400, "four hundred keys inserted outward from the middle");
+        int previous_key = -1;
+        int seen_keys = 0;
+        for (const auto &entry : zigzag) {
+            check(entry.first > previous_key, "and the whole tree is still in order");
+            previous_key = entry.first;
+            seen_keys++;
+        }
+        check(seen_keys == 400 && previous_key == 399, "every one of them, to the last");
+    }
+    {
+        std::map<int, std::string> ordered;
+        for (int i = 0; i < 400; i++) {
+            ordered[i] = std::to_string(i);
+        }
+        check(ordered.size() == 400, "a std::map took four hundred ascending keys");
+        check(ordered[137] == "137", "and gives them back");
+        check(ordered.begin()->first == 0 && ordered.rbegin()->first == 399,
+              "in order, from both ends");
+
+        // Iteration visits every key once and in order. This is what exercises
+        // _Rb_tree_increment, including the step off the maximum onto the header —
+        // the one that returns the wrong node if the header test is missing.
+        int seen = 0;
+        int previous = -1;
+        for (const auto &entry : ordered) {
+            check(entry.first > previous, "keys arrive strictly increasing");
+            previous = entry.first;
+            seen++;
+        }
+        check(seen == 400, "and every one of them arrives");
+
+        // Erase half, alternating, which is the case that makes the delete-side
+        // rebalance run — and erasing the smallest and largest is what moves the
+        // header's own leftmost and rightmost pointers.
+        for (int i = 0; i < 400; i += 2) {
+            ordered.erase(i);
+        }
+        check(ordered.size() == 200, "half of them erased");
+        check(ordered.begin()->first == 1 && ordered.rbegin()->first == 399,
+              "and the ends followed");
+        previous = -1;
+        for (const auto &entry : ordered) {
+            check(entry.first > previous, "what is left is still in order");
+            previous = entry.first;
+        }
+    }
+    {
+        // `std::list`'s splice is the only user of _M_transfer, and a self-splice
+        // is the case that corrupts a list rather than doing nothing.
+        std::list<int> a{1, 2, 3};
+        std::list<int> b{4, 5, 6};
+        a.splice(a.end(), b);
+        check(a.size() == 6 && b.empty(), "splice moved the whole list");
+        check(a.front() == 1 && a.back() == 6, "and kept the order");
+        a.reverse();
+        check(a.front() == 6 && a.back() == 1, "reverse walks it both ways");
+    }
+    {
+        // The hash table, past enough insertions to force several rehashes — which
+        // is what _M_next_bkt and _M_need_rehash decide. Pointer-shaped keys on
+        // purpose: a power-of-two bucket count keeps only the low bits, which for
+        // aligned values are the alignment, and every entry lands in one bucket.
+        std::unordered_map<unsigned long, int> table;
+        for (unsigned long i = 0; i < 500; i++) {
+            table[i * 64] = static_cast<int>(i);
+        }
+        check(table.size() == 500, "five hundred entries survived the rehashes");
+        check(table.bucket_count() > 500, "and the table really grew");
+        int found = 0;
+        for (unsigned long i = 0; i < 500; i++) {
+            auto it = table.find(i * 64);
+            if (it != table.end() && it->second == static_cast<int>(i)) {
+                found++;
+            }
+        }
+        check(found == 500, "every one of them is findable");
+    }
 
     // ---- the plugin's own calls, from C++ ---------------------------------
     // A 320x240 window's worth of pixels: 300 KiB, seventy-five pages, larger than

@@ -204,8 +204,20 @@ fn build_hello_cpp(
             .status()
             .expect("failed to spawn clang++");
         if !status.success() {
-            skip("clang++ could not compile the C++ demo against these headers");
-            return;
+            // A compile *error* is not the same as "this host has no C++ compiler",
+            // and treating them alike hid a broken runtime for a whole edit cycle:
+            // the build printed one warning line, wrote `hello-cpp.absent`, and
+            // every check downstream passed because the program it would have
+            // failed had quietly stopped being built.
+            //
+            // Absence is for a host that cannot compile C++ at all — that is
+            // checked above, before this loop, and skips it. Reaching here means
+            // the toolchain works and the *source* is wrong, which is a failure
+            // that belongs in front of whoever just edited it.
+            panic!(
+                "clang++ failed to compile {} — the C++ side is broken, not absent",
+                file.display()
+            );
         }
         objects.push(object);
     }
@@ -228,8 +240,16 @@ fn build_hello_cpp(
         .status()
         .expect("failed to spawn rust-lld");
     if !status.success() {
-        skip("the C++ demo did not link");
-        return;
+        // As with the compile: a link error means the C++ runtime is missing a
+        // symbol, and that is exactly the loop this whole side is built on — the
+        // linker names one, somebody writes it. Turning it into an absent program
+        // throws the name away and replaces it with silence, and the next check to
+        // run reports success because the thing that would have failed is no longer
+        // in the image.
+        panic!(
+            "the C++ demo did not link — {} is missing a symbol the linker just named",
+            runtime.display()
+        );
     }
     strip_to(objcopy, &debug_elf, &elf);
 

@@ -388,6 +388,11 @@ if [ -n "$INITRAMFS" ]; then
     # -fno-rtti. The size is the point — 1200 KiB is what a full-screen backing
     # store costs, and the kernel's shared-memory ceiling used to be 256 KiB.
     req "[hello-cpp] backing store: 1200 KiB for a whole 640x480 screen"
+    # The containers whose out-of-line half this tree had to write: the red-black
+    # tree's rebalancing, std::list's splice, the hash table's bucket growth. Qt
+    # uses all four, and the C++ RUNTIME OK line above only appears if the four
+    # hundred keys came back in order from three different insertion orders — a
+    # rotation reversed in the wrong half corrupts the tree into a null dereference.
     forbid "[hello-cpp] FAIL"
     forbid "C++ RUNTIME BROKEN"
     # An EL0 fault now reports where it happened, not just that it did.
