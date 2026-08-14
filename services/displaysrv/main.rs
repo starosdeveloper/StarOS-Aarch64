@@ -13,6 +13,9 @@
 //! ## The protocol
 //!
 //! ```text
+//! tag = 6 Screen   no arguments
+//!                  -> words[0] = width, words[1] = height in pixels,
+//!                     words[2] = bits per pixel, words[3] = 1 for xRGB8888
 //! tag = 1 Create   words[0] = width, words[1] = height   in pixels
 //!                  words[2] = x,     words[3] = y        top-left corner on screen
 //!                  cap      = the pixel buffer, width * height * 4 bytes of xRGB8888
@@ -30,6 +33,13 @@
 //! `words[0]` for a refusal. "Refused" and "did nothing" are different answers, and
 //! a client that cannot tell them apart will one day show a blank window and call it
 //! a slow frame.
+//!
+//! `Screen` comes first in that list because it has to come first in time: a client
+//! cannot size a buffer before it knows what it is drawing onto, and the geometry is
+//! the one thing here that no client can work out for itself. The stride is
+//! deliberately *not* reported — it is this server's business, the client's pixels
+//! are always packed, and a client that knew the stride would eventually assume its
+//! own buffer had one.
 //!
 //! ## Three decisions, and what each one costs
 //!
@@ -83,7 +93,13 @@ const TAG_CREATE: u64 = 1;
 const TAG_COMMIT: u64 = 3;
 const TAG_RAISE: u64 = 4;
 const TAG_DESTROY: u64 = 5;
+const TAG_SCREEN: u64 = 6;
 const TAG_BYE: u64 = 9;
+
+/// The only pixel format this server composites. Named in the reply so a client
+/// gets told rather than assuming, and so the day a second format exists the old
+/// clients are the ones that keep working.
+const FORMAT_XRGB8888: u64 = 1;
 
 // Reply tags.
 const TAG_ERROR: u64 = 0;
@@ -359,6 +375,20 @@ extern "C" fn main() -> ! {
             reply(TAG_OK, 0);
             continue;
         }
+        // Answered here rather than through `outcome` below because it is the one
+        // request whose answer does not fit in a single word.
+        if msg.tag == TAG_SCREEN {
+            reply_words(
+                TAG_OK,
+                [
+                    screen.width as u64,
+                    screen.height as u64,
+                    (BPP * 8) as u64,
+                    FORMAT_XRGB8888,
+                ],
+            );
+            continue;
+        }
 
         let outcome = match msg.tag {
             TAG_CREATE => create(&mut compositor, &msg),
@@ -473,9 +503,14 @@ fn high(word: u64) -> usize {
 /// Answer the client. A reply always goes out, refusals included: a client blocked
 /// waiting for one it will never get is a hang whose cause is three messages back.
 fn reply(tag: u64, result: u64) {
+    reply_words(tag, [result, 0, 0, 0]);
+}
+
+/// Answer with all four words, for the requests whose answer needs them.
+fn reply_words(tag: u64, words: [u64; 4]) {
     let mut msg = Message::new();
     msg.tag = tag;
-    msg.words[0] = result;
+    msg.words = words;
     // SAFETY: `Send` reads one `Message` through this pointer.
     unsafe {
         let _ = syscall2(SYS_SEND, EP_REPLY, core::ptr::addr_of!(msg) as u64);

@@ -153,6 +153,17 @@ pub(crate) fn map_shared(cap: u32) -> Option<*mut u8> {
     (rc > 0).then(|| rc as usize as *mut u8)
 }
 
+/// How many pages a shared buffer holds, or 0 if the handle is not ours.
+pub(crate) fn shared_pages(cap: u32) -> usize {
+    // SAFETY: `SharedPages` only reads the capability table.
+    let rc = unsafe { syscall1(Syscall::SharedPages, u64::from(cap)) };
+    if rc > 0 {
+        rc as usize
+    } else {
+        0
+    }
+}
+
 /// Create a notification of our own and return its capability handle.
 ///
 /// Capability tables are *copied* into a new thread at `SpawnThread`, so a handle

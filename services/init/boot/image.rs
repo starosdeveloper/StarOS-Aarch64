@@ -873,6 +873,31 @@ extern "C" fn _start() -> ! {
         ".Lfbclient:",
         "cmp w19, #13",
         "b.ne .Linputclient",        // id != 13 -> the input consumer, then the rest
+        // Ask the screen's geometry first, the way a plugin must: a client cannot
+        // size a buffer before it knows what it is drawing onto, and this is the one
+        // thing here it cannot work out for itself.
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #6",
+        "str x0, [x11]",             // msg.tag = 6 (Screen)
+        "bl .Lfb_call",
+        // 640x480 is what `ramfb` gives on this machine. Asserting the number rather
+        // than only that one arrived: a server answering from an uninitialised field
+        // returns zero, and zero passes every check that only looks for a reply.
+        "mov x9, #640",
+        "cmp x0, x9",
+        "b.ne .Lfb_bad",
+        "ldr x0, [x11, #16]",        // words[1] = height
+        "mov x9, #480",
+        "cmp x0, x9",
+        "b.ne .Lfb_bad",
+        "ldr x0, [x11, #24]",        // words[2] = bits per pixel
+        "cmp x0, #32",
+        "b.ne .Lfb_bad",
+        "ldr x0, [x11, #32]",        // words[3] = format, 1 = xRGB8888
+        "cmp x0, #1",
+        "b.ne .Lfb_bad",
         // Two 64x64 surfaces, deliberately overlapping. One would prove a rectangle
         // reaches the glass; two prove the server keeps them apart, stacks them, and
         // repaints only what a commit says changed. Each is 16 KiB, four pages.
@@ -1040,7 +1065,7 @@ extern "C" fn _start() -> ! {
         "mov x30, x14",
         "ret",
 
-        // ============ input consumer (id 16) ============
+        // ============ input consumer (id 21) ============
         // Holds one capability: receive on the event endpoint. No device, no
         // interrupt, no sight of the driver's memory — a key press reaches this
         // process as a message or not at all. It blocks until one arrives, prints
@@ -1050,8 +1075,8 @@ extern "C" fn _start() -> ! {
         // is the honest behaviour: a consumer that gave up after a while would
         // print "no input" on a working system whose user was slow.
         ".Linputclient:",
-        "cmp w19, #16",
-        "b.ne .Lloaded",             // id != 16 -> the loaded-from-a-file role
+        "cmp w19, #21",
+        "b.ne .Lloaded",             // id != 21 -> the loaded-from-a-file role
         "mov x0, #1",                // handle 1 = the event endpoint (recv)
         "mov x1, x11",
         "mov x8, #2",                // Syscall::Recv
@@ -1218,7 +1243,7 @@ extern "C" fn _start() -> ! {
         "26:",
         ".asciz \"[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes\\n\"",
         "27:",
-        ".asciz \"[fbclient] two 64x64 surfaces composited by displaysrv - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096\\n\"",
+        ".asciz \"[fbclient] asked the screen its size (640x480 xRGB8888), then had two 64x64 surfaces composited - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096\\n\"",
         "28:",
         ".asciz \"[fbclient] SURFACE WRONG - a buffer would not allocate, two of them landed at one address, the server refused a request, or it repainted a different rectangle than the commit named\\n\"",
         "29:",

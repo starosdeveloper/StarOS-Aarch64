@@ -71,6 +71,7 @@ pub mod scan;
 pub mod stdio;
 pub mod stream;
 pub mod string;
+pub mod surface;
 pub mod sys;
 pub mod thread;
 pub mod time;

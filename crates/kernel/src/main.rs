@@ -1537,7 +1537,11 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
                 return None;
             }
             s.set_entry(image.entry());
-            s.write_id(16);
+            // 21, not 16: `file_pair` seeds 16 into the *file server* it builds for
+            // `fsclient`. Different images, so nothing dispatches wrongly today —
+            // and that is exactly how the endpoint-numbering collision in G1 stayed
+            // invisible until it was not. Ids are one namespace; keep them one.
+            s.write_id(21);
             Some(s)
         })?;
         let mut caps = cap::empty_caps()?;

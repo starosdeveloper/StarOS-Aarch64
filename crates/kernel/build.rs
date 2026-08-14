@@ -336,11 +336,18 @@ fn build_hello_c(
         println!("cargo:rustc-env=STAROS_HELLO_C_IMAGE={}", empty.display());
         return;
     };
+    // The sysroot's own headers, so `staros.h` is compiled by the same `-Werror`
+    // that compiles everything else here. A header shipped to a plugin author and
+    // never once fed to a compiler is a header that does not build.
+    let include = canonical(&Path::new(manifest_dir).join("../staros-libc/include"));
+    println!("cargo:rerun-if-changed={}", include.display());
     let object = Path::new(out_dir).join("hello-c.o");
     let status = Command::new(clang)
         .args(["--target=aarch64-unknown-none", "-ffreestanding", "-fno-builtin"])
         .args(["-fno-omit-frame-pointer", "-fno-stack-protector", "-fno-pie"])
         .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror", "-std=c11", "-c"])
+        .arg("-I")
+        .arg(&include)
         .arg(&src)
         .arg("-o")
         .arg(&object)

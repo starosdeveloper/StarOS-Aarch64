@@ -329,6 +329,10 @@ if [ -n "$INITRAMFS" ]; then
     # the line only appears when the wake came from the message rather than the
     # 5-second timeout that guards the check.
     req "[hello-c] endpoint in poll: a message from another process woke the loop"
+    # The other half of what a platform plugin needs: memory a display server can
+    # read, allocated from C. Two buffers at two addresses is the property a window
+    # system stands on — one fixed address is one surface.
+    req "[hello-c] shared buffers: 16 KiB of surface, mapped at"
     # The phase's checkpoint: a C++ program with the real standard library — three
     # std::threads under a std::mutex, 68 std::strings through a reallocating
     # std::vector — plus the two halves of static initialisation. The constructor
@@ -401,7 +405,7 @@ req "[displaysrv] composited client surfaces onto a screen no client can touch"
 # server quietly repainting whole surfaces on every commit fails this line rather
 # than merely being slow.
 req "[displaysrv] 2 surface(s) live, 3 commit(s), 12352 pixel(s) composited, 0 refused"
-req "[fbclient] two 64x64 surfaces composited by displaysrv"
+req "[fbclient] asked the screen its size (640x480 xRGB8888)"
 forbid "[fbclient] SURFACE WRONG"
 forbid "SURFACE WRONG"
 # The single-core font self-test runs before SMP/tasks, so it must appear on a

@@ -41,7 +41,6 @@ int open(const char *path, int flags, int mode);
 ssize_t read(int fd, void *buf, size_t count);
 long lseek(int fd, long offset, int whence);
 int close(int fd);
-void staros_heap_live(size_t *bytes, size_t *blocks);
 
 struct timespec {
     long tv_sec;
@@ -88,15 +87,12 @@ int eventfd_write(int fd, unsigned long value);
 int pipe(int fds[2]);
 ssize_t write(int fd, const void *buf, size_t count);
 
-/* An IPC endpoint as a descriptor. The one call that puts this system's own
- * communication primitive inside a POSIX event loop: without it a program can
- * serve messages or run an event loop, but never both. */
-int staros_endpoint_fd(unsigned int cap);
-struct staros_message {
-    unsigned long long tag;
-    unsigned long long words[4];
-    unsigned int cap;
-};
+/* The one header in this program that is not hand-written here. Everything else is
+ * declared inline on purpose — a C program that links against this library must not
+ * need a sysroot to be *tested* — but `staros.h` is the file a plugin author is
+ * given, and the only way to know it compiles is to compile it. */
+#include <staros.h>
+
 /* The capabilities the kernel installs for a file-server client, in order. */
 #define EP_REQUEST 1u
 #define EP_REPLY 2u
@@ -145,7 +141,6 @@ char *nl_langinfo(int item);
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap(void *addr, size_t length);
 int mprotect(void *addr, size_t length, int prot);
-size_t staros_mmap_retained(void);
 #define PROT_READ 1
 #define PROT_WRITE 2
 #define PROT_EXEC 4
@@ -1354,8 +1349,7 @@ static void check_endpoint(void)
     memset(&msg, 0, sizeof msg);
     msg.tag = TAG_CLOSE;
     msg.words[0] = 4242; /* a handle the server never handed out */
-    check(write(request, &msg, sizeof msg) == (ssize_t)sizeof msg,
-          "one whole message written to the endpoint");
+    check(staros_msg_send(request, &msg) == 0, "one whole message sent to the endpoint");
 
     /* The wake-up under test. Nothing here polls a counter or spins: the poll
      * returns because a message arrived at an endpoint in the kernel. */
@@ -1367,8 +1361,7 @@ static void check_endpoint(void)
     check(watch[0].revents & POLLIN, "the endpoint is the one that woke it");
     check(watch[1].revents == 0, "the eventfd sharing the set stayed quiet");
 
-    ssize_t got = read(reply, &msg, sizeof msg);
-    check(got == (ssize_t)sizeof msg, "a whole message read back");
+    check(staros_msg_recv(reply, &msg) == 0, "a whole message read back");
     check(msg.tag == TAG_ERROR, "the server refused the made-up handle");
     check(msg.words[0] == ERR_BAD_HANDLE, "and said which refusal it was");
 
@@ -1393,6 +1386,59 @@ static void check_endpoint(void)
            waited);
 }
 
+/* Shared buffers, from C.
+ *
+ * This is the call a backing store makes: a QImage is drawn into memory that the
+ * display server can read, and the pages have to be shareable before a pixel is
+ * written into them. Everything here is in `staros.h` and nothing here is in the
+ * Qt contract — a platform plugin is by definition the layer that knows what
+ * machine it is on. */
+static void check_shared(void)
+{
+    /* A 64x64 xRGB8888 surface, the size the display demo uses: 16 KiB, four
+     * pages. Asked for in bytes, because that is what a caller has. */
+    const size_t bytes = 64 * 64 * 4;
+    unsigned int cap = staros_shared_create(bytes);
+    check(cap != 0, "a shared buffer for a 64x64 surface");
+    check(staros_shared_bytes(cap) == bytes, "the kernel reports the size it gave");
+
+    unsigned int *pixels = (unsigned int *)staros_shared_map(cap);
+    check(pixels != 0, "the buffer mapped");
+
+    /* Fresh shared memory is zeroed: a surface that arrived full of another
+     * process's leftovers would be an information leak with a picture attached. */
+    check(pixels[0] == 0 && pixels[bytes / 4 - 1] == 0, "a new buffer arrives zeroed");
+
+    for (size_t i = 0; i < bytes / 4; i++)
+        pixels[i] = 0x00FF0000u;
+    check(pixels[0] == 0x00FF0000u && pixels[bytes / 4 - 1] == 0x00FF0000u,
+          "every pixel of the buffer is writable");
+
+    /* Mapping the same object twice gives the same address. A plugin that has lost
+     * a pointer may simply ask again, and the kernel keeping one placement per
+     * object is what makes that cheaper than the bookkeeping which avoids it. */
+    check(staros_shared_map(cap) == (void *)pixels, "the same buffer maps to the same place");
+
+    /* And a *different* buffer gets a different address. This is the property a
+     * window system stands on: until the kernel kept a placement per object every
+     * mapping landed at one fixed address, so a second surface silently replaced
+     * the first. */
+    unsigned int second = staros_shared_create(bytes);
+    check(second != 0 && second != cap, "a second buffer, with its own handle");
+    unsigned int *other = (unsigned int *)staros_shared_map(second);
+    check(other != 0 && other != pixels, "two buffers, two addresses");
+    check(other[0] == 0, "and the second is its own memory, not a view of the first");
+
+    /* Zero bytes is a caller's arithmetic going wrong — a length that underflowed,
+     * a loop that should not have run — and answering it with a page hides that at
+     * the moment it could still be caught. */
+    check(staros_shared_create(0) == 0, "a zero-byte buffer is refused");
+    check(staros_shared_bytes(9999) == 0, "a handle that is not ours has no size");
+
+    printf("[hello-c] shared buffers: %lu KiB of surface, mapped at %p and %p\n",
+           (unsigned long)(bytes / 1024), (void *)pixels, (void *)other);
+}
+
 int main(void)
 {
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
@@ -1413,6 +1459,7 @@ int main(void)
     check_threads();
     check_poll();
     check_endpoint();
+    check_shared();
 
     if (failures == 0)
         puts("[hello-c] C RUNTIME OK - every check passed");
