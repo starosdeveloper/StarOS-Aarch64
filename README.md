@@ -192,6 +192,7 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [client] read from shared memory: shared-memory works: written by the server, read by the client
 [client] read the marker from the SECOND page of a 2-page shared buffer
 [hello-cpp] backing store: 1200 KiB for a whole 640x480 screen, filled and read back from C++
+[hello-cpp] a 1920x1080 backing store: 8100 KiB, contiguous, mapped whole
 [hello-cpp] a static local was constructed on first use
 [hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads
 [hello-cpp] the static local's destructor ran at exit, holding 2 entries
@@ -222,17 +223,17 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [hello-c] endpoint in poll: a message from another process woke the loop in 1072240 ns
 [hello-c] shared buffers: 16 KiB of surface, mapped at 0x500001000 and 0x500005000
 [displaysrv] composited client surfaces onto a screen no client can touch
-[displaysrv] 3 surface(s) live, 5 commit(s), 13392 pixel(s) composited, 1 refused
+[displaysrv] 3 surface(s) live, 6 commit(s), 15440 pixel(s) composited, 2 refused
 [hello-c] window: a 32x32 surface on a 640x480 screen, from C through staros.h
 [hello-c] font: read 133796 bytes of IBM Plex Mono through fssrv, checksum 6016661948058288260
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 239 requests, 275941 bytes of file data, and refused 11 - the archive never left this address space
-clock: the demo took 5598 ms on the monotonic clock, during which core 0 took 56 tick(s)
-sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 12150 us
-scheduler: all tasks finished after 56 timer ticks; task table grew to 35 (old fixed max 8)
+clock: the demo took 6012 ms on the monotonic clock, during which core 0 took 59 tick(s)
+sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 12438 us
+scheduler: all tasks finished after 59 timer ticks; task table grew to 35 (old fixed max 8)
 task teardown: reaped 32 dead-task kernel stacks (1024 KiB returned to the heap)
 user stacks: 41 page(s) mapped on demand (164 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=56
+preemption: timer ticks per core — cpu0=59
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
 frame reclaim: post-teardown alloc 0x40333000 (exited client's root was 0x40324000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned

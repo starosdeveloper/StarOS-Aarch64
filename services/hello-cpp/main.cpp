@@ -229,6 +229,25 @@ int main() {
                         "filled and read back from C++\n",
                         store.bytes() / 1024);
         }
+
+        // And the size a Raspberry Pi 5 at 1080p actually needs: 8 MB, 2048 pages,
+        // the ceiling the kernel allows. Measured rather than assumed, because
+        // these frames are *physically contiguous* — the object holds one address —
+        // so this can fail on a pool with far more than 8 MB free in pieces. Which
+        // way it goes is the answer to whether shared memory has to stop being
+        // contiguous, and guessing at that before the number exists is how a day
+        // gets spent rebuilding something that worked.
+        BackingStore full(1920, 1080);
+        if (full.valid()) {
+            full.fill(1919, 1079, 1, 1, 0x00112233u);
+            check(full.pixels()[1920 * 1080 - 1] == 0x00112233u,
+                  "the last pixel of an 8 MB buffer is mapped");
+            std::printf("[hello-cpp] a 1920x1080 backing store: %zu KiB, contiguous, mapped whole\n",
+                        full.bytes() / 1024);
+        } else {
+            std::printf("[hello-cpp] a 1920x1080 backing store was refused: "
+                        "8 MB of contiguous frames were not there\n");
+        }
     }
 
     // ---- the static local -------------------------------------------------

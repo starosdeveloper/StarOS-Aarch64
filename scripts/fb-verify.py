@@ -170,12 +170,19 @@ def main():
     f.readline()
     cmd({"execute": "qmp_capabilities"})
 
-    # Keep sampling until the pixels agree or the guest powers off. Which frame is
-    # the right one is not knowable from here — the demo runs for seconds and the
-    # composite lands somewhere inside that — so every frame is a candidate and the
-    # first one that passes ends it.
+    # Sample until the guest powers off, and judge the **last** frame.
+    #
+    # This used to stop at the first frame that passed, and that was a check with a
+    # hole in it: a window closing without repainting what it covered leaves the
+    # wrong pixels behind, and every earlier frame — before that window was ever
+    # opened — passes. The falsification proved it, by not failing.
+    #
+    # The last frame is the screen as the machine stopped: every surface created,
+    # composited, raised and destroyed, in that order, with nothing still to come.
+    # A transient correct frame no longer counts for anything.
+    last = None
     verdict = "no frame captured"
-    for i in range(120):
+    for i in range(240):
         ppm = os.path.join(tmpdir, f"verify{i:03d}.ppm")
         try:
             r = cmd({"execute": "screendump", "arguments": {"filename": ppm}})
@@ -184,29 +191,40 @@ def main():
         if "error" in r:
             break
         if os.path.exists(ppm):
-            ok, why = check(ppm)
-            if ok:
-                print(f"fb-verify: PASS - {why}")
-                # Keep the frame that passed, converted if the host can, so the
-                # claim can be looked at rather than only read.
-                keep = os.path.join(tmpdir, "composited.png")
-                if shutil.which("ffmpeg"):
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-loglevel", "error", "-i", ppm, keep], check=False
-                    )
-                elif shutil.which("convert"):
-                    subprocess.run(["convert", ppm, keep], check=False)
-                else:
-                    keep = os.path.join(tmpdir, "composited.ppm")
-                    shutil.copy(ppm, keep)
-                print(f"fb-verify: kept {keep}")
-                sys.exit(0)
-            verdict = why
-            os.remove(ppm)
+            # Keep whichever frame is most recent and actually parseable. A
+            # screendump racing with power-off can land empty, and an empty file is
+            # not evidence of anything — least of all of a blank screen.
+            w, _h, pix = parse_ppm(ppm)
+            if pix and w >= 320:
+                if last is not None:
+                    os.remove(last)
+                last = ppm
+            else:
+                os.remove(ppm)
         time.sleep(0.08)
 
-    print(f"fb-verify: FAIL - {verdict}")
-    sys.exit(1)
+    if last is None:
+        print(f"fb-verify: FAIL - {verdict}")
+        sys.exit(1)
+
+    ok, why = check(last)
+    if not ok:
+        print(f"fb-verify: FAIL - the last frame before power-off: {why}")
+        sys.exit(1)
+
+    print(f"fb-verify: PASS - {why}")
+    # Keep the frame that passed, converted if the host can, so the claim can be
+    # looked at rather than only read.
+    keep = os.path.join(tmpdir, "composited.png")
+    if shutil.which("ffmpeg"):
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", last, keep], check=False)
+    elif shutil.which("convert"):
+        subprocess.run(["convert", last, keep], check=False)
+    else:
+        keep = os.path.join(tmpdir, "composited.ppm")
+        shutil.copy(last, keep)
+    print(f"fb-verify: kept {keep}")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

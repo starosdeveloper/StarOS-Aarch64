@@ -1545,6 +1545,58 @@ static void check_display(void)
     check(display_call(display, reply, &msg), "a partial commit was accepted");
     check(msg.words[0] == 16, "and repainted 16 pixels, not 1024");
 
+    /* A second surface, exactly on top of the first, in a colour it does not
+     * share — then destroyed.
+     *
+     * Destroying is the one operation no client had ever asked for, so the code
+     * that repaints what a closed window uncovered had never run. Putting the
+     * throwaway *over* the green one makes the screenshot the check: if `Destroy`
+     * forgets to repaint, the last thing composited there is magenta, and
+     * `fb-verify`'s existing "third-surface pixel is green" fails. A closing window
+     * that leaves its pixels behind is the most ordinary bug a compositor has, and
+     * it is invisible to every reply code the server sends. */
+    unsigned int over_cap = staros_shared_create(bytes);
+    check(over_cap != 0, "pixels for a window that will be closed");
+    unsigned int *over = (unsigned int *)staros_shared_map(over_cap);
+    check(over != 0, "and they mapped");
+    for (size_t i = 0; i < bytes / 4; i++)
+        over[i] = 0x00FF00FFu; /* magenta, which nothing else on screen is */
+
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_CREATE;
+    msg.words[0] = side;
+    msg.words[1] = side;
+    msg.words[2] = 300;
+    msg.words[3] = 300;
+    msg.cap = over_cap;
+    check(display_call(display, reply, &msg), "the server took the second surface");
+    unsigned long long doomed = msg.words[0];
+    check(doomed != surface, "and gave it an id of its own");
+
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_COMMIT;
+    msg.words[0] = doomed;
+    msg.words[2] = side | (side << 32);
+    check(display_call(display, reply, &msg), "it was committed over the first");
+    check(msg.words[0] == side * side, "covering it entirely");
+
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_DESTROY;
+    msg.words[0] = doomed;
+    check(display_call(display, reply, &msg), "and destroyed");
+    check(msg.words[0] == side * side, "repainting everything it had covered");
+
+    /* Gone means gone: a surface id that has been destroyed must stop working, or
+     * a client with a stale handle draws into someone else's window. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_COMMIT;
+    msg.words[0] = doomed;
+    msg.words[2] = 1u | (1ull << 32);
+    staros_msg_send(display, &msg);
+    staros_msg_recv(reply, &msg);
+    check(msg.tag == STAROS_DISPLAY_ERROR, "a destroyed surface is refused");
+    check(msg.words[0] == STAROS_DISPLAY_ERR_NO_SURFACE, "as one that never existed");
+
     /* Refusals name themselves. A client that cannot tell "refused" from "did
      * nothing" will one day show a blank window and call it a slow frame. */
     memset(&msg, 0, sizeof msg);

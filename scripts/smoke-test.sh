@@ -427,13 +427,15 @@ req "framebuffer: ramfb 640x480 online"
 req "framebuffer: handed to displaysrv"
 req "[displaysrv] the screen is mine"
 req "[displaysrv] composited client surfaces onto a screen no client can touch"
-# The window-system half: three surfaces from two clients, two of them overlapping
-# and restacked, and commits that repainted only the rectangles they named. The
-# tally is exact — two full 64x64 commits and a raise at 4096 pixels each, 64 for
-# the 8x8 damage, then the C program's 1024 and 16 — so a server quietly repainting
-# whole surfaces on every commit fails this line rather than merely being slow. The
-# one refusal is the made-up surface id the C program sends on purpose.
-req "[displaysrv] 3 surface(s) live, 5 commit(s), 13392 pixel(s) composited, 1 refused"
+# The window-system half: four surfaces from two clients, three of them
+# overlapping, restacked, one closed again, and commits that repainted only the
+# rectangles they named. The tally is exact — two full 64x64 commits and a raise at
+# 4096 pixels each, 64 for the 8x8 damage, then the C program's 1024, its 16, its
+# throwaway window's 1024 and the 1024 that repainted what closing it uncovered —
+# so a server quietly repainting whole surfaces on every commit fails this line
+# rather than merely being slow. The two refusals are the made-up surface id and
+# the destroyed one, both sent on purpose.
+req "[displaysrv] 3 surface(s) live, 6 commit(s), 15440 pixel(s) composited, 2 refused"
 # And that a second *process* was served: the C program's window, drawn through the
 # same header a platform plugin is given. Two clients on one server is where a
 # shared reply endpoint shows itself — as one of them hanging on an answer the
