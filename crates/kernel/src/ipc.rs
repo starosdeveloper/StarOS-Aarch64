@@ -32,15 +32,15 @@ use crate::sync::SpinLock;
 /// Number of endpoints the kernel exposes. Two carry the client<->server request
 /// and reply; two more carry the device manager's grants to the driver and the
 /// server; one is the contention endpoint several senders hammer at once; two
-/// carry the display protocol's commit and its reply; the last four are two file
-/// servers' request/reply pairs (one per client — see `kmain`). A real system
-/// allocates them dynamically.
+/// carry the display protocol's commit and its reply; four are two file servers'
+/// request/reply pairs (one per client — see `kmain`); the last carries decoded
+/// input events out of the input driver. A real system allocates them dynamically.
 ///
 /// The ids are a *shared numbering* between this table and whoever creates the
 /// objects in `main`, which is exactly the kind of seam that bites: giving the
 /// display endpoint id 4 put its traffic into [`STORM_EP`], and the display server
 /// spent its life rejecting storm messages it had no business seeing.
-const NUM_ENDPOINTS: usize = 12;
+const NUM_ENDPOINTS: usize = 13;
 
 /// The endpoint the IPC contention test uses (see [`storm_stats`]).
 ///

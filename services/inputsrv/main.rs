@@ -38,6 +38,7 @@ use staros_virtio::{DESC_F_WRITE, DEVICE_ID_INPUT, MAGIC_VALUE};
 const USER_DMA_VA: u64 = 0x7_0000_0000;
 
 // Syscall numbers — must match `staros_abi::syscall::Syscall`.
+const SYS_SEND: usize = 1;
 const SYS_RECV: usize = 2;
 const SYS_MAP_MEMORY: usize = 3;
 const SYS_EXIT: usize = 4;
@@ -51,6 +52,15 @@ const SYS_DMA_PHYS: usize = 27;
 
 /// The endpoint the device manager delegates our device and interrupt on.
 const EP_MANAGER: u64 = 1;
+/// Where decoded events go. Send only: a driver publishes, it does not consume.
+const EP_EVENTS: u64 = 2;
+
+/// The event kinds this driver publishes, as the message tag. They are the Linux
+/// numbers virtio-input passes through unchanged, so a consumer that already knows
+/// `EV_KEY` needs no translation table.
+const TAG_KEY: u64 = 1;
+const TAG_REL: u64 = 2;
+const TAG_ABS: u64 = 3;
 
 /// Queue size. Eight buffers is more than a keyboard produces between two of our
 /// wake-ups, and small enough that the whole queue is two pages.
@@ -254,9 +264,12 @@ extern "C" fn main() -> ! {
                     puts("[inputsrv] key press from the device: code ");
                     put_dec(u64::from(event.code));
                     puts(" - decoded in EL0, the kernel never saw the event\n");
+                    publish(TAG_KEY, u64::from(event.code), u64::from(event.value));
                     presses += 1;
                 } else if event.kind == ev::REL || event.kind == ev::ABS {
                     puts("[inputsrv] pointer motion from the device\n");
+                    let tag = if event.kind == ev::REL { TAG_REL } else { TAG_ABS };
+                    publish(tag, u64::from(event.code), u64::from(event.value));
                 }
             }
             // Hand the buffer straight back: the device may refill it.
@@ -278,6 +291,26 @@ extern "C" fn main() -> ! {
 
     puts("[inputsrv] input driver exiting\n");
     exit();
+}
+
+/// Publish one decoded event to whoever holds the receiving end.
+///
+/// The send is deliberately allowed to block. An endpoint's ring is small, and a
+/// consumer that has stopped draining is a consumer that will lose events either
+/// way — but a driver that *drops* them silently produces a keyboard which
+/// occasionally misses a keystroke, which is the hardest class of bug there is to
+/// believe. Blocking makes the back-pressure visible instead: the driver stops
+/// acknowledging interrupts, the device's queue fills, and the failure has a shape.
+fn publish(tag: u64, code: u64, value: u64) {
+    let mut msg = Message::new();
+    msg.tag = tag;
+    msg.words[0] = code;
+    msg.words[1] = value;
+    // SAFETY: `Send` reads one `Message` through this pointer; the endpoint handle
+    // is the capability the kernel installed for exactly this.
+    unsafe {
+        let _ = syscall2(SYS_SEND, EP_EVENTS, core::ptr::addr_of!(msg) as u64);
+    }
 }
 
 /// Read one event out of the buffer descriptor `id` names, if the device wrote a

@@ -341,8 +341,31 @@ used-кольцом зависит от размера очереди: драй�
 [devicemgr] found a virtio-input device at a003e00 intid 79 and delegated it to the input driver
 [inputsrv] virtio-input driver up in EL0: queue armed, waiting for the device
 [inputsrv] key press from the device: code 30 - decoded in EL0, the kernel never saw the event
-input-check: PASS — the key crossed device, virtqueue, interrupt and driver
+[inputclient] key code 30 arrived over IPC - I hold no device, no interrupt and no sight of the driver's memory
+input-check: PASS — the key crossed device, virtqueue, interrupt, driver, and a process boundary
 ```
+
+### G2.1. Событие покидает драйвер (сделано перед G6)
+
+Драйвер декодировал нажатие и печатал его — то есть доказывал, что драйвер
+работает, и не давал ни одной программе способа нажатием **воспользоваться**.
+Теперь есть endpoint событий (id 12): у драйвера на нём право отправки, у
+потребителя — право приёма. Разделение не косметическое: capability, умеющая и
+то и другое, позволила бы одному клиенту ввода съедать события другого.
+
+Сообщение — `tag` = вид события (числа Linux, которые virtio-input пропускает без
+изменений), `words[0]` = код, `words[1]` = значение. Отправка намеренно может
+блокировать: кольцо endpoint маленькое, и потребитель, переставший разбирать
+события, потеряет их в любом случае — но драйвер, **молча роняющий** события,
+даёт клавиатуру, которая иногда пропускает нажатие, а это самый трудный для веры
+класс дефекта. Блокировка делает противодавление видимым.
+
+Потребитель в демо (`id 16`) не держит ничего, кроме права приёма: ни устройства,
+ни линии прерывания, ни доступа к памяти драйвера. Нажатие приходит к нему
+сообщением или не приходит вовсе.
+
+Для плагина второй конец оборачивается в `staros_endpoint_fd` и попадает в тот же
+`poll`, что и таймеры с пайпами.
 
 *Фальсификации:*
 
@@ -351,6 +374,11 @@ input-check: PASS — the key crossed device, virtqueue, interrupt and driver
    как «драйвер завис»: никакой ошибки, просто тишина.
 2. **Снова терять смещение устройства в странице** — `no virtio-input device on
    this machine`, то есть тот самый симптом, с которого фаза началась.
+3. **Драйвер декодирует, но не публикует** — `input-check: FAIL — the driver
+   decoded the key but no process received it`.
+4. **Отобрать у драйвера право отправки** на endpoint событий — тот же отказ,
+   и это ровно то, чем он должен быть: ядро не пустило сообщение, а не драйвер
+   забыл его послать.
 
 *Проверено:* 123 хост-теста, `kclippy -D warnings` чисто, smoke-матрица —
 **215 ассертов на 7 машинах, exit=0**, плюс `input-check.sh` PASS и `fb-check.sh`
@@ -1440,8 +1468,9 @@ Qt Platform Abstraction — официальная точка порта. Сло
 - `QPlatformFontDatabase` — `QFreeTypeFontDatabase` + FreeType, шрифты из
   initramfs через G4.
 - Диспетчер событий — `QEventDispatcherUNIX` поверх `poll` из G5; события ввода
-  из `inputsrv` (G2) приходят на дескриптор, который этот `poll` умеет ждать.
-  **Этот дескриптор существует:** `staros_endpoint_fd(cap)` заворачивает
+  из `inputsrv` приходят на endpoint событий (G2.1), а он заворачивается в
+  дескриптор, который этот `poll` умеет ждать.
+  **Оба конца существуют:** `staros_endpoint_fd(cap)` заворачивает
   IPC-endpoint в fd, `read` отдаёт целое сообщение, `write` посылает, а `poll`
   показывает `POLLIN`, пока очередь в ядре не пуста. Механика описана ниже, в
   «Мост endpoint → дескриптор».

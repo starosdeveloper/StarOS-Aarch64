@@ -1255,6 +1255,13 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // spends its one capability slot on the data buffer. Until that changes, one
     // server per client is the honest arrangement — and it costs nothing but the
     // pages, since the server is an ordinary program that can be run twice.
+    // Where decoded input events leave the driver. Until now `inputsrv` printed
+    // what it decoded and that was the end of it, which proves a driver works and
+    // gives no program a way to *use* a key press. This endpoint is the path a
+    // toolkit's event loop reads: the driver holds send rights, whoever consumes
+    // input holds receive rights, and `staros_endpoint_fd` turns the second half
+    // into a descriptor `poll` can wait on beside every other source.
+    let ep_events = obj::create(obj::Object::Endpoint { id: 12 }).expect("ep_events object");
     let ep_fs2 = obj::create(obj::Object::Endpoint { id: 10 }).expect("ep_fs2 object");
     let ep_fs2_reply = obj::create(obj::Object::Endpoint { id: 11 }).expect("ep_fs2_reply object");
 
@@ -1508,6 +1515,33 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         })?;
         let mut caps = cap::empty_caps()?;
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_input, send: false, recv: true });
+        // Handle 2: where decoded events go. Send only — a driver publishes, it
+        // does not consume, and a capability that could do both would let one
+        // input client eat another's events.
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_events, send: true, recv: false });
+        Some((space, caps))
+    })();
+
+    // The other end of the input path: a process holding nothing but "receive on
+    // the event endpoint". It cannot reach the keyboard, the interrupt line, or the
+    // driver's memory; a key press arrives as a message or not at all. That is the
+    // shape a toolkit sits in, and building it now is how the claim "input leaves
+    // the driver" gets tested rather than assumed.
+    let input_client = (|| {
+        // SAFETY: as every other space built here — the MMU is on with the frame
+        // pool identity-mapped and writable, and these frames are uniquely ours.
+        let space = mem::with(|frames| unsafe {
+            let mut s = AddressSpace::new(frames)?;
+            if !load_segments(&mut s, frames, &image) {
+                s.destroy(frames);
+                return None;
+            }
+            s.set_entry(image.entry());
+            s.write_id(16);
+            Some(s)
+        })?;
+        let mut caps = cap::empty_caps()?;
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_events, send: false, recv: true });
         Some((space, caps))
     })();
 
@@ -1525,6 +1559,12 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // Before the device manager, so it is already blocked in `Recv` when the
     // manager delegates — otherwise the grants queue up and the ordering, rather
     // than the wake path, is what makes the demo work.
+    // Before the driver, for the same reason the driver goes before the manager:
+    // the consumer must already be blocked in `Recv` when the first event is sent,
+    // or the ordering rather than the wake path is what makes the demo work.
+    if let Some((space, caps)) = input_client {
+        sched::spawn_user(user_task_entry, space, caps);
+    }
     if let Some((space, caps)) = input {
         sched::spawn_user(user_task_entry, space, caps);
     }

@@ -872,7 +872,7 @@ extern "C" fn _start() -> ! {
         // memory it made itself.
         ".Lfbclient:",
         "cmp w19, #13",
-        "b.ne .Lloaded",             // id != 13 -> the loaded-from-a-file role
+        "b.ne .Linputclient",        // id != 13 -> the input consumer, then the rest
         // Two 64x64 surfaces, deliberately overlapping. One would prove a rectangle
         // reaches the glass; two prove the server keeps them apart, stacks them, and
         // repaints only what a commit says changed. Each is 16 KiB, four pages.
@@ -1040,6 +1040,41 @@ extern "C" fn _start() -> ! {
         "mov x30, x14",
         "ret",
 
+        // ============ input consumer (id 16) ============
+        // Holds one capability: receive on the event endpoint. No device, no
+        // interrupt, no sight of the driver's memory — a key press reaches this
+        // process as a message or not at all. It blocks until one arrives, prints
+        // the code it was told, and exits.
+        //
+        // On a machine where nobody presses a key it simply never returns, and that
+        // is the honest behaviour: a consumer that gave up after a while would
+        // print "no input" on a working system whose user was slow.
+        ".Linputclient:",
+        "cmp w19, #16",
+        "b.ne .Lloaded",             // id != 16 -> the loaded-from-a-file role
+        "mov x0, #1",                // handle 1 = the event endpoint (recv)
+        "mov x1, x11",
+        "mov x8, #2",                // Syscall::Recv
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lic_bad",
+        "ldr x20, [x11]",            // msg.tag = the event kind
+        "cmp x20, #1",               // 1 = EV_KEY, the only kind published so far
+        "b.ne .Lic_bad",
+        "adr x2, 29f",
+        "bl .Lputs",
+        "ldr x0, [x11, #8]",         // words[0] = the key code
+        "bl .Lputdec",
+        "adr x2, 30f",
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+        ".Lic_bad:",
+        "adr x2, 31f",
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+
         // ============ loaded from a file (id 12) ============
         // Same bytes as every other role here, but this copy did not come from the
         // kernel's built-in image: the device manager found `init.elf` inside the
@@ -1107,6 +1142,31 @@ extern "C" fn _start() -> ! {
         "svc #0",
         "ret",
 
+        // Print the unsigned value in x0 in decimal. Digits come out least
+        // significant first, so they are written backwards into a scratch buffer
+        // below the stack pointer and the whole run is sent in one `DebugWrite` —
+        // one call is one line as far as the console lock is concerned, and a
+        // number shredded across two cores' output is a number nobody can read.
+        // Clobbers x0..x6, x8 and the link register.
+        ".Lputdec:",
+        "sub sp, sp, #32",
+        "add x3, sp, #32",           // one past the end of the scratch buffer
+        "mov x4, #10",
+        ".Lputdec_digit:",
+        "udiv x5, x0, x4",
+        "msub x6, x5, x4, x0",       // x6 = x0 - (x0 / 10) * 10
+        "add w6, w6, #48",           // '0'
+        "strb w6, [x3, #-1]!",
+        "mov x0, x5",
+        "cbnz x0, .Lputdec_digit",
+        "add x1, sp, #32",
+        "sub x1, x1, x3",            // length
+        "mov x0, x3",                // ptr
+        "mov x8, #19",               // Syscall::DebugWrite
+        "svc #0",
+        "add sp, sp, #32",
+        "ret",
+
         "8:",
         ".asciz \"server drove the UART, then revoked it for everyone\\n\"",
         "1:",
@@ -1161,6 +1221,12 @@ extern "C" fn _start() -> ! {
         ".asciz \"[fbclient] two 64x64 surfaces composited by displaysrv - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096\\n\"",
         "28:",
         ".asciz \"[fbclient] SURFACE WRONG - a buffer would not allocate, two of them landed at one address, the server refused a request, or it repainted a different rectangle than the commit named\\n\"",
+        "29:",
+        ".asciz \"[inputclient] key code \"",
+        "30:",
+        ".asciz \" arrived over IPC - I hold no device, no interrupt and no sight of the driver's memory\\n\"",
+        "31:",
+        ".asciz \"[inputclient] EVENT WRONG - the receive failed, or what arrived was not a key event\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,

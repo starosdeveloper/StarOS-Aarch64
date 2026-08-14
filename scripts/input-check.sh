@@ -43,16 +43,24 @@ cat "$TMP/send.out"
 
 echo
 echo "serial log said:"
-grep -a -E "\[devicemgr\] (found|no virtio)|\[inputsrv\]" "$TMP/serial.log" | sed 's/^/  /'
+grep -a -E "\[devicemgr\] (found|no virtio)|\[inputsrv\]|\[inputclient\]" "$TMP/serial.log" | sed 's/^/  /'
 
-# The claim: a key press, decoded by a driver in EL0. Code 30 is 'a' in the Linux
-# input numbering that virtio-input passes through unchanged.
-if grep -qa "key press from the device: code 30" "$TMP/serial.log"; then
+# The claim, in two halves. First: a key press, decoded by a driver in EL0. Code 30
+# is 'a' in the Linux input numbering that virtio-input passes through unchanged.
+# Second, and the one that makes input *usable*: the same code reached a different
+# process, which holds no device, no interrupt and no sight of the driver's memory.
+# A driver that decodes a key and tells nobody is where this stopped before.
+if ! grep -qa "key press from the device: code 30" "$TMP/serial.log"; then
     echo
-    echo "input-check: PASS — the key crossed device, virtqueue, interrupt and driver"
-    exit 0
+    echo "input-check: FAIL — no decoded key press in the log"
+    exit 1
+fi
+if ! grep -qa "\[inputclient\] key code 30 arrived over IPC" "$TMP/serial.log"; then
+    echo
+    echo "input-check: FAIL — the driver decoded the key but no process received it"
+    exit 1
 fi
 
 echo
-echo "input-check: FAIL — no decoded key press in the log"
-exit 1
+echo "input-check: PASS — the key crossed device, virtqueue, interrupt, driver, and a process boundary"
+exit 0
