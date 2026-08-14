@@ -819,8 +819,17 @@ impl AddressSpace {
     }
 
     /// Map a shared-memory buffer (`pages` contiguous frames at physical `phys`)
-    /// into this space at [`USER_SHARED_VA`], read/write and EL0-accessible, and
-    /// return that virtual address.
+    /// into this space at `base`, read/write and EL0-accessible, and return that
+    /// virtual address.
+    ///
+    /// The address is a parameter rather than [`USER_SHARED_VA`] because a display
+    /// server holds one buffer per surface and needs them all reachable at once. A
+    /// fixed address is exactly one buffer, and the second `MapShared` silently
+    /// replaced the first — a bug whose symptom is a window drawing another
+    /// window's pixels, discovered nowhere near the call that caused it. Choosing
+    /// *which* address is the caller's business, not this function's; see
+    /// `sched::map_shared_current`, which keeps one placement per object so that
+    /// mapping the same buffer twice lands it in the same place.
     ///
     /// Like [`map_device`](AddressSpace::map_device), the descriptors carry **no**
     /// [`SW_OWNED`]: the frames belong to the shared-memory *object*, not to this
@@ -836,11 +845,12 @@ impl AddressSpace {
     pub unsafe fn map_shared<A: FrameAllocator>(
         &self,
         alloc: &mut A,
+        base: u64,
         phys: u64,
         pages: u32,
     ) -> Option<u64> {
         for i in 0..u64::from(pages) {
-            let va = USER_SHARED_VA + i * PAGE_4K;
+            let va = base + i * PAGE_4K;
             // SAFETY: forwarded from this function's contract; a table frame may be
             // allocated for the walk, and the page is Normal RW EL0.
             if !unsafe { self.map_page(alloc, va, user_data_page(phys + i * PAGE_4K)) } {
@@ -857,7 +867,7 @@ impl AddressSpace {
                 options(nostack, preserves_flags),
             );
         }
-        Some(USER_SHARED_VA)
+        Some(base)
     }
 
     /// Map a DMA buffer (`pages` physically-contiguous frames at `phys`) into this

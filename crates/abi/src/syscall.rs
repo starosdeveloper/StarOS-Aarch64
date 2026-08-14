@@ -76,6 +76,15 @@ pub enum Syscall {
     /// return its virtual address. `arg0` = a *shared* capability handle (created
     /// by [`CreateShared`], possibly received over IPC). Both holders see the same
     /// physical page at their own virtual address.
+    ///
+    /// **Where** it lands is the kernel's choice and must be read from the return
+    /// value, never assumed. One object keeps one address for the life of a task —
+    /// mapping the same buffer twice returns the same pointer and costs nothing —
+    /// while a *different* buffer gets a different address, so a server can hold
+    /// several at once. Until this rule existed every mapping went to one fixed
+    /// address, which is one buffer: a display server's second surface silently
+    /// replaced its first, and the symptom was a window drawing another window's
+    /// pixels.
     MapShared = 15,
     /// Create a DMA buffer: `arg0` = number of 4 KiB pages. Unlike shared memory,
     /// the pages are guaranteed **physically contiguous** (a device sees physical

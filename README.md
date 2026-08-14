@@ -182,8 +182,9 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [inputsrv] virtio-input driver up in EL0: queue armed, waiting for the device
 [devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
 [devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
-[displaysrv] composited a client surface onto a screen the client cannot touch
-[fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen
+[displaysrv] composited client surfaces onto a screen no client can touch
+[displaysrv] 2 surface(s) live, 3 commit(s), 12352 pixel(s) composited, 0 refused
+[fbclient] two 64x64 surfaces composited by displaysrv - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096
 [fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
 [hello-c] clock: 407402608 ns across a 20 ms nanosleep
 [child] hello - I was created at runtime, not by the kernel
@@ -219,17 +220,17 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
 [hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 20990848 ns
-[hello-c] endpoint in poll: a message from another process woke the loop in 893344 ns
+[hello-c] endpoint in poll: a message from another process woke the loop in 1532656 ns
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 73 requests, 157 bytes of file data, and refused 11 - the archive never left this address space
-clock: the demo took 5674 ms on the monotonic clock, during which core 0 took 57 tick(s)
-sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 12624 us
-scheduler: all tasks finished after 57 timer ticks; task table grew to 34 (old fixed max 8)
+clock: the demo took 6136 ms on the monotonic clock, during which core 0 took 59 tick(s)
+sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 2870 us
+scheduler: all tasks finished after 59 timer ticks; task table grew to 34 (old fixed max 8)
 task teardown: reaped 32 dead-task kernel stacks (1024 KiB returned to the heap)
 user stacks: 41 page(s) mapped on demand (164 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=57
+preemption: timer ticks per core — cpu0=59
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x40329000 (exited client's root was 0x4031a000)
+frame reclaim: post-teardown alloc 0x4032d000 (exited client's root was 0x4031e000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
   (2 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
 shutting down (PSCI SYSTEM_OFF)

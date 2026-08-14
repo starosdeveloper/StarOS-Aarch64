@@ -9,7 +9,13 @@ What this asserts, at named coordinates, is the claim the phase makes:
 
   * the client's 64x64 red surface is on the glass, at (100, 80), where the client
     asked for it and nowhere else;
-  * around it is the display server's background, which only the server draws;
+  * its 64x64 blue surface is on the glass at (140, 110), overlapping the red one —
+    two surfaces at two addresses, which is the whole reason the kernel now keeps a
+    placement per shared object rather than one fixed address;
+  * *in the overlap* the pixels are red, because the client raised the red surface
+    after both were committed. Blue there means the stack order lives in the
+    server's list and not on the screen;
+  * around them is the display server's background, which only the server draws;
   * the kernel's green console text is *gone* from the region the server owns —
     a kernel that kept mirroring would be writing over the composited frame.
 
@@ -25,9 +31,11 @@ import time
 
 # What the two programs paint, as they write them (see displaysrv/main.rs and the
 # fbclient role in init's image.rs).
-SURFACE = (0xFF, 0x00, 0x00)  # the client's red square
+SURFACE = (0xFF, 0x00, 0x00)  # the client's red square, raised to the top
+SECOND = (0x00, 0x00, 0xFF)  # its blue square, underneath and offset
 BACKGROUND = (0x10, 0x20, 0x30)  # the server's background
 SURFACE_AT = (100, 80)
+SECOND_AT = (140, 110)
 SURFACE_SIZE = 64
 
 
@@ -84,18 +92,38 @@ def check(path):
         if not near(at(x, y), SURFACE):
             return (False, f"surface pixel ({x},{y}) is {at(x, y)}, not red")
 
-    # Just outside every edge must be background, not surface: this is what
-    # catches a blit that is one pixel too wide or offset by a row.
-    for x, y in [(sx - 2, sy + n // 2), (sx + n + 1, sy + n // 2), (sx + n // 2, sy - 2)]:
+    # The second surface, in the part of it the first does not cover.
+    bx, by = SECOND_AT
+    for x, y in [(bx + n - 2, by + n - 2), (bx + n // 2, by + n - 2), (bx + n - 2, by + 2)]:
+        if not near(at(x, y), SECOND):
+            return (False, f"second-surface pixel ({x},{y}) is {at(x, y)}, not blue")
+
+    # The overlap: red, because the red surface was raised after both were drawn.
+    # This is the pixel that tells a stacking order apart from a list of windows.
+    ox, oy = bx + 4, by + 4
+    if not near(at(ox, oy), SURFACE):
+        return (False, f"overlap pixel ({ox},{oy}) is {at(ox, oy)}, not the raised surface's red")
+
+    # Just outside must be background, not surface: this is what catches a blit
+    # one pixel too wide or offset by a row. The probes avoid the second surface,
+    # which legitimately occupies the space below and to the right of the first.
+    for x, y in [(sx - 2, sy + n // 2), (sx + n // 2, sy - 2), (sx + 2, sy + n + 2)]:
         if not near(at(x, y), BACKGROUND):
             return (False, f"pixel ({x},{y}) beside the surface is {at(x, y)}, not the background")
+    for x, y in [(bx + n + 2, by + n // 2), (bx + n // 2, by + n + 2)]:
+        if not near(at(x, y), BACKGROUND):
+            return (False, f"pixel ({x},{y}) beside the second surface is {at(x, y)}, not the background")
 
     # And the server's background must cover the area the kernel's console used to
     # write in. Green text there means the kernel never stopped mirroring.
     greens = sum(1 for x in range(0, w, 4) for y in range(0, 40, 4) if at(x, y)[1] > 80)
     if greens:
         return (False, f"{greens} green console pixels remain in the top rows")
-    return (True, f"{w}x{h}: surface at {SURFACE_AT}, background around it, no console text")
+    return (
+        True,
+        f"{w}x{h}: surfaces at {SURFACE_AT} and {SECOND_AT}, the raised one on top "
+        "in the overlap, background around them, no console text",
+    )
 
 
 def main():

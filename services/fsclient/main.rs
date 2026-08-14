@@ -30,9 +30,6 @@
 use core::arch::{asm, naked_asm};
 use core::panic::PanicInfo;
 
-/// Where a shared buffer we create appears in our address space.
-const USER_SHARED_VA: u64 = 0x5_0000_0000;
-
 /// Where the initramfs is mapped **in the file server's** space. Nothing is mapped
 /// there in ours, which is what the last step demonstrates.
 const USER_INITRD_VA: u64 = 0x9_0000_0000;

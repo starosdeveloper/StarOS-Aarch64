@@ -394,8 +394,15 @@ req "framebuffer: ramfb 640x480 online"
 # coordinates, which every line here passes).
 req "framebuffer: handed to displaysrv"
 req "[displaysrv] the screen is mine"
-req "[displaysrv] composited a client surface onto a screen the client cannot touch"
-req "[fbclient] 64x64 surface composited by displaysrv"
+req "[displaysrv] composited client surfaces onto a screen no client can touch"
+# The window-system half: two overlapping surfaces from one client, restacked, and
+# a commit that repainted only the rectangle it named. The tally is exact — two
+# full commits and a raise at 4096 pixels each, plus 64 for the 8x8 damage — so a
+# server quietly repainting whole surfaces on every commit fails this line rather
+# than merely being slow.
+req "[displaysrv] 2 surface(s) live, 3 commit(s), 12352 pixel(s) composited, 0 refused"
+req "[fbclient] two 64x64 surfaces composited by displaysrv"
+forbid "[fbclient] SURFACE WRONG"
 forbid "SURFACE WRONG"
 # The single-core font self-test runs before SMP/tasks, so it must appear on a
 # machine with a framebuffer — and proves the line-atomic DebugWrite path is wired.

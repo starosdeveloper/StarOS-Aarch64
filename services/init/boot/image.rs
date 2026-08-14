@@ -873,53 +873,98 @@ extern "C" fn _start() -> ! {
         ".Lfbclient:",
         "cmp w19, #13",
         "b.ne .Lloaded",             // id != 13 -> the loaded-from-a-file role
-        // A 64x64 surface: 16 KiB, four pages of shared memory.
+        // Two 64x64 surfaces, deliberately overlapping. One would prove a rectangle
+        // reaches the glass; two prove the server keeps them apart, stacks them, and
+        // repaints only what a commit says changed. Each is 16 KiB, four pages.
+        //
+        // The second buffer landing at its own address is itself a claim: until the
+        // kernel kept one placement per shared object, every MapShared returned the
+        // same address and the second surface simply replaced the first.
         "mov x0, #4",
         "mov x8, #14",               // Syscall::CreateShared
         "svc #0",
         "cmp x0, #0",
         "b.lt .Lfb_bad",
-        "mov x21, x0",               // x21 = the surface's capability handle
+        "mov x21, x0",               // x21 = the red surface's capability handle
         "mov x8, #15",               // Syscall::MapShared
         "svc #0",
         "cmp x0, #0",
         "b.lt .Lfb_bad",
-        "mov x22, x0",               // x22 = the pixels, in our own space
-        // Fill it: 64*64 = 4096 pixels of solid red, xRGB8888.
-        "movz w23, #0x00FF, lsl #16",  // 0x00FF0000
-        "mov x24, #4096",
-        "mov x25, x22",
-        ".Lfb_fill:",
-        "str w23, [x25], #4",
-        "subs x24, x24, #1",
-        "b.ne .Lfb_fill",
-        // Ask the server to composite it at (100, 80).
+        "mov x22, x0",               // x22 = the red pixels, in our own space
+        "movz w23, #0x00FF, lsl #16",  // 0x00FF0000, solid red
+        "bl .Lfb_fill",
+        "mov x0, #4",
+        "mov x8, #14",               // Syscall::CreateShared
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lfb_bad",
+        "mov x26, x0",               // x26 = the blue surface's capability handle
+        "mov x8, #15",               // Syscall::MapShared
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lfb_bad",
+        "mov x27, x0",               // x27 = the blue pixels
+        "cmp x27, x22",
+        "b.eq .Lfb_bad",             // two buffers, one address: the placement broke
+        "mov x22, x27",
+        "mov w23, #0x00FF",          // 0x000000FF, solid blue
+        "bl .Lfb_fill",
+        // Create the red surface at (100, 80).
+        "mov x24, #100",
+        "mov x25, #80",
+        "mov w28, w21",
+        "bl .Lfb_create",
+        "mov x20, x0",               // x20 = the red surface's id
+        // Create the blue one at (140, 110): its top-left quarter lies over the red
+        // surface's bottom-right, which is the overlap the screen check reads.
+        "mov x24, #140",
+        "mov x25, #110",
+        "mov w28, w26",
+        "bl .Lfb_create",
+        "mov x21, x0",               // x21 = the blue surface's id (its cap is done)
+        // Commit both in full. 64*64 = 4096 pixels each.
+        "mov x0, x20",
+        "mov x24, #64",
+        "mov x25, #64",
+        "bl .Lfb_commit",
+        "mov x26, #4096",
+        "cmp x0, x26",
+        "b.ne .Lfb_bad",
+        "mov x0, x21",
+        "mov x24, #64",
+        "mov x25, #64",
+        "bl .Lfb_commit",
+        "cmp x0, x26",
+        "b.ne .Lfb_bad",
+        // Raise the red surface. It was created first, so it was underneath; after
+        // this the overlap must be red, and that is what the screenshot checks.
         "stp xzr, xzr, [x11]",
         "stp xzr, xzr, [x11, #16]",
         "stp xzr, xzr, [x11, #32]",
-        "mov x0, #1",
-        "str x0, [x11]",             // msg.tag = 1 (Commit)
-        "mov x0, #64",
-        "str x0, [x11, #8]",         // words[0] = width
-        "str x0, [x11, #16]",        // words[1] = height
-        "mov x0, #100",
-        "str x0, [x11, #24]",        // words[2] = x
-        "mov x0, #80",
-        "str x0, [x11, #32]",        // words[3] = y
-        "str w21, [x11, #40]",       // msg.cap = the surface, delegated
-        "mov x0, #1",                // handle 1 = the display endpoint (send)
-        "mov x1, x11",
-        "mov x8, #1",                // Syscall::Send
-        "svc #0",
-        // Wait for the reply: pixels on the glass, not merely sent.
-        "mov x0, #2",                // handle 2 = the reply endpoint (recv)
-        "mov x1, x11",
-        "mov x8, #2",                // Syscall::Recv
-        "svc #0",
-        "ldr x20, [x11, #8]",        // words[0] = pixels the server drew
-        "mov x24, #4096",
-        "cmp x20, x24",
-        "b.ne .Lfb_bad",             // it drew a different number than we sent
+        "mov x0, #4",
+        "str x0, [x11]",             // msg.tag = 4 (Raise)
+        "str x20, [x11, #8]",        // words[0] = the red surface
+        "bl .Lfb_call",
+        "cmp x0, x26",
+        "b.ne .Lfb_bad",             // a raise repaints the whole surface: 4096
+        // Commit an 8x8 corner of it. The reply must be 64 pixels and not 4096:
+        // damage that is not honoured is a full-frame copy wearing a smaller number,
+        // and at 1080p that is the difference between sixty frames and a slide show.
+        "mov x0, x20",
+        "mov x24, #8",
+        "mov x25, #8",
+        "bl .Lfb_commit",
+        "mov x27, #64",
+        "cmp x0, x27",
+        "b.ne .Lfb_bad",
+        // Say goodbye, so the server ends its loop rather than being killed inside
+        // it. A server that only exits by dying never proves it can stop cleanly.
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #9",
+        "str x0, [x11]",             // msg.tag = 9 (Bye)
+        "bl .Lfb_call",
         "adr x2, 27f",
         "bl .Lputs",
         "mov x8, #4",                // Syscall::Exit
@@ -929,6 +974,71 @@ extern "C" fn _start() -> ! {
         "bl .Lputs",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
+
+        // -------- fbclient helpers --------
+        // Fill 4096 pixels at x22 with the colour in w23.
+        ".Lfb_fill:",
+        "mov x9, #4096",
+        "mov x10, x22",
+        ".Lfb_fill_loop:",
+        "str w23, [x10], #4",
+        "subs x9, x9, #1",
+        "b.ne .Lfb_fill_loop",
+        "ret",
+        // Create a 64x64 surface at (x24, y25) from the capability in w28; returns
+        // its id in x0.
+        ".Lfb_create:",
+        "mov x12, x30",              // .Lputs and the call below clobber x30
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #1",
+        "str x0, [x11]",             // msg.tag = 1 (Create)
+        "mov x0, #64",
+        "str x0, [x11, #8]",         // words[0] = width
+        "str x0, [x11, #16]",        // words[1] = height
+        "str x24, [x11, #24]",       // words[2] = x
+        "str x25, [x11, #32]",       // words[3] = y
+        "str w28, [x11, #40]",       // msg.cap = the buffer, delegated
+        "bl .Lfb_call",
+        "mov x30, x12",
+        "ret",
+        // Commit the surface in x0 with a damage rectangle of (x24, x25) at its
+        // origin; returns the pixels the server wrote.
+        ".Lfb_commit:",
+        "mov x12, x30",
+        "mov x13, x0",
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #3",
+        "str x0, [x11]",             // msg.tag = 3 (Commit)
+        "str x13, [x11, #8]",        // words[0] = surface id
+        // words[1] = damage origin, x | y << 32, both zero here.
+        "lsl x0, x25, #32",
+        "orr x0, x0, x24",
+        "str x0, [x11, #24]",        // words[2] = w | h << 32
+        "bl .Lfb_call",
+        "mov x30, x12",
+        "ret",
+        // Send the message at x11 and wait for the reply; returns words[0] in x0,
+        // or jumps to the failure path if the server refused.
+        ".Lfb_call:",
+        "mov x14, x30",
+        "mov x0, #1",                // handle 1 = the display endpoint (send)
+        "mov x1, x11",
+        "mov x8, #1",                // Syscall::Send
+        "svc #0",
+        "mov x0, #2",                // handle 2 = the reply endpoint (recv)
+        "mov x1, x11",
+        "mov x8, #2",                // Syscall::Recv
+        "svc #0",
+        "ldr x0, [x11]",             // reply tag: 2 is ok, 0 is a refusal
+        "cmp x0, #2",
+        "b.ne .Lfb_bad",
+        "ldr x0, [x11, #8]",         // words[0] = the result
+        "mov x30, x14",
+        "ret",
 
         // ============ loaded from a file (id 12) ============
         // Same bytes as every other role here, but this copy did not come from the
@@ -1048,9 +1158,9 @@ extern "C" fn _start() -> ! {
         "26:",
         ".asciz \"[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes\\n\"",
         "27:",
-        ".asciz \"[fbclient] 64x64 surface composited by displaysrv - 4096 pixels, and I never touched the screen\\n\"",
+        ".asciz \"[fbclient] two 64x64 surfaces composited by displaysrv - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096\\n\"",
         "28:",
-        ".asciz \"[fbclient] SURFACE WRONG - the buffer would not allocate, or the server drew a different rectangle\\n\"",
+        ".asciz \"[fbclient] SURFACE WRONG - a buffer would not allocate, two of them landed at one address, the server refused a request, or it repainted a different rectangle than the commit named\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,

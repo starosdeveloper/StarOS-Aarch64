@@ -413,7 +413,9 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // same physical page.
         Some(Syscall::MapShared) => match sched::resolve_cap(req.args[0] as u32) {
             Some(Cap::Shared { obj }) => match obj::get(obj) {
-                Some(Object::SharedMemory { phys, pages }) => sched::map_shared_current(phys, pages),
+                Some(Object::SharedMemory { phys, pages }) => {
+                    sched::map_shared_current(obj, phys, pages)
+                }
                 _ => KError::BadHandle.as_raw(),
             },
             Some(_) => KError::PermissionDenied.as_raw(),

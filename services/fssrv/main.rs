@@ -65,9 +65,6 @@ use staros_cpio::{Archive, Entry};
 /// at `+24` and its length at `+32` (see `AddressSpace::write_initrd_info`).
 const USER_DATA_VA: u64 = 0x4_0000_0000;
 
-/// Where a mapped shared buffer appears in our address space (`AddressSpace::map_shared`).
-const USER_SHARED_VA: u64 = 0x5_0000_0000;
-
 // Syscall numbers — must match `staros_abi::syscall::Syscall`.
 const SYS_SEND: usize = 1;
 const SYS_RECV: usize = 2;
@@ -373,11 +370,12 @@ impl Buffer {
     /// Map the buffer a delegated handle names, or `None` if the handle names no
     /// shared memory.
     ///
-    /// Each request remaps at [`USER_SHARED_VA`], replacing whatever the previous
-    /// one left there. That is what lets one server serve buffers from different
-    /// clients with a single mapping window; the cost is that a shorter buffer
-    /// leaves the tail pages of a longer predecessor mapped, which is why `len`
-    /// comes from this handle's own page count and nothing here ever walks past it.
+    /// The address comes from the kernel and is used as returned, never assumed.
+    /// One object keeps one placement for the life of the task, so a client's
+    /// buffer stays where it first landed and a *second* client's gets its own
+    /// address — which is why this may not cache the pointer across requests, and
+    /// why `len` comes from this handle's own page count rather than from the
+    /// previous request's.
     fn map(cap: u32) -> Option<Self> {
         if cap == 0 {
             return None;

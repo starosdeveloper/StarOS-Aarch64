@@ -161,6 +161,65 @@ struct Task {
     /// loads a half-saved context, and there is no cross-core spin to deadlock. Set
     /// when a task is marked `Running`; every access is under the scheduler lock.
     on_cpu: AtomicBool,
+    /// Where each shared-memory object this task has mapped landed in its address
+    /// space, and how far the placement cursor has advanced.
+    ///
+    /// One entry per *object*, not per mapping call, and that is the whole point.
+    /// A file server remaps its client's one bounce buffer on every request; a
+    /// display server maps a different buffer for every surface and needs them all
+    /// at once. A fixed address serves the first and breaks the second; a cursor
+    /// that advances on every call serves the second and makes the first climb
+    /// through its address space one page per request until the page tables eat the
+    /// heap. Remembering the placement serves both: the same object comes back to
+    /// the same address, a new one gets the next.
+    shared: SharedPlacements,
+}
+
+/// How many distinct shared buffers one task may have mapped at once.
+///
+/// A display server needs one per surface, so this is the ceiling on windows on
+/// screen — a number that will have to grow, and is deliberately a constant here
+/// rather than a `Vec` while the answer to "how many" is still a guess. The honest
+/// failure at the limit is [`KError::OutOfResources`] from `MapShared`, not a
+/// silently reused address.
+const MAX_SHARED_MAPPINGS: usize = 16;
+
+/// The per-task record of shared-buffer placements. See [`Task::shared`].
+#[derive(Clone, Copy)]
+struct SharedPlacements {
+    entries: [Option<(crate::obj::ObjectRef, u64)>; MAX_SHARED_MAPPINGS],
+    /// The next unused address. Grows by whole buffers, never reused: a placement
+    /// outlives the mapping in the tables, because unmapping is not a thing this
+    /// system does yet and pretending otherwise would hand out an address whose
+    /// old pages are still there.
+    cursor: u64,
+}
+
+impl SharedPlacements {
+    const fn new() -> Self {
+        Self {
+            entries: [None; MAX_SHARED_MAPPINGS],
+            cursor: staros_arch_aarch64::addrspace::USER_SHARED_VA,
+        }
+    }
+
+    /// The address this object already occupies, if it has one.
+    fn find(&self, obj: crate::obj::ObjectRef) -> Option<u64> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|(o, _)| *o == obj)
+            .map(|(_, va)| *va)
+    }
+
+    /// Reserve an address for `obj`'s `pages`, or `None` if the table is full.
+    fn place(&mut self, obj: crate::obj::ObjectRef, pages: u32) -> Option<u64> {
+        let slot = self.entries.iter_mut().find(|e| e.is_none())?;
+        let va = self.cursor;
+        *slot = Some((obj, va));
+        self.cursor += u64::from(pages) * 4096;
+        Some(va)
+    }
 }
 
 /// Allocate a zeroed kernel stack, or `None` if the heap is exhausted.
@@ -431,11 +490,17 @@ fn post_switch() {
 ///   capability minted *after* the thread starts is not visible to it.
 pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
     let cpu = me();
-    let (cur, _old_space, caps, pid) = {
+    let (cur, _old_space, caps, pid, shared) = {
         let sched = SCHED.lock();
         let cur = sched.current[cpu];
         match sched.tasks[cur].space {
-            Some(s) => (cur, s, sched.tasks[cur].caps.clone(), sched.tasks[cur].pid),
+            Some(s) => (
+                cur,
+                s,
+                sched.tasks[cur].caps.clone(),
+                sched.tasks[cur].pid,
+                sched.tasks[cur].shared,
+            ),
             None => return KError::InvalidArgument.as_raw(),
         }
     };
@@ -489,6 +554,11 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
         mailbox: None,
         wake_pending: false,
         on_cpu: AtomicBool::new(false),
+        // A *copy* of the creator's placements, exactly like the capability table
+        // above and for a sharper reason: the pages are already in this address
+        // space at those addresses. A thread starting with an empty table would put
+        // its first new buffer on top of one its creator is using.
+        shared,
     }) else {
         return KError::OutOfResources.as_raw();
     };
@@ -562,6 +632,7 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         mailbox: None,
         wake_pending: false,
         on_cpu: AtomicBool::new(false),
+        shared: SharedPlacements::new(),
     })?;
 
     let mut sched = SCHED.lock();
@@ -1247,17 +1318,32 @@ pub fn map_device_current(dev_phys: u64) -> isize {
 /// Map the shared buffer (`pages` frames at `phys`) into the *current* task's
 /// address space and return the resulting user virtual address (or a negative
 /// [`KError`] if the caller is not a user task). Backs the `MapShared` syscall.
-pub fn map_shared_current(phys: u64, pages: u32) -> isize {
-    let space = {
-        let sched = SCHED.lock();
-        sched.tasks[sched.current[me()]].space
+pub fn map_shared_current(obj: crate::obj::ObjectRef, phys: u64, pages: u32) -> isize {
+    // Decide the address under the lock, map outside it: the walk may allocate a
+    // table frame, and the frame pool must never be entered holding this lock.
+    let (space, base, already) = {
+        let mut sched = SCHED.lock();
+        let cur = sched.current[me()];
+        let space = sched.tasks[cur].space;
+        match sched.tasks[cur].shared.find(obj) {
+            // Mapped already: the same object gives the same address, and the
+            // mapping is still there, so there is nothing left to do.
+            Some(va) => (space, va, true),
+            None => match sched.tasks[cur].shared.place(obj, pages) {
+                Some(va) => (space, va, false),
+                None => return KError::OutOfResources.as_raw(),
+            },
+        }
     };
+    if already {
+        return base as isize;
+    }
     match space {
         Some(s) => {
             // SAFETY: at EL1 with the task's tables reachable through the linear
             // map; the frames belong to a shared object the kernel allocated. The
             // walk may need a frame for a missing table.
-            let va = crate::mem::with(|frames| unsafe { s.map_shared(frames, phys, pages) });
+            let va = crate::mem::with(|frames| unsafe { s.map_shared(frames, base, phys, pages) });
             va.map_or(KError::OutOfResources.as_raw(), |v| v as isize)
         }
         None => KError::InvalidArgument.as_raw(),
