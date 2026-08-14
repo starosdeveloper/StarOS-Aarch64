@@ -106,6 +106,117 @@ pub(crate) fn to_upper(c: c_int) -> c_int {
     }
 }
 
+/// glibc's classification bits, in the order its header assigns them.
+///
+/// `_ISbit(n)` is `(1 << n) << 8` for the first eight and `(1 << n) >> 8` after —
+/// a byte-swapped layout that exists because glibc stores the table in network
+/// order on some targets. The numbers are copied rather than derived: they are an
+/// ABI, and a table whose bits were assigned differently would classify every
+/// character wrongly through `std::ctype` while `isalpha` kept working.
+const fn bit(n: u32) -> u16 {
+    if n < 8 {
+        ((1u32 << n) << 8) as u16
+    } else {
+        ((1u32 << n) >> 8) as u16
+    }
+}
+
+const IS_UPPER: u16 = bit(0);
+const IS_LOWER: u16 = bit(1);
+const IS_ALPHA: u16 = bit(2);
+const IS_DIGIT: u16 = bit(3);
+const IS_XDIGIT: u16 = bit(4);
+const IS_SPACE: u16 = bit(5);
+const IS_PRINT: u16 = bit(6);
+const IS_GRAPH: u16 = bit(7);
+const IS_BLANK: u16 = bit(8);
+const IS_CNTRL: u16 = bit(9);
+const IS_PUNCT: u16 = bit(10);
+const IS_ALNUM: u16 = bit(11);
+
+/// The mask for one byte value.
+const fn mask_of(c: u8) -> u16 {
+    let mut m = 0u16;
+    if c.is_ascii_uppercase() {
+        m |= IS_UPPER | IS_ALPHA | IS_ALNUM;
+    }
+    if c.is_ascii_lowercase() {
+        m |= IS_LOWER | IS_ALPHA | IS_ALNUM;
+    }
+    if c.is_ascii_digit() {
+        m |= IS_DIGIT | IS_ALNUM | IS_XDIGIT;
+    }
+    if matches!(c, b'a'..=b'f' | b'A'..=b'F') {
+        m |= IS_XDIGIT;
+    }
+    if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+        m |= IS_SPACE;
+    }
+    if matches!(c, b' ' | b'\t') {
+        m |= IS_BLANK;
+    }
+    if c.is_ascii_control() {
+        m |= IS_CNTRL;
+    }
+    if c.is_ascii_graphic() {
+        m |= IS_GRAPH;
+    }
+    if c >= 0x20 && c < 0x7f {
+        m |= IS_PRINT;
+    }
+    if c.is_ascii_punctuation() {
+        m |= IS_PUNCT;
+    }
+    m
+}
+
+/// The table libstdc++ indexes, 384 entries wide.
+///
+/// It runs from -128 to 255 because a signed `char` is used as the index directly.
+/// The first 128 entries — the negative half — are zero: this is the C locale, and
+/// a byte above 127 classifies as nothing. Getting the offset wrong would make
+/// every high byte a letter, which surfaces months later as a parser accepting
+/// rubbish.
+const fn build_masks() -> [u16; 384] {
+    let mut table = [0u16; 384];
+    let mut i = 0;
+    while i < 256 {
+        table[128 + i] = mask_of(i as u8);
+        i += 1;
+    }
+    table
+}
+
+static CTYPE_MASKS: [u16; 384] = build_masks();
+
+const fn build_case(upper: bool) -> [i32; 384] {
+    let mut table = [0i32; 384];
+    let mut i = 0;
+    while i < 256 {
+        let c = i as u8;
+        let mapped = if upper {
+            if c.is_ascii_lowercase() {
+                c - 32
+            } else {
+                c
+            }
+        } else if c.is_ascii_uppercase() {
+            c + 32
+        } else {
+            c
+        };
+        table[128 + i] = mapped as i32;
+        // The negative half maps to itself: those indices are bytes above 127 seen
+        // as signed, and the C locale changes the case of none of them.
+        table[i] = (i as i32) - 128;
+        i += 1;
+    }
+    table
+}
+
+static CTYPE_TOLOWER: [i32; 384] = build_case(false);
+static CTYPE_TOUPPER: [i32; 384] = build_case(true);
+
 /// The C entry points.
 #[cfg(not(test))]
 pub mod exports {
@@ -141,6 +252,64 @@ pub mod exports {
     #[no_mangle]
     pub extern "C" fn toupper(c: c_int) -> c_int {
         super::to_upper(c)
+    }
+
+    // The three `*_loc` functions return a pointer *to a pointer* to the table.
+    //
+    // The extra indirection is glibc's, and it is there so a thread can have its
+    // own locale: the inner pointer is thread-local there and changes when
+    // `uselocale` is called. There is one locale here and no `uselocale`, so the
+    // cell is a static and every thread sees the same table — which is correct
+    // rather than a simplification, because with one locale there is nothing for
+    // two threads to disagree about.
+
+    static MASKS: &[u16; 384] = &super::CTYPE_MASKS;
+    static TOLOWER: &[i32; 384] = &super::CTYPE_TOLOWER;
+    static TOUPPER: &[i32; 384] = &super::CTYPE_TOUPPER;
+
+    /// The cells the `*_loc` functions hand out. Each holds the address of the
+    /// table's *zero* entry, so `table[-1]` is the byte 0xff seen as signed — which
+    /// is the whole reason the tables are 384 wide and start at -128.
+    static MASK_CELL: MaskCell = MaskCell(core::sync::atomic::AtomicPtr::new(
+        core::ptr::null_mut(),
+    ));
+    static LOWER_CELL: CaseCell = CaseCell(core::sync::atomic::AtomicPtr::new(
+        core::ptr::null_mut(),
+    ));
+    static UPPER_CELL: CaseCell = CaseCell(core::sync::atomic::AtomicPtr::new(
+        core::ptr::null_mut(),
+    ));
+
+    struct MaskCell(core::sync::atomic::AtomicPtr<u16>);
+    struct CaseCell(core::sync::atomic::AtomicPtr<i32>);
+    // SAFETY: the pointer only ever holds the address of a `'static` table, and
+    // every write stores the same value.
+    unsafe impl Sync for MaskCell {}
+    unsafe impl Sync for CaseCell {}
+
+    #[no_mangle]
+    pub extern "C" fn __ctype_b_loc() -> *mut *const u16 {
+        // SAFETY: `MASKS` is `'static`; offsetting to entry 128 is inside it, and
+        // the pointer handed out is only ever indexed from -128 to 255.
+        let base = unsafe { MASKS.as_ptr().add(128) };
+        MASK_CELL.0.store(base.cast_mut(), core::sync::atomic::Ordering::Relaxed);
+        MASK_CELL.0.as_ptr().cast::<*const u16>()
+    }
+
+    #[no_mangle]
+    pub extern "C" fn __ctype_tolower_loc() -> *mut *const c_int {
+        // SAFETY: as above.
+        let base = unsafe { TOLOWER.as_ptr().add(128) };
+        LOWER_CELL.0.store(base.cast_mut(), core::sync::atomic::Ordering::Relaxed);
+        LOWER_CELL.0.as_ptr().cast::<*const c_int>()
+    }
+
+    #[no_mangle]
+    pub extern "C" fn __ctype_toupper_loc() -> *mut *const c_int {
+        // SAFETY: as above.
+        let base = unsafe { TOUPPER.as_ptr().add(128) };
+        UPPER_CELL.0.store(base.cast_mut(), core::sync::atomic::Ordering::Relaxed);
+        UPPER_CELL.0.as_ptr().cast::<*const c_int>()
     }
 }
 

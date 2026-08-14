@@ -77,6 +77,7 @@ pub mod surface;
 pub mod sys;
 pub mod thread;
 pub mod time;
+pub mod wctype;
 
 /// Allocate from the process heap, aligned, for the parts of this library that
 /// need memory before C does — thread control blocks and TLS.

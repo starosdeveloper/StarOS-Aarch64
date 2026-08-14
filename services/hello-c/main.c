@@ -102,6 +102,7 @@ ssize_t write(int fd, const void *buf, size_t count);
  * implementation. Included rather than redeclared, for the same reason. */
 #include <ctype.h>
 #include <sys/select.h>
+#include <wctype.h>
 /* Declared here rather than through <sys/time.h>: that header pulls in <time.h>,
  * whose `struct tm` this file already declares by hand. Two definitions of one
  * struct is an error even when they agree. */
@@ -1929,6 +1930,21 @@ static void check_ctype(void)
     int evaluated = 0;
     assert(++evaluated == 1);
     check(evaluated == 1, "assert evaluated its argument exactly once");
+
+    /* The wide half, which QML found: libstdc++'s <cwctype> is what QV4's lexer
+     * pulls in, so the JavaScript engine does not compile without these. */
+    check(iswalpha(L'a') && !iswalpha(L'5'), "iswalpha");
+    check(iswdigit(L'7') && !iswdigit(L'a'), "iswdigit");
+    check(iswspace(L'\n') && !iswblank(L'\n'), "iswspace and iswblank differ here too");
+    check(towlower(L'Q') == L'q' && towupper(L'q') == L'Q', "towlower and towupper");
+    check(iswctype(L'f', wctype("xdigit")), "iswctype through a named class");
+    check(!iswctype(L'a', wctype("nonsense")), "and an unknown class classifies nothing");
+
+    /* Above ASCII classifies as nothing, in the C locale, on purpose. Deciding
+     * whether U+00E9 is a letter needs the Unicode database; a guess would have a
+     * lexer accept identifiers it should reject. */
+    check(!iswalpha(0xe9) && !iswalnum(0x4e2d), "nothing above ASCII is a letter here");
+    check(towlower(0xc9) == 0xc9, "and its case does not change");
 
     puts("[hello-c] ctype: fourteen classifications the header had promised and nobody had written");
 }

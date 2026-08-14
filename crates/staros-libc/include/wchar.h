@@ -17,7 +17,10 @@
 extern "C" {
 #endif
 
+#ifndef __STAROS_WINT_DEFINED
+#define __STAROS_WINT_DEFINED 1
 typedef __WINT_TYPE__ wint_t;
+#endif
 
 typedef struct {
     int __count;

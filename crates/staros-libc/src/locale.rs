@@ -181,6 +181,88 @@ pub mod exports {
     pub unsafe extern "C" fn duplocale(_loc: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
         1 as *mut core::ffi::c_void
     }
+
+    // gettext, on a system with no message catalogues.
+    //
+    // Translation of a string, when no catalogue exists, *is* the string — that is
+    // what gettext itself returns on a miss, so a caller cannot tell this apart
+    // from a real implementation that found nothing. libstdc++'s `std::messages`
+    // facet is built on these for a glibc target, and QV4 reaches it through
+    // `<locale>`.
+
+    /// # Safety
+    /// C ABI: `msgid` is a NUL-terminated string, returned unchanged.
+    #[no_mangle]
+    pub unsafe extern "C" fn gettext(msgid: *const c_char) -> *mut c_char {
+        msgid.cast_mut()
+    }
+
+    /// # Safety
+    /// As [`gettext`].
+    #[no_mangle]
+    pub unsafe extern "C" fn dgettext(
+        _domain: *const c_char,
+        msgid: *const c_char,
+    ) -> *mut c_char {
+        msgid.cast_mut()
+    }
+
+    /// # Safety
+    /// As [`gettext`].
+    #[no_mangle]
+    pub unsafe extern "C" fn dcgettext(
+        _domain: *const c_char,
+        msgid: *const c_char,
+        _category: core::ffi::c_int,
+    ) -> *mut c_char {
+        msgid.cast_mut()
+    }
+
+    /// Plural selection, in the only rule this library knows: English's.
+    ///
+    /// One is singular and everything else — including zero — is plural. Real
+    /// gettext takes the rule from the catalogue, because languages disagree
+    /// (Russian has three forms and picks by the last two digits). With no
+    /// catalogue there is no rule to read, and English's is the one that matches
+    /// the untranslated strings in the source.
+    ///
+    /// # Safety
+    /// C ABI: both are NUL-terminated strings.
+    #[no_mangle]
+    pub unsafe extern "C" fn ngettext(
+        singular: *const c_char,
+        plural: *const c_char,
+        n: core::ffi::c_ulong,
+    ) -> *mut c_char {
+        if n == 1 {
+            singular.cast_mut()
+        } else {
+            plural.cast_mut()
+        }
+    }
+
+    /// # Safety
+    /// C ABI: `domain` is a NUL-terminated string or null.
+    #[no_mangle]
+    pub unsafe extern "C" fn textdomain(domain: *const c_char) -> *mut c_char {
+        // The domain is accepted and remembered nowhere, because nothing looks it
+        // up. Returning it back is what glibc does and lets a caller's round-trip
+        // check pass without a claim being made.
+        domain.cast_mut()
+    }
+
+    /// Null: there is no directory of catalogues, and a caller that checks the
+    /// result learns so. Answering with the path would claim one had been found.
+    ///
+    /// # Safety
+    /// C ABI.
+    #[no_mangle]
+    pub unsafe extern "C" fn bindtextdomain(
+        _domain: *const c_char,
+        _dirname: *const c_char,
+    ) -> *mut c_char {
+        core::ptr::null_mut()
+    }
 }
 
 #[cfg(test)]

@@ -65,6 +65,57 @@ for src in "$PLUGIN"/*.cpp; do
     fi
 done
 
+# The QML half. He asked for a 100% QML interface, so the modules that matter are
+# QtQml and QtQuick — including QV4, the JavaScript engine, and the *software*
+# scene-graph adaptation, which is the renderer this system will use because there
+# is no GPU driver and the build is `-no-opengl`.
+#
+# Nothing is compiled from the plugin here: these are Qt's own headers, and what is
+# being asked is whether this sysroot can host them at all. It is the cheapest way
+# to find a missing header — QV4 pulled in <cwctype>, which named nineteen
+# functions nobody had written, and libstdc++'s locale machinery reached past
+# ctype.h for glibc's classification table.
+QML_PROBE="$(mktemp /tmp/qpa-qml-XXXXXX.cpp)"
+trap 'rm -f "$QML_PROBE"' EXIT
+cat >"$QML_PROBE" <<'PROBE'
+#include <QtGui/qguiapplication.h>
+#include <QtQml/qqmlengine.h>
+#include <QtQml/qqmlcomponent.h>
+#include <QtQml/private/qv4engine_p.h>
+#include <QtQml/private/qv4function_p.h>
+#include <QtQuick/qquickwindow.h>
+#include <QtQuick/private/qsgsoftwareadaptation_p.h>
+#include <QtQuick/private/qsgabstractsoftwarerenderer_p.h>
+PROBE
+
+if [ -d "$QT_INC/QtQuick/$QT_VER" ]; then
+    out="$(clang++ --target=aarch64-unknown-none -nostdlibinc -std=c++17 \
+        -fno-exceptions -fno-rtti -fno-omit-frame-pointer -fno-stack-protector -fno-pie \
+        -D__linux__=1 -D__unix__=1 -DQT_NO_OPENGL=1 -DQT_NO_EXCEPTIONS=1 \
+        -ferror-limit=20 \
+        -isystem "$CXX_INC" -isystem "$CXX_TGT" -isystem "$SYSROOT" \
+        -isystem "$QT_INC" \
+        -isystem "$QT_INC/QtCore" -isystem "$QT_INC/QtCore/$QT_VER" \
+        -isystem "$QT_INC/QtCore/$QT_VER/QtCore" \
+        -isystem "$QT_INC/QtGui" -isystem "$QT_INC/QtGui/$QT_VER" \
+        -isystem "$QT_INC/QtGui/$QT_VER/QtGui" \
+        -isystem "$QT_INC/QtQml" -isystem "$QT_INC/QtQml/$QT_VER" \
+        -isystem "$QT_INC/QtQml/$QT_VER/QtQml" \
+        -isystem "$QT_INC/QtQuick" -isystem "$QT_INC/QtQuick/$QT_VER" \
+        -isystem "$QT_INC/QtQuick/$QT_VER/QtQuick" \
+        -I "$PLUGIN/mkspec" \
+        -fsyntax-only "$QML_PROBE" 2>&1)"
+    if [ -n "$out" ]; then
+        echo "  ✗ QtQml + QtQuick + QV4 + the software renderer"
+        printf '%s\n' "$out" | head -20 | sed 's/^/      /'
+        fail=$((fail + 1))
+    else
+        echo "  ✓ QtQml + QtQuick + QV4 + the software renderer"
+    fi
+else
+    echo "  — no QtQuick headers here; the QML probe is skipped"
+fi
+
 echo
 if [ "$fail" -gt 0 ]; then
     echo "qpa-check: FAIL — $fail translation unit(s) did not compile"
