@@ -51,7 +51,22 @@ set(STAROS_COMMON_FLAGS
     # configure: `is incompatible with elf_x86_64`, from a linker nobody chose,
     # about objects that are perfectly correct.
     "--target=aarch64-unknown-none"
-    "-nostdlibinc -isystem ${STAROS_SYSROOT} -ffreestanding -fno-builtin"
+    # No `-ffreestanding`, and that is the fifth cross-build error rather than an
+    # omission.
+    #
+    # In a freestanding implementation the entry point is implementation-defined, so
+    # `main` stops being special and C++ mangles it like any other function:
+    # `_Z4mainiPPc`. The C library's `_start` calls `main`, the linker does not find
+    # it, and the message is `undefined symbol: main` followed by lld's own hint —
+    # "did you mean to declare main() as extern C?" — pointing at the object that
+    # defines it. Three attempts went into link order before the object was
+    # disassembled and the mangled name was simply there.
+    #
+    # `services/hello-cpp` has always been built without it, which is why the C++
+    # side of this tree works and why the flag looked harmless. What it would have
+    # bought is covered already: `-nostdlibinc` keeps the host's headers out and
+    # `-fno-builtin` stops the compiler assuming library functions it can inline.
+    "-nostdlibinc -isystem ${STAROS_SYSROOT} -fno-builtin"
     "-fno-omit-frame-pointer -fno-stack-protector -fno-pie"
     # Qt reads the operating system from compiler macros, and a bare-metal target
     # defines none — `qsystemdetection.h` stops with "Qt has not been ported to this
@@ -118,20 +133,6 @@ if(STAROS_CXX_RUNTIME_COUNT EQUAL 0)
 endif()
 list(GET STAROS_CXX_RUNTIME 0 STAROS_CXX_RUNTIME)
 
-# `-Wl,-m,aarch64linux` as well as `--target`, and the two are not redundant.
-#
-# `--target` tells clang what to compile for and clang normally passes the matching
-# emulation on to the linker. It does not here, and the error is the one this whole
-# block exists to avoid: `is incompatible with elf_x86_64`, about objects that are
-# aarch64 and correct, from a linker still set to the machine cmake is running on.
-# Naming the emulation directly leaves nothing to infer.
-set(STAROS_LINK_FLAGS
-    "--target=aarch64-unknown-none -fuse-ld=lld -Wl,-m,aarch64linux -nostdlib")
-
-# Both the `_INIT` form, which seeds a fresh cache, and the plain one, which is what
-# the compiler-ABI try_compile actually reads — the detection runs before the INIT
-# values have been folded in, which is why the first attempt at this linked with the
-# host's emulation while every compile was already correct.
 # The linker script every EL0 program in this tree is linked with. It places the
 # image at `USER_BASE` and defines the thread-local boundary symbols — `__tdata_start`
 # and its relatives — which `crates/staros-libc`'s TLS setup references and which no
@@ -139,23 +140,59 @@ set(STAROS_LINK_FLAGS
 # a symbol that has nothing to do with Qt.
 set(STAROS_IMAGE_LD "${STAROS_ROOT}/services/init/boot/image.ld")
 
-# The C library and the C++ runtime go in `STANDARD_LIBRARIES` rather than in the
-# linker flags, and the difference is link order.
+# Link with `ld.lld` directly, not through the compiler driver.
 #
-# Flags are placed *before* the object files; a static archive only contributes what
-# something already needs, so `libstaros_libc.a` there pulls in `_start`, `_start`
-# needs `main`, and `main` is in an object that has not been seen yet. The error is
-# `undefined symbol: main` about a program that defines `main` on the next line —
-# which is exactly what it looked like. Standard libraries are placed last, which is
-# where a C library belongs.
+# This is the fix for the error that took four attempts to see. clang, asked to link
+# for `aarch64-unknown-none`, hands the job to `/usr/bin/g++` — it has no linker
+# configuration for a bare-metal aarch64 triple and falls back to the system's GCC
+# driver. That driver then calls `ld.lld` with its own `-m elf_x86_64` *first*, every
+# host `-L` path, and GCC's LTO plugin; our `-Wl,-m,aarch64linux` arrives second and
+# the first one wins. The visible symptoms were, in order: "file in wrong format",
+# "incompatible with elf_x86_64", and finally "undefined symbol: main" — three
+# different messages, one cause, and none of them naming g++.
+#
+# `crates/kernel/build.rs` has linked this tree's EL0 programs with `rust-lld`
+# directly since the first one. Doing the same here is not a workaround; it is the
+# same decision, and the compiler driver was the deviation.
+find_program(STAROS_LD ld.lld REQUIRED)
+set(CMAKE_LINKER "${STAROS_LD}")
+
+# The rules, spelled out because the default ones invoke the compiler. `-m` is the
+# emulation, and nothing else supplies it once the driver is gone.
+#
+# `<LINK_FLAGS>` is deliberately *not* expanded. CMake fills it with things meant
+# for a compiler driver — `-Wl,-v` during the ABI test, `-Wl,` prefixes generally —
+# and `ld.lld` refuses them by name. Our own flags are in the rule, so the
+# substitution has nothing to contribute and everything to break.
+set(STAROS_LD_FLAGS "-m aarch64linux -static -T${STAROS_IMAGE_LD}")
+set(CMAKE_C_LINK_EXECUTABLE
+    "<CMAKE_LINKER> ${STAROS_LD_FLAGS} <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
+set(CMAKE_CXX_LINK_EXECUTABLE
+    "<CMAKE_LINKER> ${STAROS_LD_FLAGS} <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
+
+# Nothing else goes on the link line: the flags above are the whole of it, and a
+# leftover `--target` or `-fuse-ld` would now be handed to `ld.lld`, which does not
+# know them.
+set(STAROS_LINK_FLAGS "")
+
+# The C library and the C++ runtime go in `STANDARD_LIBRARIES`, which the link rule
+# above places *last*.
+#
+# Order is the whole point. A static archive contributes only what something already
+# needs, so an archive ahead of the objects pulls in `_start`, `_start` needs `main`,
+# and `main` is in an object the linker has not read yet. The error is `undefined
+# symbol: main` about a program that defines `main` on the next line.
 set(CMAKE_C_STANDARD_LIBRARIES "${STAROS_CXX_RUNTIME} ${STAROS_LIBC}" CACHE STRING "" FORCE)
 set(CMAKE_CXX_STANDARD_LIBRARIES "${STAROS_CXX_RUNTIME} ${STAROS_LIBC}" CACHE STRING "" FORCE)
 
-set(CMAKE_EXE_LINKER_FLAGS_INIT
-    "${STAROS_LINK_FLAGS} -static -T${STAROS_IMAGE_LD}")
-set(CMAKE_SHARED_LINKER_FLAGS_INIT "${STAROS_LINK_FLAGS}")
-set(CMAKE_MODULE_LINKER_FLAGS_INIT "${STAROS_LINK_FLAGS}")
-set(CMAKE_EXE_LINKER_FLAGS
-    "${STAROS_LINK_FLAGS} -static -T${STAROS_IMAGE_LD}" CACHE STRING "" FORCE)
-set(CMAKE_SHARED_LINKER_FLAGS "${STAROS_LINK_FLAGS}" CACHE STRING "" FORCE)
-set(CMAKE_MODULE_LINKER_FLAGS "${STAROS_LINK_FLAGS}" CACHE STRING "" FORCE)
+# Empty, in both the `_INIT` and plain forms. Everything the link needs is in the
+# rule; anything here would be handed to `ld.lld`, which does not take compiler
+# flags. The plain form is set as well because the compiler-ABI test reads it before
+# the `_INIT` values have been folded into the cache — which is why an earlier
+# attempt at this file compiled correctly for aarch64 and linked for x86.
+set(CMAKE_EXE_LINKER_FLAGS_INIT "")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT "")
+set(CMAKE_EXE_LINKER_FLAGS "" CACHE STRING "" FORCE)
+set(CMAKE_SHARED_LINKER_FLAGS "" CACHE STRING "" FORCE)
+set(CMAKE_MODULE_LINKER_FLAGS "" CACHE STRING "" FORCE)
