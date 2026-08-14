@@ -88,6 +88,24 @@ int eventfd_write(int fd, unsigned long value);
 int pipe(int fds[2]);
 ssize_t write(int fd, const void *buf, size_t count);
 
+/* An IPC endpoint as a descriptor. The one call that puts this system's own
+ * communication primitive inside a POSIX event loop: without it a program can
+ * serve messages or run an event loop, but never both. */
+int staros_endpoint_fd(unsigned int cap);
+struct staros_message {
+    unsigned long long tag;
+    unsigned long long words[4];
+    unsigned int cap;
+};
+/* The capabilities the kernel installs for a file-server client, in order. */
+#define EP_REQUEST 1u
+#define EP_REPLY 2u
+/* Two tags of the file protocol, borrowed here because a refusal needs no shared
+ * buffer and is therefore the smallest request that provokes a real reply. */
+#define TAG_ERROR 0u
+#define TAG_CLOSE 4u
+#define ERR_BAD_HANDLE 2u
+
 /* The mathematics. Qt reaches these through every transform and every gradient;
  * this program reaches them directly so that a failure names the function. */
 double sqrt(double x);
@@ -1294,6 +1312,87 @@ static void check_poll(void)
            20, waited);
 }
 
+/* An endpoint inside the event loop.
+ *
+ * Everything above waits on things a POSIX program invented for itself: a counter,
+ * a ring buffer, a clock. This waits on the thing the system is actually built out
+ * of. The shape being proved is exactly the one `QEventDispatcherUNIX` needs — one
+ * poll, several descriptors of different kinds, and a wake-up caused by another
+ * process sending a message. */
+static void check_endpoint(void)
+{
+    struct staros_message msg;
+    int loop_event = eventfd(0, 0);
+    check(loop_event >= 0, "an eventfd to sit in the same poll set");
+
+    /* The request endpoint is send-only. It becomes a descriptor because writing to
+     * it is the whole point, and it must never be claimed readable: this task may
+     * not receive there, so nothing could ever arrive for it. */
+    int request = staros_endpoint_fd(EP_REQUEST);
+    check(request >= 0, "a descriptor for a send-only endpoint");
+
+    int reply = staros_endpoint_fd(EP_REPLY);
+    check(reply >= 0, "a descriptor for the endpoint replies arrive on");
+
+    /* A handle that names nothing must be refused rather than turned into a
+     * descriptor whose reads fail later and elsewhere. */
+    check(staros_endpoint_fd(9999) < 0, "a handle that is not ours is refused");
+
+    struct pollfd watch[2];
+    watch[0].fd = reply;
+    watch[0].events = POLLIN;
+    watch[0].revents = 0;
+    watch[1].fd = loop_event;
+    watch[1].events = POLLIN;
+    watch[1].revents = 0;
+
+    check(poll(watch, 2, 0) == 0, "nothing is queued before anything is sent");
+
+    /* Send a request the server is obliged to refuse. A refusal is a reply like any
+     * other, and it needs no shared buffer, so this is the smallest round trip that
+     * makes another process send us a message. */
+    memset(&msg, 0, sizeof msg);
+    msg.tag = TAG_CLOSE;
+    msg.words[0] = 4242; /* a handle the server never handed out */
+    check(write(request, &msg, sizeof msg) == (ssize_t)sizeof msg,
+          "one whole message written to the endpoint");
+
+    /* The wake-up under test. Nothing here polls a counter or spins: the poll
+     * returns because a message arrived at an endpoint in the kernel. */
+    struct timespec before, after;
+    clock_gettime(0, &before);
+    int ready = poll(watch, 2, 5000);
+    clock_gettime(0, &after);
+    check(ready == 1, "poll woke for exactly one descriptor");
+    check(watch[0].revents & POLLIN, "the endpoint is the one that woke it");
+    check(watch[1].revents == 0, "the eventfd sharing the set stayed quiet");
+
+    ssize_t got = read(reply, &msg, sizeof msg);
+    check(got == (ssize_t)sizeof msg, "a whole message read back");
+    check(msg.tag == TAG_ERROR, "the server refused the made-up handle");
+    check(msg.words[0] == ERR_BAD_HANDLE, "and said which refusal it was");
+
+    /* Drained. Readiness is a question asked of the endpoint every time round, so
+     * consuming the message must take the descriptor out of the ready set. A bit
+     * remembered here is how an event loop comes to report a ready descriptor and
+     * then block for ever in the read that follows. */
+    check(poll(watch, 2, 0) == 0, "the endpoint is not ready once its message is taken");
+
+    /* Send-only stays send-only. Asking to be told when it becomes readable is a
+     * question about a queue this task may not look at, and the honest answer is
+     * the timeout rather than a wake-up nothing would deliver. */
+    struct pollfd watch_request = { request, POLLIN, 0 };
+    check(poll(&watch_request, 1, 10) == 0, "a send-only endpoint never becomes readable");
+
+    long long waited = (long long)(after.tv_sec - before.tv_sec) * 1000000000LL
+                       + (after.tv_nsec - before.tv_nsec);
+    close(loop_event);
+    close(request);
+    close(reply);
+    printf("[hello-c] endpoint in poll: a message from another process woke the loop in %lld ns\n",
+           waited);
+}
+
 int main(void)
 {
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
@@ -1313,6 +1412,7 @@ int main(void)
     check_process();
     check_threads();
     check_poll();
+    check_endpoint();
 
     if (failures == 0)
         puts("[hello-c] C RUNTIME OK - every check passed");

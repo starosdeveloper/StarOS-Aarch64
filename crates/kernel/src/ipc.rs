@@ -87,6 +87,9 @@ struct Endpoint {
     n_recv: usize,
     send_waiters: [(usize, KMessage); MAX_WAITERS],
     n_send: usize,
+    /// A notification signalled whenever a message arrives here, if a holder of
+    /// this endpoint's receive rights asked for one. See [`bind_notify`].
+    notify: Option<usize>,
 }
 
 impl Endpoint {
@@ -99,6 +102,7 @@ impl Endpoint {
             n_recv: 0,
             send_waiters: [(0, KMessage::empty()); MAX_WAITERS],
             n_send: 0,
+            notify: None,
         }
     }
 
@@ -232,12 +236,13 @@ pub fn send(ep: usize, km: KMessage) -> isize {
         Block,
         Full,
     }
-    let action = {
+    let (action, bound) = {
         // The guard's scope is this block: it is released before any of the
         // actions below can context switch.
         let mut table = IPC.lock();
         let e = &mut table[ep];
-        if let Some(w) = e.pop_recv_waiter() {
+        let bound = e.notify;
+        let action = if let Some(w) = e.pop_recv_waiter() {
             Action::Deliver(w)
         } else if e.push_msg(km) {
             Action::Buffered
@@ -245,8 +250,20 @@ pub fn send(ep: usize, km: KMessage) -> isize {
             Action::Block
         } else {
             Action::Full
-        }
+        };
+        (action, bound)
     };
+    // A bound notification is signalled for every send that placed a message,
+    // including one handed straight to a blocked receiver. Signalling in that case
+    // is redundant — nobody polling was waiting for it — and it costs one spurious
+    // wake-up, after which the poller re-asks [`pending`] and goes back to sleep.
+    // The other way round costs a program that sleeps for ever holding a message,
+    // so the error is deliberately made on the noisy side.
+    if matches!(action, Action::Deliver(_) | Action::Buffered) {
+        if let Some(id) = bound {
+            crate::notify::signal(id);
+        }
+    }
     match action {
         Action::Deliver(w) => {
             sched::deliver(w, km);
@@ -288,11 +305,12 @@ pub fn recv(ep: usize) -> Result<KMessage, KError> {
         Block,
         Full,
     }
-    let action = {
+    let (action, bound) = {
         // As in `send`: the lock does not outlive the decision.
         let mut table = IPC.lock();
         let e = &mut table[ep];
-        match e.pop_msg() {
+        let bound = e.notify;
+        let action = match e.pop_msg() {
             Some(km) => match e.pop_send_waiter() {
                 // We freed a slot; let a blocked sender deposit its message.
                 Some((tid, skm)) => {
@@ -303,17 +321,56 @@ pub fn recv(ep: usize) -> Result<KMessage, KError> {
             },
             None if e.push_recv_waiter(me) => Action::Block,
             None => Action::Full,
-        }
+        };
+        (action, bound)
     };
     match action {
         Action::Got(km) => Ok(km),
         Action::WakeSender(km, tid) => {
+            // A message just moved into the ring from a sender that had been
+            // blocked. That is an arrival like any other, and the only one a
+            // *sender* cannot announce: it happened inside this receive.
+            if let Some(id) = bound {
+                crate::notify::signal(id);
+            }
             sched::unblock(tid);
             Ok(km)
         }
         Action::Block => Ok(sched::block_for_message()),
         Action::Full => Err(KError::OutOfResources),
     }
+}
+
+/// Bind notification `notif` to endpoint `ep`, so every message that arrives there
+/// signals it. Returns `false` if `ep` names no endpoint.
+///
+/// One notification per endpoint, last binding wins. A list would let two event
+/// loops watch one endpoint, which reads as a feature and is a race: both wake, one
+/// takes the message, and the other has been told about a message that is no longer
+/// there. With one binding the surprise is at least confined to whoever asked for
+/// it, and a server that wants to share an endpoint has to say how.
+pub fn bind_notify(ep: usize, notif: usize) -> bool {
+    let mut table = IPC.lock();
+    match table.get_mut(ep) {
+        Some(e) => {
+            e.notify = Some(notif);
+            true
+        }
+        None => false,
+    }
+}
+
+/// How many messages are buffered at endpoint `ep` right now.
+///
+/// Blocked senders are deliberately not counted. Their messages are not at the
+/// endpoint yet and a receive will not return one directly — it returns a buffered
+/// message and only then lets a sender deposit. Counting them would report a
+/// readiness that the very next receive cannot satisfy, and the ring is full
+/// whenever a sender is blocked, so the count is already non-zero in every case
+/// where it would have mattered.
+#[must_use]
+pub fn pending(ep: usize) -> usize {
+    IPC.lock().get(ep).map_or(0, |e| e.len)
 }
 
 /// Emit a short kernel diagnostic (used to make the blocking-send path visible).

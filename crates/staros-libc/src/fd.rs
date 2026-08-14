@@ -63,6 +63,21 @@ pub(crate) enum Kind {
     Event { slot: usize, semaphore: bool },
     /// One end of a pipe.
     Pipe { slot: usize, write: bool },
+    /// An IPC endpoint: the capability handle, and the waitable slot whose
+    /// `readable` notification the kernel signals when a message arrives.
+    ///
+    /// The slot's counter and ring go unused here — an endpoint keeps its queue in
+    /// the kernel, and the only thing borrowed from the pool is a notification that
+    /// exists in every thread. Spending a whole slot on that is waste measured in
+    /// one array element, against the alternative of a second pool with its own
+    /// exhaustion rules.
+    ///
+    /// `slot` is `None` for a send-only endpoint. Such a descriptor is a real one —
+    /// it can be written, and `poll` calls it writable — it simply has nothing that
+    /// could ever make it readable, because this task may not receive there. Two
+    /// descriptor kinds for the two directions was the other option, and it makes
+    /// every caller ask which one it holds before it can write.
+    Endpoint { cap: u32, slot: Option<usize> },
 }
 
 /// One waitable object: a counter *and* a ring, because an eventfd needs the first
@@ -241,6 +256,20 @@ fn readiness(kind: Kind, wanted: i16) -> i16 {
                 }
             }
         }
+        // Asked of the kernel every time, never remembered. The bound notification
+        // says "something happened"; only the queue says "something is still here",
+        // and the difference is a message another thread took between the wake-up
+        // and this question.
+        Kind::Endpoint { cap, .. } => {
+            if sys::endpoint_pending(cap) > 0 {
+                ready |= POLLIN;
+            }
+            // An endpoint is always writable in the sense `poll` means: a send may
+            // still block when the ring is full, exactly as a write to a socket
+            // may, and there is no way to ask the kernel about a queue we are not
+            // the receiver of.
+            ready |= POLLOUT;
+        }
     }
     ready & (wanted | POLLERR | POLLNVAL)
 }
@@ -250,6 +279,12 @@ fn notification(kind: Kind, wanted: i16) -> Option<u32> {
     let (slot, want_read) = match kind {
         Kind::Event { slot, .. } => (slot, wanted & POLLIN != 0),
         Kind::Pipe { slot, write } => (slot, !write),
+        // Only the arrival of a message can be waited for. A caller that asks to be
+        // told when an endpoint becomes *writable* is asking about a queue in
+        // another task's future, and gets the timeout it deserves rather than a
+        // wake-up this side cannot promise.
+        Kind::Endpoint { slot: Some(slot), .. } => (slot, true),
+        Kind::Endpoint { slot: None, .. } => return None,
         _ => return None,
     };
     let w = &WAITABLES[slot];
@@ -395,6 +430,30 @@ pub(crate) fn read(kind: Kind, dst: &mut [u8]) -> isize {
                 sys::wait(w.readable.load(Ordering::Acquire));
             }
         }
+        // One message, whole or not at all. A short read of a message is not a
+        // shorter message, it is a corrupt one, and the caller has no way to ask for
+        // the rest: the kernel handed it over already.
+        Kind::Endpoint { cap, .. } => {
+            if dst.len() < size_of::<sys::Message>() {
+                return -1;
+            }
+            match sys::recv(u64::from(cap)) {
+                Some(msg) => {
+                    // SAFETY: `dst` has room for a whole `Message`, checked above,
+                    // and `Message` is `repr(C)` with no padding the caller may not
+                    // see — it is the same bytes the kernel wrote.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            core::ptr::from_ref(&msg).cast::<u8>(),
+                            dst.as_mut_ptr(),
+                            size_of::<sys::Message>(),
+                        );
+                    }
+                    size_of::<sys::Message>() as isize
+                }
+                None => -1,
+            }
+        }
         _ => -1,
     }
 }
@@ -446,6 +505,26 @@ pub(crate) fn write(kind: Kind, src: &[u8]) -> isize {
             }
             written as isize
         }
+        Kind::Endpoint { cap, .. } => {
+            if src.len() < size_of::<sys::Message>() {
+                return -1;
+            }
+            let mut msg = sys::Message::new();
+            // SAFETY: `src` holds at least one `Message`, checked above; the copy is
+            // into a local of exactly that type and alignment.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    core::ptr::from_mut(&mut msg).cast::<u8>(),
+                    size_of::<sys::Message>(),
+                );
+            }
+            if sys::send(u64::from(cap), &msg) < 0 {
+                -1
+            } else {
+                size_of::<sys::Message>() as isize
+            }
+        }
         _ => -1,
     }
 }
@@ -470,6 +549,17 @@ pub(crate) fn release(fd: c_int) -> Option<u64> {
             }
             sys::notify_signal(w.readable.load(Ordering::Acquire));
             sys::notify_signal(w.writable.load(Ordering::Acquire));
+            None
+        }
+        // The slot comes back; the binding in the kernel does not, and cannot until
+        // an endpoint can be unbound. A signal to a notification whose slot has been
+        // reused is a spurious wake-up for its next owner, which costs one trip
+        // round a poll loop — the price of not adding an unbind syscall for a
+        // descriptor that in practice lives as long as the program.
+        Kind::Endpoint { slot, .. } => {
+            if let Some(slot) = slot {
+                WAITABLES[slot].used.store(0, Ordering::Release);
+            }
             None
         }
         Kind::Free => None,
@@ -546,6 +636,56 @@ pub mod exports {
         let fd = install(Kind::Event { slot, semaphore: flags & EFD_SEMAPHORE != 0 });
         if fd < 0 {
             WAITABLES[slot].used.store(0, Ordering::Release);
+            return -EMFILE;
+        }
+        fd
+    }
+
+    /// Wrap an IPC endpoint capability in a descriptor `poll` can wait on.
+    ///
+    /// This is the one call that lets a POSIX event loop see this system's native
+    /// communication primitive. `QEventDispatcherUNIX` waits in `poll`; messages
+    /// arrive at endpoints; without a descriptor in between, a program can serve
+    /// messages or run an event loop, but not both.
+    ///
+    /// `read` on the returned descriptor delivers one whole message (48 bytes, laid
+    /// out as the kernel's `Message`), `write` sends one, and `poll` reports
+    /// `POLLIN` while the endpoint's queue is not empty. Returns `EMFILE` negated if
+    /// the descriptor table or the waitable pool is full, and `EINVAL` negated if
+    /// the kernel refused the binding — a handle that is not ours, or one with no
+    /// receive rights.
+    #[no_mangle]
+    pub extern "C" fn staros_endpoint_fd(cap: u32) -> c_int {
+        /// What the kernel returns when the endpoint carries no receive rights.
+        const PERMISSION_DENIED: isize = -3;
+
+        let Some(slot) = take_waitable() else {
+            return -EMFILE;
+        };
+        let notification = WAITABLES[slot].readable.load(Ordering::Acquire);
+        if notification == 0 {
+            WAITABLES[slot].used.store(0, Ordering::Release);
+            return -EMFILE;
+        }
+        let slot = match crate::sys::endpoint_bind(cap, notification) {
+            0 => Some(slot),
+            // Send-only: give the slot straight back and make a write-only
+            // descriptor. The capability is good, it just points the other way.
+            PERMISSION_DENIED => {
+                WAITABLES[slot].used.store(0, Ordering::Release);
+                None
+            }
+            // Anything else means the handle is not ours, or names no endpoint.
+            _ => {
+                WAITABLES[slot].used.store(0, Ordering::Release);
+                return -EINVAL;
+            }
+        };
+        let fd = install(Kind::Endpoint { cap, slot });
+        if fd < 0 {
+            if let Some(slot) = slot {
+                WAITABLES[slot].used.store(0, Ordering::Release);
+            }
             return -EMFILE;
         }
         fd

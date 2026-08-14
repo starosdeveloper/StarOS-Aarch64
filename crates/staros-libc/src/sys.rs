@@ -237,3 +237,27 @@ pub(crate) fn recv(endpoint: u64) -> Option<Message> {
     let rc = unsafe { syscall2(Syscall::Recv, endpoint, core::ptr::from_mut(&mut msg) as u64) };
     (rc >= 0).then_some(msg)
 }
+
+/// Ask the kernel to signal `notification` whenever a message arrives at
+/// `endpoint`. Returns the raw result: `0` when bound, and otherwise a negative
+/// `KError` the caller has to tell apart — `PermissionDenied` means a send-only
+/// endpoint, which is a perfectly good thing to hold and merely not a thing that
+/// can ever become readable, while `BadHandle` means the handle is not ours at all.
+pub(crate) fn endpoint_bind(endpoint: u32, notification: u32) -> isize {
+    // SAFETY: `EndpointBind` resolves both handles in our own table.
+    unsafe { syscall2(Syscall::EndpointBind, u64::from(endpoint), u64::from(notification)) }
+}
+
+/// How many messages are queued at an endpoint. Returns 0 for a handle that is not
+/// ours, which is the same answer as an empty endpoint on purpose: `poll` reports
+/// the bad descriptor through `POLLNVAL`, and a readiness query is not the place to
+/// discover it a second time.
+pub(crate) fn endpoint_pending(endpoint: u32) -> usize {
+    // SAFETY: `EndpointPending` only reads the endpoint's queue length.
+    let rc = unsafe { syscall1(Syscall::EndpointPending, u64::from(endpoint)) };
+    if rc > 0 {
+        rc as usize
+    } else {
+        0
+    }
+}

@@ -440,6 +440,34 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // nothing, and it is the caller's own.
         Some(Syscall::TaskId) => sched::current_pid() as isize,
 
+        // Bind the notification named by `x1` to the endpoint named by `x0`, so a
+        // message arriving there also signals it. Both handles are the caller's, and
+        // the endpoint one must carry receive rights: this grants the authority to
+        // be *told* about messages, which belongs to whoever may take them.
+        Some(Syscall::EndpointBind) => {
+            let ep = match resolve_receivable_endpoint(req.args[0] as u32) {
+                Ok(id) => id,
+                Err(e) => return e.as_raw(),
+            };
+            let notif = match resolve_notification(req.args[1] as u32) {
+                Ok(id) => id,
+                Err(e) => return e.as_raw(),
+            };
+            if ipc::bind_notify(ep, notif) {
+                0
+            } else {
+                KError::BadHandle.as_raw()
+            }
+        }
+
+        // How many messages are queued at the endpoint named by `x0`. The question
+        // `poll` asks each time round its loop, and the reason it need not remember
+        // a readiness it was told about once.
+        Some(Syscall::EndpointPending) => match resolve_receivable_endpoint(req.args[0] as u32) {
+            Ok(id) => ipc::pending(id) as isize,
+            Err(e) => e.as_raw(),
+        },
+
         // Allocate a physically-contiguous, non-cacheable DMA buffer of `x0`
         // pages and hand the caller a DMA capability for it.
         Some(Syscall::CreateDma) => create_dma(req.args[0] as usize),
@@ -617,6 +645,21 @@ fn resolve_interrupt(handle: u32) -> Result<u32, KError> {
     match sched::resolve_cap(handle) {
         Some(Cap::Irq { obj }) => match obj::get(obj) {
             Some(Object::Interrupt { intid }) => Ok(intid),
+            _ => Err(KError::BadHandle),
+        },
+        Some(_) => Err(KError::PermissionDenied),
+        None => Err(KError::BadHandle),
+    }
+}
+
+/// Resolve an endpoint capability handle to its table id, requiring **receive**
+/// rights. Shared by `EndpointBind` and `EndpointPending`, both of which answer the
+/// question "is there something here for me to take" and neither of which a
+/// send-only holder has any business asking.
+fn resolve_receivable_endpoint(handle: u32) -> Result<usize, KError> {
+    match sched::resolve_cap(handle) {
+        Some(Cap::Endpoint { obj, recv: true, .. }) => match obj::get(obj) {
+            Some(Object::Endpoint { id }) => Ok(id),
             _ => Err(KError::BadHandle),
         },
         Some(_) => Err(KError::PermissionDenied),

@@ -323,6 +323,12 @@ if [ -n "$INITRAMFS" ]; then
     # rather than returned from. The number in the line is measured, so only the
     # prefix is asserted.
     req "[hello-c] poll: a thread slept on an eventfd and a pipe"
+    # The same loop, woken by the system's own primitive: an endpoint wrapped in a
+    # descriptor, sharing a poll set with an eventfd, and a message from *another
+    # process* ending the wait. This is the shape a Qt event dispatcher needs, and
+    # the line only appears when the wake came from the message rather than the
+    # 5-second timeout that guards the check.
+    req "[hello-c] endpoint in poll: a message from another process woke the loop"
     # The phase's checkpoint: a C++ program with the real standard library — three
     # std::threads under a std::mutex, 68 std::strings through a reallocating
     # std::vector — plus the two halves of static initialisation. The constructor

@@ -232,6 +232,38 @@ pub enum Syscall {
     /// object, and holding it grants nothing — every authority in this system is a
     /// capability, and an id is not one.
     TaskId = 29,
+    /// Bind a notification to an endpoint, so that a message arriving there also
+    /// signals it: `arg0` = an endpoint capability with **receive** rights, `arg1` =
+    /// a notification capability. One notification per endpoint; binding again
+    /// replaces the previous one.
+    ///
+    /// This exists because of a shape mismatch that no amount of user-space code can
+    /// paper over. [`Recv`] blocks on *one* endpoint; [`WaitAny`] blocks on a set,
+    /// but only of notifications. A program that must wait for a message **and** a
+    /// timer **and** a pipe — which is every event loop, and `QEventDispatcherUNIX`
+    /// in particular — has no primitive that covers all three.
+    ///
+    /// The alternative was a thread per endpoint, parked in `Recv`, forwarding into
+    /// an eventfd. That works and costs a thread, a stack and a copy of every
+    /// message for the sole purpose of changing which primitive the wait is spelled
+    /// with. Binding is the same fact expressed once, in the place that already
+    /// knows when a message arrives.
+    ///
+    /// Receive rights are required rather than send rights on purpose: the authority
+    /// this hands out is "be told that something is here for you to take", which is
+    /// meaningless to a task that may not take it, and is a side channel to a task
+    /// that may only send.
+    EndpointBind = 30,
+    /// How many messages are queued at an endpoint right now: `arg0` = an endpoint
+    /// capability with **receive** rights. Non-destructive; returns 0 or more.
+    ///
+    /// A notification cannot answer this, and that is not a detail. [`WaitAny`]
+    /// *consumes* the signal it reports, so a poll implementation that treated the
+    /// signal as the readiness would have to remember it — and a remembered
+    /// readiness bit is precisely how an event loop comes to report a ready
+    /// descriptor and then block forever in the read that follows. Readiness has to
+    /// be a question asked of the endpoint, every time round the loop.
+    EndpointPending = 31,
 }
 
 impl Syscall {
@@ -269,6 +301,8 @@ impl Syscall {
             27 => Some(Syscall::DmaPhys),
             28 => Some(Syscall::SharedPages),
             29 => Some(Syscall::TaskId),
+            30 => Some(Syscall::EndpointBind),
+            31 => Some(Syscall::EndpointPending),
             _ => None,
         }
     }
@@ -280,11 +314,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=29 {
+        for n in 0..=31 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(30), None);
+        assert_eq!(Syscall::from_raw(32), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }
