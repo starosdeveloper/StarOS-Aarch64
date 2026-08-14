@@ -66,8 +66,13 @@ trap 'rm -f "$DEFINED" "$WEAK"' EXIT
 # a thing is worth more than an argument about the rest.
 DECLARED="$(mktemp)"
 trap 'rm -f "$DEFINED" "$WEAK" "$DECLARED"' EXIT
-grep -hoE '^[a-z_][a-zA-Z0-9_ *]*\**[[:space:]]+\**([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\(' \
-    "$INCLUDE"/*.h |
+# `typedef` lines are dropped first. A function-pointer typedef —
+# `typedef void (*handler)(int);` — has its first parenthesis after the *return*
+# type, so the extraction below reads the name as `void` and then reports that the
+# library fails to define it. Filtering the line is more honest than adding `void`
+# to the keyword list, which would hide the next one of these.
+grep -hvE '^[[:space:]]*typedef' "$INCLUDE"/*.h "$INCLUDE"/sys/*.h |
+    grep -oE '^[a-z_][a-zA-Z0-9_ *]*\**[[:space:]]+\**([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\(' |
     grep -oE '[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\($' |
     tr -d ' (' |
     grep -vE '^(if|for|while|switch|return|sizeof|defined|typedef|struct|union|enum)$' |

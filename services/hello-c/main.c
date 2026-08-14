@@ -101,6 +101,14 @@ ssize_t write(int fd, const void *buf, size_t count);
 /* And the header whose fourteen functions had been declared by nobody's
  * implementation. Included rather than redeclared, for the same reason. */
 #include <ctype.h>
+#include <sys/select.h>
+/* Declared here rather than through <sys/time.h>: that header pulls in <time.h>,
+ * whose `struct tm` this file already declares by hand. Two definitions of one
+ * struct is an error even when they agree. */
+struct timeval {
+    long tv_sec;
+    long tv_usec;
+};
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -1317,6 +1325,34 @@ static void check_poll(void)
     eventfd_write(event_fd, 3);
     check(eventfd_read(event_fd, &value) == 0, "eventfd_read again");
     check(value == 5, "the eventfd summed the writes it had not delivered");
+
+    /* `select`, over the same wait `poll` uses — which is what it is on every
+     * modern system. Exercised because it was written for Qt's sake and nothing
+     * else called it, and because its two defining awkwardnesses are exactly the
+     * kind a compiling-but-untested implementation gets wrong: the sets are
+     * rewritten in place, and `nfds` is the highest descriptor *plus one* rather
+     * than a count. */
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(event_fd, &readable);
+    struct timeval nowait = { 0, 0 };
+    check(select(event_fd + 1, &readable, 0, 0, &nowait) == 0,
+          "select with a zero timeout reports nothing ready");
+    check(!FD_ISSET(event_fd, &readable), "and cleared the set it was given");
+
+    eventfd_write(event_fd, 9);
+    FD_ZERO(&readable);
+    FD_SET(event_fd, &readable);
+    check(select(event_fd + 1, &readable, 0, 0, &nowait) == 1, "select saw the eventfd");
+    check(FD_ISSET(event_fd, &readable), "and said which descriptor it was");
+
+    /* `nfds` too small must exclude the descriptor rather than include it. This is
+     * the off-by-one that makes a program wait on nothing and call it a hang. */
+    FD_ZERO(&readable);
+    FD_SET(event_fd, &readable);
+    check(select(event_fd, &readable, 0, 0, &nowait) == 0,
+          "an nfds that does not reach the descriptor excludes it");
+    eventfd_read(event_fd, &value);
 
     check(pthread_join(worker_id, 0) == 0, "join the io worker");
     check(pipe_message_ok, "the worker read exactly what the pipe was given");

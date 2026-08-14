@@ -43,6 +43,34 @@ pub(crate) const fn join(sec: i64, nsec: i64) -> u64 {
     }
 }
 
+/// C's `struct timeval` — the older pair, in *micro*seconds.
+///
+/// Kept apart from [`Timespec`] rather than converted at the boundary, because the
+/// two differ by a factor of a thousand in a field with the same name, and every
+/// bug that mixes them is a delay a thousand times too long or too short.
+#[repr(C)]
+pub struct Timeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+impl Timeval {
+    /// This interval in nanoseconds, saturating. Negative means zero, as a
+    /// negative timeout means "do not wait" everywhere it is accepted at all.
+    #[must_use]
+    pub const fn nanos(&self) -> u64 {
+        if self.tv_sec < 0 || self.tv_usec < 0 {
+            return 0;
+        }
+        let sec = self.tv_sec as u64;
+        let usec = self.tv_usec as u64;
+        match sec.checked_mul(NANOS) {
+            Some(n) => n.saturating_add(usec.saturating_mul(1_000)),
+            None => u64::MAX,
+        }
+    }
+}
+
 /// C's `struct tm`: a broken-down calendar time.
 ///
 /// The field order and the offsets are C's, not a convenience: `strftime` and every

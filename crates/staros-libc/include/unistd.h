@@ -56,6 +56,12 @@ int fsync(int fd);
 int dup(int fd);
 int dup2(int old_fd, int new_fd);
 int pipe(int fds[2]);
+/* `pipe2` takes the flags `pipe` would have needed a second call to set. Qt uses it
+ * for exactly the reason its own comment gives — it is documented not to return
+ * EINTR — and this system delivers no signals, so that is true here twice over.
+ * The flags are accepted and ignored: `O_CLOEXEC` means nothing where there is no
+ * `exec`, and `O_NONBLOCK` on a pipe end is a property `poll` already answers for. */
+int pipe2(int fds[2], int flags);
 int isatty(int fd);
 
 /* Read-only filesystem: both refuse with EROFS. Declared because a program that
@@ -68,6 +74,28 @@ int chdir(const char *path);
 char *getcwd(char *buf, size_t size);
 ssize_t readlink(const char *path, char *buf, size_t size);
 int symlink(const char *target, const char *link);
+
+int dup3(int old_fd, int new_fd, int flags);
+
+/* The process tree, which does not exist here.
+ *
+ * `fork` refuses with `ENOSYS` and the `exec` family with `EACCES`. They are
+ * declared, and that is not a contradiction: a refusal is an implementation, and it
+ * carries the errno that tells a caller which fallback to take. Qt's own
+ * `qcore_unix_p.h` references every one of these from inline wrappers, so the
+ * alternative to declaring them is that no Qt translation unit including it
+ * compiles at all — which would be a stronger statement about this system than the
+ * true one, that a process here cannot start another.
+ *
+ * `docs/LIBC-CONTRACT.md` records each refusal and its reason. */
+pid_t fork(void);
+pid_t vfork(void);
+int execve(const char *path, char *const argv[], char *const envp[]);
+int execv(const char *path, char *const argv[]);
+int execvp(const char *file, char *const argv[]);
+
+pid_t setsid(void);
+pid_t getpgrp(void);
 
 pid_t getpid(void);
 pid_t getppid(void);

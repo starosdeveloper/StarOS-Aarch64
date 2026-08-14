@@ -33,9 +33,12 @@ bool QStarosIntegration::hasCapability(QPlatformIntegration::Capability cap) con
     // No GPU driver and no OpenGL: `-no-opengl` is a build flag and this is the
     // run-time half of the same statement. Answering true would have Qt Quick pick
     // its hardware path and fail somewhere with no connection to this decision.
+    //
+    // `RasterGLSurface` is *not* in this list even though it is false, because Qt
+    // has deprecated the enumerator and naming it is a warning. The base class
+    // already answers false for it.
     case OpenGL:
     case ThreadedOpenGL:
-    case RasterGLSurface:
         return false;
     // Painting from another thread is fine — the buffer is memory like any other —
     // but it is not *proved*, and QPA capabilities are promises Qt acts on rather

@@ -358,6 +358,11 @@ if [ -n "$INITRAMFS" ]; then
     # rather than returned from. The number in the line is measured, so only the
     # prefix is asserted.
     req "[hello-c] poll: a thread slept on an eventfd and a pipe"
+    # `select` too, which is `poll` wearing a worse interface and was written for
+    # Qt's sake: `qcore_unix_p.h` includes <sys/select.h> unconditionally. Its two
+    # awkwardnesses are the ones a compiling-but-untested version gets wrong — the
+    # sets are rewritten in place, and `nfds` is the highest descriptor plus one.
+    forbid "[hello-c] FAIL: an nfds that does not reach the descriptor excludes it"
     # The same loop, woken by the system's own primitive: an endpoint wrapped in a
     # descriptor, sharing a poll set with an eventfd, and a message from *another
     # process* ending the wait. This is the shape a Qt event dispatcher needs, and

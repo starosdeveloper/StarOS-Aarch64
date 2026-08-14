@@ -572,8 +572,13 @@ pub(crate) fn release(fd: c_int) -> Option<u64> {
 pub mod exports {
     use super::{
         c_int, c_void, get, install, poll_impl, take_waitable, Kind, PollFd, EFD_SEMAPHORE,
-        WAITABLES,
+        POLLERR, POLLIN, POLLNVAL, POLLOUT, WAITABLES,
     };
+
+    /// `POLLPRI`: urgent data. Nothing in this system ever reports it — there are
+    /// no sockets — and it is named so `select`'s exception set can be translated
+    /// into something rather than silently dropped.
+    const POLLPRI: i16 = 0x002;
     use core::sync::atomic::Ordering;
 
     /// `EMFILE`: no descriptor or no waitable slot left.
@@ -624,6 +629,136 @@ pub mod exports {
             }
         };
         poll_impl(entries, deadline)
+    }
+
+    /// How many descriptors an `fd_set` holds. glibc's number, because the type is
+    /// part of the ABI: a caller's `fd_set` is this many bits and writing past it
+    /// would corrupt whatever it sits next to on the stack.
+    const FD_SETSIZE: usize = 1024;
+
+    /// `fd_set`, laid out as glibc has it: 1024 bits in 64-bit words.
+    #[repr(C)]
+    pub struct FdSet {
+        bits: [u64; FD_SETSIZE / 64],
+    }
+
+    impl FdSet {
+        fn contains(&self, fd: c_int) -> bool {
+            let Ok(fd) = usize::try_from(fd) else { return false };
+            fd < FD_SETSIZE && self.bits[fd / 64] & (1 << (fd % 64)) != 0
+        }
+
+        fn clear(&mut self) {
+            self.bits = [0; FD_SETSIZE / 64];
+        }
+
+        fn insert(&mut self, fd: c_int) {
+            if let Ok(fd) = usize::try_from(fd) {
+                if fd < FD_SETSIZE {
+                    self.bits[fd / 64] |= 1 << (fd % 64);
+                }
+            }
+        }
+    }
+
+    /// `select`, over `poll`.
+    ///
+    /// This is what `select` *is* on a modern system — a worse interface over the
+    /// same wait — and writing it any other way here would mean a second
+    /// implementation of the readiness rules that could disagree with the first.
+    ///
+    /// Two of `select`'s properties come along for free and are worth naming,
+    /// because both are why it is the worse interface. The sets are rewritten in
+    /// place, so a caller looping on `select` must rebuild them every time round
+    /// and the ones that forget spin. And `nfds` is a *count*, not a maximum: it is
+    /// the highest descriptor plus one, and a caller passing the descriptor itself
+    /// silently never waits on it.
+    ///
+    /// # Safety
+    /// C ABI: each non-null set points at one `fd_set`; `timeout` at one `timeval`.
+    #[no_mangle]
+    pub unsafe extern "C" fn select(
+        nfds: c_int,
+        readfds: *mut FdSet,
+        writefds: *mut FdSet,
+        exceptfds: *mut FdSet,
+        timeout: *mut crate::time::Timeval,
+    ) -> c_int {
+        /// The most descriptors one `select` will translate. The pool's own limit
+        /// is smaller, so this is never the binding constraint — it exists so the
+        /// array below can live on the stack.
+        const MAX: usize = super::MAX_FDS + super::FIRST_FD as usize;
+
+        let mut entries: [PollFd; MAX] = [const { PollFd { fd: -1, events: 0, revents: 0 } }; MAX];
+        let mut count = 0;
+        let top = nfds.clamp(0, MAX as c_int);
+        for fd in 0..top {
+            let mut events = 0i16;
+            // SAFETY: each pointer is either null or one `fd_set`, per the contract.
+            unsafe {
+                if !readfds.is_null() && (*readfds).contains(fd) {
+                    events |= POLLIN;
+                }
+                if !writefds.is_null() && (*writefds).contains(fd) {
+                    events |= POLLOUT;
+                }
+                // An "exceptional condition" is out-of-band data on a socket, which
+                // this system has none of. The descriptor is still watched so that
+                // a caller passing only this set gets its timeout rather than an
+                // immediate return, and it can only ever come back with an error.
+                if !exceptfds.is_null() && (*exceptfds).contains(fd) {
+                    events |= POLLPRI;
+                }
+            }
+            if events != 0 {
+                entries[count] = PollFd { fd, events, revents: 0 };
+                count += 1;
+            }
+        }
+
+        let deadline = if timeout.is_null() {
+            None
+        } else {
+            // SAFETY: the caller passes one `timeval`, per the contract.
+            let want = unsafe { (*timeout).nanos() };
+            if want == 0 {
+                Some(0)
+            } else {
+                crate::sys::clock_now().map(|now| now.saturating_add(want))
+            }
+        };
+        let ready = poll_impl(&mut entries[..count], deadline);
+        if ready < 0 {
+            return ready;
+        }
+
+        // The sets are rewritten with what is ready. `select`'s defining
+        // awkwardness, and the reason a loop around it must rebuild them.
+        // SAFETY: as above.
+        unsafe {
+            for set in [readfds, writefds, exceptfds] {
+                if !set.is_null() {
+                    (*set).clear();
+                }
+            }
+            let mut n = 0;
+            for entry in &entries[..count] {
+                if entry.revents == 0 {
+                    continue;
+                }
+                if !readfds.is_null() && entry.revents & (POLLIN | POLLERR | POLLNVAL) != 0 {
+                    (*readfds).insert(entry.fd);
+                }
+                if !writefds.is_null() && entry.revents & POLLOUT != 0 {
+                    (*writefds).insert(entry.fd);
+                }
+                if !exceptfds.is_null() && entry.revents & POLLPRI != 0 {
+                    (*exceptfds).insert(entry.fd);
+                }
+                n += 1;
+            }
+            n
+        }
     }
 
     #[no_mangle]

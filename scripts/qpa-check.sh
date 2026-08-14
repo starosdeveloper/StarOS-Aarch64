@@ -54,7 +54,7 @@ for src in "$PLUGIN"/*.cpp; do
         -isystem "$QT_INC/QtCore/$QT_VER/QtCore" \
         -isystem "$QT_INC/QtGui" -isystem "$QT_INC/QtGui/$QT_VER" \
         -isystem "$QT_INC/QtGui/$QT_VER/QtGui" \
-        -I "$PLUGIN" \
+        -I "$PLUGIN" -I "$PLUGIN/mkspec" \
         -fsyntax-only "$src" 2>&1)"
     if [ -n "$out" ]; then
         echo "  ✗ $(basename "$src")"
