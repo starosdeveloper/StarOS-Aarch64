@@ -511,9 +511,22 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
 /// contiguous allocation rounds up to a power of two, so a large request can fail
 /// on merely fragmented memory.
 fn create_shared(pages: usize) -> isize {
-    /// Enough for a screenful at modest size (256 KiB) without letting one call
-    /// take a large contiguous run out of the pool.
-    const MAX_SHARED_PAGES: usize = 64;
+    /// One 1080p frame of xRGB8888, which is what a full-screen backing store is.
+    ///
+    /// It was 64 pages, and the comment claimed that was "enough for a screenful at
+    /// modest size" — 256 KiB, against the 1.2 MB this machine's own 640x480 screen
+    /// needs. Nothing noticed while the only client drew 64x64 squares. The first
+    /// window sized to the screen would have met `InvalidArgument` and had no idea
+    /// why, because the number was wrong rather than the request.
+    ///
+    /// The real constraint is not the size, it is that these frames are
+    /// **physically contiguous** — `Object::SharedMemory` holds one address — so a
+    /// pool with 60 MiB free in scattered pieces can still refuse 8 MiB. Nothing
+    /// here needs contiguity; only DMA does. Until that changes, a full-screen
+    /// buffer is a request that can fail for reasons the caller cannot see, and the
+    /// honest answer is `OutOfResources` rather than a smaller buffer it did not
+    /// ask for.
+    const MAX_SHARED_PAGES: usize = 2048;
     // Zero is a caller's arithmetic going wrong, not a request for nothing.
     if pages == 0 || pages > MAX_SHARED_PAGES {
         return KError::InvalidArgument.as_raw();

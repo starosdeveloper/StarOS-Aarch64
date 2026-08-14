@@ -343,6 +343,11 @@ if [ -n "$INITRAMFS" ]; then
     req "[hello-cpp] a static local was constructed on first use"
     req "[hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads"
     req "[hello-cpp] the static local's destructor ran at exit"
+    # The plugin's own calls, from the compiler the plugin is written in: a whole
+    # screen's worth of shareable pixels in an RAII type, under -fno-exceptions
+    # -fno-rtti. The size is the point — 1200 KiB is what a full-screen backing
+    # store costs, and the kernel's shared-memory ceiling used to be 256 KiB.
+    req "[hello-cpp] backing store: 1200 KiB for a whole 640x480 screen"
     forbid "[hello-cpp] FAIL"
     forbid "C++ RUNTIME BROKEN"
     # An EL0 fault now reports where it happened, not just that it did.

@@ -18,6 +18,13 @@
 #include <thread>
 #include <vector>
 
+// The header a platform plugin is handed. It has been compiled as C since it was
+// written, and a QPA plugin is C++ — under `-fno-exceptions -fno-rtti -std=c++17`,
+// which is exactly how this file is built. A header that only ever met one of the
+// two compilers is a header that half works, and the half that fails is the one
+// nobody has tried.
+#include <staros.h>
+
 extern "C" {
 unsigned long staros_heap_live_bytes(void);
 }
@@ -79,6 +86,66 @@ struct Beacon {
 bool Beacon::constructed = false;
 Beacon beacon;
 
+/// A backing store, the way a plugin would own one: pixels a display server can
+/// read, held by a C++ object with a destructor.
+///
+/// This program holds **no capabilities**, which is the claim it exists to make, so
+/// it never talks to the display server — `staros_shared_create` needs no
+/// authority, exactly as `malloc` does not. What is being proved is narrower and
+/// still worth proving: that the plugin's calls compile and link from C++ with
+/// exceptions and RTTI off, and that a buffer sized for a real window is a thing
+/// this system can hand out.
+class BackingStore {
+public:
+    BackingStore(int width, int height)
+        : width_(width), height_(height),
+          cap_(staros_shared_create(static_cast<size_t>(width) * height * 4)) {
+        if (cap_ != 0) {
+            pixels_ = static_cast<unsigned int *>(staros_shared_map(cap_));
+        }
+    }
+
+    // Copying would give two objects one buffer and one of them would eventually
+    // hand it back twice. There is no unmap here to get wrong yet, and saying so in
+    // the type is cheaper than remembering it.
+    BackingStore(const BackingStore &) = delete;
+    BackingStore &operator=(const BackingStore &) = delete;
+
+    ~BackingStore() {
+        // Nothing to release: this system has no unmap, and the pages stay. Saying
+        // so where the release would go beats an empty destructor that reads like
+        // an oversight — and beats a `free` that would be a lie.
+    }
+
+    bool valid() const { return cap_ != 0 && pixels_ != nullptr; }
+    size_t bytes() const { return staros_shared_bytes(cap_); }
+    unsigned int *pixels() const { return pixels_; }
+    int width() const { return width_; }
+    int height() const { return height_; }
+
+    /// Fill a rectangle, the way `QPainter` eventually will: row by row, inside a
+    /// buffer whose stride is its width because the client's pixels are packed.
+    void fill(int x, int y, int w, int h, unsigned int colour) {
+        // A store that never got its pages is not a store to draw into. Without
+        // this a failed allocation becomes a null write and the program dies three
+        // lines later, where the report says "EL0 fault" and not "no memory".
+        if (!valid()) {
+            return;
+        }
+        for (int row = y; row < y + h && row < height_; row++) {
+            for (int col = x; col < x + w && col < width_; col++) {
+                pixels_[row * width_ + col] = colour;
+            }
+        }
+    }
+
+private:
+    int width_;
+    int height_;
+    unsigned int cap_;
+    unsigned int *pixels_ = nullptr;
+};
+
 }  // namespace
 
 int main() {
@@ -134,6 +201,35 @@ int main() {
     std::thread scribe([&built, &words] { built = words.front() + "/" + words.back(); });
     scribe.join();
     check(built.find('/') != std::string::npos, "a thread built a string the main thread reads");
+
+    // ---- the plugin's own calls, from C++ ---------------------------------
+    // A 320x240 window's worth of pixels: 300 KiB, seventy-five pages, larger than
+    // anything else this program allocates and the size a first backing store
+    // actually is. Held in an RAII type, because that is how a plugin will hold it
+    // and because `-fno-exceptions` does not take destructors away.
+    {
+        BackingStore store(640, 480);
+        check(store.valid(), "a backing store's pixels, allocated and mapped from C++");
+        if (store.valid()) {
+            check(store.bytes() == 640 * 480 * 4, "and the kernel agrees about its size");
+            check(store.pixels()[0] == 0, "shared pages arrive zeroed");
+
+            store.fill(0, 0, store.width(), store.height(), 0x00203040u);
+            store.fill(16, 16, 32, 32, 0x00FF8000u);
+            check(store.pixels()[0] == 0x00203040u, "the background reached the first pixel");
+            check(store.pixels()[17 * 640 + 17] == 0x00FF8000u,
+                  "and the rectangle reached its own");
+            check(store.pixels()[15 * 640 + 15] == 0x00203040u,
+                  "the rectangle stopped where it was told");
+            // The last pixel, because a buffer that is a page short passes every
+            // check that only reads the beginning.
+            check(store.pixels()[640 * 480 - 1] == 0x00203040u,
+                  "and the last pixel of the last page is ours too");
+            std::printf("[hello-cpp] backing store: %zu KiB for a whole 640x480 screen, "
+                        "filled and read back from C++\n",
+                        store.bytes() / 1024);
+        }
+    }
 
     // ---- the static local -------------------------------------------------
     check(ledger().built(), "the static local reports itself constructed");

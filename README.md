@@ -191,6 +191,7 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [child] hello - I was created at runtime, not by the kernel
 [client] read from shared memory: shared-memory works: written by the server, read by the client
 [client] read the marker from the SECOND page of a 2-page shared buffer
+[hello-cpp] backing store: 1200 KiB for a whole 640x480 screen, filled and read back from C++
 [hello-cpp] a static local was constructed on first use
 [hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads
 [hello-cpp] the static local's destructor ran at exit, holding 2 entries
@@ -225,14 +226,14 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [hello-c] window: a 32x32 surface on a 640x480 screen, from C through staros.h
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 73 requests, 157 bytes of file data, and refused 11 - the archive never left this address space
-clock: the demo took 6310 ms on the monotonic clock, during which core 0 took 61 tick(s)
-sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 12293 us
-scheduler: all tasks finished after 61 timer ticks; task table grew to 35 (old fixed max 8)
+clock: the demo took 3197 ms on the monotonic clock, during which core 0 took 39 tick(s)
+sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 6085 us
+scheduler: all tasks finished after 39 timer ticks; task table grew to 35 (old fixed max 8)
 task teardown: reaped 32 dead-task kernel stacks (1024 KiB returned to the heap)
 user stacks: 41 page(s) mapped on demand (164 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=61
+preemption: timer ticks per core — cpu0=39
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x40331000 (exited client's root was 0x40322000)
+frame reclaim: post-teardown alloc 0x40332000 (exited client's root was 0x40323000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
   (3 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
 shutting down (PSCI SYSTEM_OFF)
