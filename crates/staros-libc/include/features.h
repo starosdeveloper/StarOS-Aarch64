@@ -6,10 +6,23 @@
  * claims C11 and POSIX, and no locale or wide-character machinery beyond the
  * little that crates/staros-libc actually implements.
  *
- * Everything declared through this sysroot is implemented in that crate, or it is
- * not declared at all. A header that promised a function nobody wrote would move
- * the failure from the link (where it names the symbol) to run time (where it does
- * not).
+ * The rule this file used to state — "everything declared here is implemented, or
+ * it is not declared at all" — was right about the danger and wrong about the
+ * mechanism, and it was never checked. By the time anything looked, `math.h` was
+ * promising `erf`, `lgamma` and the whole `long double` family against an archive
+ * that defined none of them.
+ *
+ * The danger is a *definition that silently does nothing*: it moves the failure
+ * from the link, where the symbol names itself, to run time, where it names
+ * nothing. A **declaration** with no definition does not do that — it fails at the
+ * link, by name, which is the good failure. It is also unavoidable here: libstdc++'s
+ * <cwchar> and <cmath> require declarations for functions nothing in this system
+ * will ever call, and removing them would mean no C++ program compiles at all.
+ *
+ * So the rule is now: every declaration is either implemented, or listed in
+ * `docs/header-gap.txt` with the reason its group is there. `scripts/header-check.sh`
+ * enforces both halves — a promise added without being kept fails, and a promise
+ * kept but still listed fails too, so the list cannot rot.
  */
 #ifndef _FEATURES_H
 #define _FEATURES_H 1

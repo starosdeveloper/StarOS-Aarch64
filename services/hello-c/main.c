@@ -93,6 +93,18 @@ ssize_t write(int fd, const void *buf, size_t count);
  * given, and the only way to know it compiles is to compile it. */
 #include <staros.h>
 
+/* The header Qt asks for first — `qglobal.h` includes it on line 20 — and the one
+ * this sysroot did not have. Included here so it is compiled by the same -Werror as
+ * everything else, and with NDEBUG *undefined*, which is the half that has code in
+ * it: an `assert` that expands to `((void)0)` proves only that the macro exists. */
+#include <assert.h>
+/* And the header whose fourteen functions had been declared by nobody's
+ * implementation. Included rather than redeclared, for the same reason. */
+#include <ctype.h>
+#ifndef EOF
+#define EOF (-1)
+#endif
+
 /* The capabilities the kernel installs for this program, in order: a file server's
  * request/reply pair, then the display server's. */
 #define EP_REQUEST 1u
@@ -1830,6 +1842,55 @@ static void check_font(void)
            (unsigned long)total, sum);
 }
 
+/* Character classification, and the assertion macro.
+ *
+ * Fourteen `ctype.h` functions had been declared by this sysroot since it was
+ * written and implemented by nobody. Nothing noticed: the 282-symbol contract is
+ * measured from what a Qt *link* leaves undefined, and a header is a different
+ * demand — libstdc++'s <cctype> says `using ::isalpha;`, which fails at compile
+ * time in a file that has nothing to do with the mistake.
+ *
+ * `assert` is exercised in the same place because it has the same shape of bug: a
+ * macro that expands to nothing passes every test that only calls it. */
+static void check_ctype(void)
+{
+    check(isalpha('a') && isalpha('Z') && !isalpha('5') && !isalpha(' '), "isalpha");
+    check(isdigit('7') && !isdigit('a'), "isdigit");
+    check(isalnum('7') && isalnum('a') && !isalnum('-'), "isalnum");
+    check(isxdigit('f') && isxdigit('F') && isxdigit('9') && !isxdigit('g'), "isxdigit");
+    check(isupper('A') && !isupper('a'), "isupper");
+    check(islower('a') && !islower('A'), "islower");
+    check(ispunct('-') && !ispunct('a') && !ispunct(' '), "ispunct");
+    check(isgraph('!') && !isgraph(' '), "isgraph");
+    check(isprint(' ') && !isprint('\n'), "isprint");
+    check(iscntrl('\n') && !iscntrl('a'), "iscntrl");
+    check(tolower('Q') == 'q' && tolower('q') == 'q' && tolower('-') == '-', "tolower");
+    check(toupper('q') == 'Q' && toupper('Q') == 'Q' && toupper('-') == '-', "toupper");
+
+    /* Space and blank are different, which is the whole reason both names exist: a
+     * newline separates tokens and does not sit inside a line. An implementation
+     * that forwarded one to the other makes every line-oriented parser read past
+     * the end of its line. */
+    check(isspace('\n') && isspace(' ') && isspace('\t'), "isspace");
+    check(isblank(' ') && isblank('\t') && !isblank('\n'), "isblank");
+
+    /* EOF must classify as nothing. `while (isspace(c = getchar()))` depends on it,
+     * and a table-driven implementation indexed from -128 reads out of bounds here
+     * instead of answering. */
+    check(!isalpha(EOF) && !isdigit(EOF) && !isspace(EOF), "EOF is not a character");
+    check(tolower(EOF) == EOF && toupper(EOF) == EOF, "and converting it changes nothing");
+
+    /* The assertion macro, with NDEBUG undefined, on a condition that holds. What
+     * this cannot check is the failing branch — it ends the process by design — so
+     * what is proved here is that the macro evaluates its argument exactly once and
+     * that `__assert_fail` linked. */
+    int evaluated = 0;
+    assert(++evaluated == 1);
+    check(evaluated == 1, "assert evaluated its argument exactly once");
+
+    puts("[hello-c] ctype: fourteen classifications the header had promised and nobody had written");
+}
+
 int main(void)
 {
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
@@ -1853,6 +1914,7 @@ int main(void)
     check_shared();
     check_display();
     check_font();
+    check_ctype();
 
     if (failures == 0)
         puts("[hello-c] C RUNTIME OK - every check passed");

@@ -56,6 +56,7 @@
 // guard, several function calls away from anything that looks related.
 #![cfg_attr(not(test), no_builtins)]
 
+pub mod ctype;
 pub mod cxx;
 pub mod dir;
 pub mod fd;
@@ -330,6 +331,70 @@ mod exports {
     #[no_mangle]
     pub extern "C" fn abort() -> ! {
         stdio::write_bytes(b"[libc] abort()\n");
+        stdio::flush();
+        sys::exit(134) // 128 + SIGABRT, what a shell would report
+    }
+
+    /// What a failed `assert` calls.
+    ///
+    /// The name and the four arguments are glibc's, because that is what every
+    /// header compiled against a Linux sysroot expands `assert` into — libstdc++'s
+    /// included. A tidier signature here would mean patching all of them.
+    ///
+    /// It prints and ends the process rather than calling `abort`, so the message
+    /// and the exit are one path: a report that reached the console followed by a
+    /// second failure inside the abort handler is how an assertion comes to look
+    /// like a crash with no diagnosis.
+    ///
+    /// # Safety
+    /// C ABI: all four pointers are NUL-terminated C strings, as `assert` builds
+    /// them from string literals and `__PRETTY_FUNCTION__`.
+    #[no_mangle]
+    pub unsafe extern "C" fn __assert_fail(
+        expression: *const core::ffi::c_char,
+        file: *const core::ffi::c_char,
+        line: core::ffi::c_uint,
+        function: *const core::ffi::c_char,
+    ) -> ! {
+        /// Write a C string, or a placeholder when the caller passed null. A
+        /// diagnostic that faults while reporting a fault tells nobody anything.
+        // SAFETY: forwarded from the caller's contract.
+        unsafe fn put(p: *const core::ffi::c_char) {
+            if p.is_null() {
+                stdio::write_bytes(b"?");
+                return;
+            }
+            let mut n = 0;
+            // SAFETY: the caller promised a NUL-terminated string.
+            while unsafe { *p.add(n) } != 0 {
+                n += 1;
+            }
+            // SAFETY: `n` bytes were just walked and found to be readable.
+            stdio::write_bytes(unsafe { core::slice::from_raw_parts(p.cast::<u8>(), n) });
+        }
+        stdio::write_bytes(b"[libc] assertion failed: ");
+        // SAFETY: forwarded from the caller.
+        unsafe { put(expression) };
+        stdio::write_bytes(b", at ");
+        // SAFETY: forwarded from the caller.
+        unsafe { put(file) };
+        stdio::write_bytes(b":");
+        let mut digits = [0u8; 10];
+        let mut i = digits.len();
+        let mut value = line;
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        stdio::write_bytes(&digits[i..]);
+        stdio::write_bytes(b" in ");
+        // SAFETY: forwarded from the caller.
+        unsafe { put(function) };
+        stdio::write_bytes(b"\n");
         stdio::flush();
         sys::exit(134) // 128 + SIGABRT, what a shell would report
     }

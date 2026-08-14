@@ -195,7 +195,7 @@ fn digit(c: u8, base: c_int) -> Option<u8> {
 /// belong to the system's own libc and defining them would break the test binary.
 #[cfg(not(test))]
 pub mod exports {
-    use super::{as_bytes, c_char, c_int, c_void, digit};
+    use super::{as_bytes, c_char, c_int, c_void};
 
     // The three memory primitives are written as explicit loops, and the crate
     // carries `#![no_builtins]` so LLVM leaves them alone.
@@ -461,15 +461,10 @@ pub mod exports {
         v.wrapping_abs()
     }
 
-    #[no_mangle]
-    pub extern "C" fn isspace(c: c_int) -> c_int {
-        c_int::from(c == 0x20 || (0x09..=0x0d).contains(&c))
-    }
-
-    #[no_mangle]
-    pub extern "C" fn isdigit(c: c_int) -> c_int {
-        c_int::from(digit(c as u8, 10).is_some())
-    }
+    // `isspace` and `isdigit` used to be here, alone, because `strtol` needed them
+    // and nothing else did. They live in `crate::ctype` now with the other twelve —
+    // a header that declared fourteen against an archive that defined two is the
+    // defect that found the rest.
 
     /// The name glibc's headers give `strtol` when a program is compiled as C23.
     /// The C23 change is that base 2 gets a `0b` prefix; everything else, including

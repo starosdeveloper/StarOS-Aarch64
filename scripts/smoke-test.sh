@@ -313,6 +313,12 @@ if [ -n "$INITRAMFS" ]; then
     # this line is one where a stream that forgot to subtract its read-ahead gets a
     # different answer.
     req "[hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell"
+    # Fourteen ctype functions the sysroot had declared and nobody had written,
+    # plus the assertion macro. Found by starting G6: the 282-symbol contract is
+    # measured from what a Qt *link* leaves undefined, and a header is a different
+    # demand — libstdc++'s <cctype> says `using ::isalpha;` and fails at compile
+    # time in a file that has nothing to do with the mistake.
+    req "[hello-c] ctype: fourteen classifications the header had promised and nobody had written"
     # The system font, read the way FreeType will read it: 133796 bytes through a
     # 4 KiB bounce buffer, twice — once in 512-byte bites through FILE*, once as a
     # single 33-page read of the descriptor — and the two agree byte for byte. The

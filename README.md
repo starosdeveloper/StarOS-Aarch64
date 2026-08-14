@@ -109,6 +109,7 @@ cargo ktest-host             # portable-crate unit tests on the host (183 tests)
 ./scripts/input-check.sh     # press a key on the emulated keyboard and check the driver decoded it
 ./scripts/gdb-check.sh       # break inside an EL0 program over QEMU's gdbstub and unwind its stack
 ./scripts/libc-progress.sh   # score crates/staros-libc against the symbols Qt needs
+./scripts/header-check.sh    # every function the sysroot declares must be one the library defines
 ./scripts/smoke-test.sh --quick   # same, minus the slow 8-core run
 ```
 
