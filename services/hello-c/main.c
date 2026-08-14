@@ -1504,7 +1504,7 @@ static void check_display(void)
 
     /* A 32x32 green surface, placed clear of the two the assembly client draws so
      * the screenshot can tell all three apart. */
-    const unsigned long side = 32;
+    const unsigned long side = 48;
     const size_t bytes = side * side * 4;
     unsigned int cap = staros_shared_create(bytes);
     check(cap != 0, "pixels for a window");
@@ -1543,7 +1543,7 @@ static void check_display(void)
     msg.words[0] = surface;
     msg.words[2] = 4u | (4ull << 32);
     check(display_call(display, reply, &msg), "a partial commit was accepted");
-    check(msg.words[0] == 16, "and repainted 16 pixels, not 1024");
+    check(msg.words[0] == 16, "and repainted 16 pixels, not 2304");
 
     /* A second surface, exactly on top of the first, in a colour it does not
      * share — then destroyed.
@@ -1607,6 +1607,50 @@ static void check_display(void)
     staros_msg_recv(reply, &msg);
     check(msg.tag == STAROS_DISPLAY_ERROR, "a made-up surface is refused");
     check(msg.words[0] == STAROS_DISPLAY_ERR_NO_SURFACE, "and the refusal says which");
+
+    /* Double buffering, which is the whole reason `Commit` may carry a capability.
+     *
+     * A client drawing into the buffer the server is compositing produces a torn
+     * window, and nothing on the server's side fixes it: the pages are shared and
+     * there is no fence. So the client keeps two, draws into the one that is not on
+     * screen, and hands it over with the commit. `QBackingStore` does exactly this,
+     * and without it a plugin's only choices are tearing or a full-frame copy.
+     *
+     * The green here is a different shade, so the screenshot at the end says which
+     * buffer won: if the swap did not happen, the first one is still on screen. */
+    unsigned int back_cap = staros_shared_create(bytes);
+    check(back_cap != 0, "a second buffer for the same window");
+    unsigned int *back = (unsigned int *)staros_shared_map(back_cap);
+    check(back != 0, "and it mapped somewhere else");
+    check(back != pixels, "two buffers are two addresses");
+    /* A visibly different green. The first version filled both buffers with the
+     * same colour, so "the swap happened" and "the swap did nothing" produced
+     * identical screens — the falsification passed, which is how that was found. */
+    for (size_t i = 0; i < bytes / 4; i++)
+        back[i] = 0x0000C800u;
+
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_COMMIT;
+    msg.words[0] = surface;
+    msg.words[2] = side | (side << 32);
+    msg.cap = back_cap;
+    check(display_call(display, reply, &msg), "the commit carrying a new buffer");
+    check(msg.words[0] == side * side, "repainted the whole surface from it");
+
+    /* A buffer too small for the surface must be refused on this path too. The
+     * check lives in one function for both requests, and this is what proves the
+     * second caller reaches it. */
+    unsigned int tiny = staros_shared_create(64);
+    check(tiny != 0, "a deliberately tiny buffer");
+    memset(&msg, 0, sizeof msg);
+    msg.tag = STAROS_DISPLAY_COMMIT;
+    msg.words[0] = surface;
+    msg.words[2] = side | (side << 32);
+    msg.cap = tiny;
+    staros_msg_send(display, &msg);
+    staros_msg_recv(reply, &msg);
+    check(msg.tag == STAROS_DISPLAY_ERROR, "swapping in a buffer that is too small is refused");
+    check(msg.words[0] == STAROS_DISPLAY_ERR_BUFFER, "because the buffer is too small");
 
     /* Surface ids are global and sequential, so the neighbour's window is one away
      * from this one. Naming it must fail: a client that can destroy or move another
@@ -1685,7 +1729,7 @@ static void check_display(void)
 
     close(display);
     close(reply);
-    printf("[hello-c] window: a %lux%lu surface on a %lux%lu screen, from C through staros.h\n",
+    printf("[hello-c] window: a %lux%lu surface on a %lux%lu screen, double buffered, from C through staros.h\n",
            side, side, width, height);
 }
 

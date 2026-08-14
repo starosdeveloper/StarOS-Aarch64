@@ -427,9 +427,11 @@ req "framebuffer: ramfb 640x480 online"
 req "framebuffer: handed to displaysrv"
 req "[displaysrv] the screen is mine"
 req "[displaysrv] composited client surfaces onto a screen no client can touch"
-# The window-system half: four surfaces from two clients, three of them
-# overlapping, restacked, one closed again, and commits that repainted only the
-# rectangles they named. The tally is exact — two full 64x64 commits and a raise at
+# The window-system half: five surfaces from four clients, some overlapping, one
+# restacked, one closed again and one taken down with the process that crashed, and
+# commits that repainted only the rectangles they named. No keys are pressed here —
+# that is input-check.sh — so the routing counters are zero and say so, which is a
+# claim of its own: a server dropping keystrokes with nobody focused must admit it. The tally is exact — two full 64x64 commits and a raise at
 # 4096 pixels each, 64 for the 8x8 damage, then the C program's 1024, its 16, its
 # throwaway window's 1024 and the 1024 that repainted what closing it uncovered —
 # so a server quietly repainting whole surfaces on every commit fails this line
@@ -437,7 +439,7 @@ req "[displaysrv] composited client surfaces onto a screen no client can touch"
 # made-up surface id, a destroyed one, a surface claiming more pixels than its
 # buffer holds, one with no buffer at all, and damage past the bottom edge. The
 # third of those is what keeps a lying client from making the *server* fault.
-req "[displaysrv] 3 surface(s) live, 7 commit(s), 17488 pixel(s) composited, 7 refused, 1 client(s) reaped"
+req "[displaysrv] 4 surface(s) live, 9 commit(s), 24656 pixel(s) composited, 8 refused, 1 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus"
 # A fourth client opened a window, asked the server to watch it, and crashed. The
 # kernel signals the notification it delegated, the server takes its windows off
 # the screen, and the count says it happened. Whether the *pixels* went back is
@@ -449,7 +451,7 @@ forbid "[dyingclient] WINDOW WRONG"
 # same header a platform plugin is given. Two clients on one server is where a
 # shared reply endpoint shows itself — as one of them hanging on an answer the
 # other took — so this line is also the routing assertion.
-req "[hello-c] window: a 32x32 surface on a 640x480 screen, from C through staros.h"
+req "[hello-c] window: a 48x48 surface on a 640x480 screen, double buffered, from C through staros.h"
 req "[fbclient] asked the screen its size (640x480 xRGB8888)"
 forbid "[fbclient] SURFACE WRONG"
 forbid "SURFACE WRONG"

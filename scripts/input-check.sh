@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Press a key on the emulated keyboard and check the driver decoded it.
+# Press a key on the emulated keyboard and check it reaches a window.
+#
+# `-device ramfb` is not decoration here. Input is routed by the *display server* —
+# it is the only process that knows which window has the focus — so a machine with
+# no framebuffer has no display server, and a decoded key has nowhere to go. This
+# script ran without it for one revision and reported "the driver decoded the key
+# but no process received it", which was true and had nothing to do with the driver.
 #
 # The rest of the test suite asserts on what the kernel and its programs say about
 # themselves. This one makes the *outside world* do something: QEMU synthesises a
@@ -33,7 +39,7 @@ SEND=$!
 
 printf '\n' | timeout -k 5 60 qemu-system-aarch64 \
     -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M \
-    -display none -device virtio-keyboard-device \
+    -display none -device ramfb -device virtio-keyboard-device \
     -kernel "$TMP/Image" \
     -qmp "unix:$QMP,server,nowait" \
     -serial file:"$TMP/serial.log" >/dev/null 2>&1
@@ -47,20 +53,22 @@ grep -a -E "\[devicemgr\] (found|no virtio)|\[inputsrv\]|\[inputclient\]" "$TMP/
 
 # The claim, in two halves. First: a key press, decoded by a driver in EL0. Code 30
 # is 'a' in the Linux input numbering that virtio-input passes through unchanged.
-# Second, and the one that makes input *usable*: the same code reached a different
-# process, which holds no device, no interrupt and no sight of the driver's memory.
-# A driver that decodes a key and tells nobody is where this stopped before.
+# Second, and the one that makes input *usable*: the same code reached a window,
+# through the display server, in a process holding no device, no interrupt and no
+# sight of the driver's memory. Routed rather than broadcast — the compositor is the
+# only process that knows which window has the focus, and that is where the decision
+# belongs.
 if ! grep -qa "key press from the device: code 30" "$TMP/serial.log"; then
     echo
     echo "input-check: FAIL — no decoded key press in the log"
     exit 1
 fi
-if ! grep -qa "\[inputclient\] key code 30 arrived over IPC" "$TMP/serial.log"; then
+if ! grep -qa "\[inputclient\] key code 30 reached my window through displaysrv" "$TMP/serial.log"; then
     echo
-    echo "input-check: FAIL — the driver decoded the key but no process received it"
+    echo "input-check: FAIL — the driver decoded the key but no window received it"
     exit 1
 fi
 
 echo
-echo "input-check: PASS — the key crossed device, virtqueue, interrupt, driver, and a process boundary"
+echo "input-check: PASS — the key crossed device, virtqueue, interrupt, driver, the compositor, and a process boundary"
 exit 0

@@ -1077,7 +1077,63 @@ extern "C" fn _start() -> ! {
         ".Linputclient:",
         "cmp w19, #21",
         "b.ne .Ldyingclient",        // id != 21 -> the client that crashes, then the rest
-        "mov x0, #1",                // handle 1 = the event endpoint (recv)
+        // A window first: input is routed by the display server, and a process with
+        // no window has nothing to be focused. 32x32, one page.
+        "mov x0, #1",
+        "mov x8, #14",               // Syscall::CreateShared
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lic_bad",
+        "mov x21, x0",               // x21 = the buffer's capability
+        "mov x8, #15",               // Syscall::MapShared
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lic_bad",
+        "mov w23, #0xFFFF",          // 0x0000FFFF, cyan — nothing else on screen is
+        "mov x9, #1024",
+        "mov x10, x0",
+        ".Lic_fill:",
+        "str w23, [x10], #4",
+        "subs x9, x9, #1",
+        "b.ne .Lic_fill",
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #1",
+        "str x0, [x11]",             // msg.tag = 1 (Create)
+        "mov x0, #32",
+        "str x0, [x11, #8]",
+        "str x0, [x11, #16]",
+        "mov x0, #520",
+        "str x0, [x11, #24]",        // words[2] = x
+        "mov x0, #380",
+        "str x0, [x11, #32]",        // words[3] = y
+        "str w21, [x11, #40]",
+        "bl .Lic_call",
+        "mov x25, x0",               // x25 = the surface id
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #3",
+        "str x0, [x11]",             // msg.tag = 3 (Commit)
+        "str x25, [x11, #8]",
+        "mov x0, #32",
+        "lsl x1, x0, #32",
+        "orr x0, x0, x1",
+        "str x0, [x11, #24]",
+        "bl .Lic_call",
+        // Claim the keyboard. Focus is asked for, not inherited from being on top:
+        // raising a window and taking the keystroke someone is in the middle of
+        // typing are different acts.
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #8",
+        "str x0, [x11]",             // msg.tag = 8 (Focus)
+        "bl .Lic_call",
+        // And wait. Handle 3 is where the display server sends what it decided
+        // belongs to this window; nothing arrives unless someone presses a key.
+        "mov x0, #3",
         "mov x1, x11",
         "mov x8, #2",                // Syscall::Recv
         "svc #0",
@@ -1097,6 +1153,23 @@ extern "C" fn _start() -> ! {
         "bl .Lputs",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
+        // Send at x11 on handle 1, reply on handle 2, result in x0.
+        ".Lic_call:",
+        "mov x14, x30",
+        "mov x0, #1",
+        "mov x1, x11",
+        "mov x8, #1",                // Syscall::Send
+        "svc #0",
+        "mov x0, #2",
+        "mov x1, x11",
+        "mov x8, #2",                // Syscall::Recv
+        "svc #0",
+        "ldr x0, [x11]",
+        "cmp x0, #2",                // 2 = OK
+        "b.ne .Lic_bad",
+        "ldr x0, [x11, #8]",
+        "mov x30, x14",
+        "ret",
 
         // ============ the client that crashes (id 22) ============
         // Opens a window, tells the display server to watch it, and then dies on
@@ -1386,9 +1459,9 @@ extern "C" fn _start() -> ! {
         "29:",
         ".asciz \"[inputclient] key code \"",
         "30:",
-        ".asciz \" arrived over IPC - I hold no device, no interrupt and no sight of the driver's memory\\n\"",
+        ".asciz \" reached my window through displaysrv - I hold no device, no interrupt and no sight of the driver's memory\\n\"",
         "31:",
-        ".asciz \"[inputclient] EVENT WRONG - the receive failed, or what arrived was not a key event\\n\"",
+        ".asciz \"[inputclient] EVENT WRONG - the window, the focus claim or the event failed\\n\"",
         "32:",
         ".asciz \"[dyingclient] a 32x32 window on screen, the server watching me, and now I crash\\n\"",
         "33:",

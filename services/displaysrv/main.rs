@@ -23,10 +23,15 @@
 //! tag = 3 Commit   words[0] = surface id
 //!                  words[1] = damage x | y << 32     in surface-local pixels
 //!                  words[2] = damage w | h << 32
+//!                  cap      = optional: a new buffer for this surface, swapped in
+//!                             before compositing (double buffering)
 //!                  -> words[0] = pixels written to the screen
 //! tag = 4 Raise    words[0] = surface id              to the top of the stack
 //! tag = 5 Destroy  words[0] = surface id
 //! tag = 7 Watch    cap = a notification the kernel signals when this client dies
+//!                  -> words[0] = 1
+//! tag = 8 Focus    claim the keyboard; input events go to this client until
+//!                  another claims it or this one dies
 //!                  -> words[0] = 1
 //! tag = 9 Bye      this client will send nothing more (its windows stay)
 //! ```
@@ -55,6 +60,24 @@
 //! leaves a window up has made a choice. The polite case is covered by the same
 //! mechanism anyway — `NotifyOnExit` fires on an ordinary exit too.
 //!
+//! ## Where input goes
+//!
+//! `inputsrv` decodes a key and sends it here, not to an application. This is the
+//! only process that knows which window is in front, so it is the only one that can
+//! decide who the key belongs to; a driver that routed input would have to be told
+//! about windows, and then it would be a display server with a virtqueue attached.
+//!
+//! Focus is **claimed**, not inferred from the stacking order. Raising a window and
+//! focusing it are different acts in every real window system — a notification pops
+//! to the front and must not steal the keystroke being typed — and this server has
+//! no policy of its own about who deserves input: a real one takes that from the
+//! shell. So the mechanism is exposed and left to be driven. The last claim wins,
+//! and a client that dies loses it.
+//!
+//! A key arriving with nobody focused is dropped, and counted. Queueing it for the
+//! next client to claim focus would deliver a keystroke to a window that was not on
+//! screen when it was typed, which is worse than losing it.
+//!
 //! `Screen` comes first in that list because it has to come first in time: a client
 //! cannot size a buffer before it knows what it is drawing onto, and the geometry is
 //! the one thing here that no client can work out for itself. The stride is
@@ -82,8 +105,25 @@
 //! which the region approach is only after it is finished. There is no alpha: a
 //! pixel belongs to exactly one surface.
 //!
-//! Vsync and double buffering are still absent, deliberately. This is the phase that
-//! gives a window system several windows, not the phase that makes them smooth.
+//! ## Double buffering, and the vsync that is not here
+//!
+//! A client drawing into the buffer this server is compositing produces a torn
+//! window, and no amount of care on this side fixes it: the pages are shared and
+//! there is no fence. The fix belongs to the client and needs one thing from the
+//! protocol — `Commit` may carry a *new* buffer, which is swapped in before the
+//! rectangle is painted. So a client keeps two, draws into the one that is not on
+//! screen, and commits it. That is exactly what `QBackingStore` does, and without it
+//! a plugin's only options are tearing or a full-frame copy.
+//!
+//! A back buffer *on this side* was considered and is not here, because it buys
+//! nothing: compositing computes each pixel's final colour and writes it once, so
+//! there is no half-drawn pixel for a back buffer to hide, and the copy out of it
+//! would tear across the rectangle exactly as the direct writes do.
+//!
+//! **Vsync is absent and is not simulated.** `ramfb` is one buffer with no flip and
+//! no vblank — the device reads it whenever it refreshes, and there is nothing to
+//! synchronise against. Anything printed here about frame timing would be a
+//! measurement of QEMU's refresh loop. It waits for the board.
 
 #![no_std]
 #![no_main]
@@ -107,6 +147,11 @@ const SYS_WAIT_ANY: usize = 24;
 const SYS_SHARED_PAGES: usize = 28;
 const SYS_ENDPOINT_BIND: usize = 30;
 const SYS_ENDPOINT_PENDING: usize = 31;
+
+/// Input arrives from the driver here, and leaves for the focused client on
+/// `EV_BASE + client`.
+const EP_INPUT: u64 = 9;
+const EV_BASE: u64 = 10;
 
 /// The most client pairs this server will look for in its capability table.
 ///
@@ -137,6 +182,7 @@ const TAG_RAISE: u64 = 4;
 const TAG_DESTROY: u64 = 5;
 const TAG_SCREEN: u64 = 6;
 const TAG_WATCH: u64 = 7;
+const TAG_FOCUS: u64 = 8;
 const TAG_BYE: u64 = 9;
 
 /// The only pixel format this server composites. Named in the reply so a client
@@ -504,6 +550,20 @@ extern "C" fn main() -> ! {
     // hears about them only when a message happens to arrive.
     let mut watches = [0u32; MAX_CLIENTS];
     let mut reaped = 0u32;
+    // Who the keyboard belongs to, and how many keys have gone nowhere because
+    // nobody had claimed it. Both are reported: a key that vanishes silently is the
+    // hardest input bug there is to believe.
+    let mut focus: Option<usize> = None;
+    let mut routed = 0u32;
+    let mut dropped = 0u32;
+    // The driver's endpoint waits in the same set as the clients'. One notification
+    // for messages and deaths and input alike is the whole reason `EndpointBind`
+    // exists — a second wait would mean hearing about a key only when a client
+    // happened to send a request.
+    // SAFETY: handle 9 is ours with receive rights; `arrivals` is our notification.
+    if unsafe { syscall2(SYS_ENDPOINT_BIND, EP_INPUT, arrivals) } < 0 {
+        puts("[displaysrv] no input endpoint; the keyboard will not reach a window\n");
+    }
     while goodbyes < CLIENTS_EXPECTED {
         // A death is not a message, so it is checked before the queues: a client
         // that crashed after sending its last request has both waiting, and taking
@@ -513,8 +573,24 @@ extern "C" fn main() -> ! {
             if let Some(rect) = compositor.remove_owner(dead) {
                 pixels_drawn += compositor.composite(&mut screen, rect);
             }
+            if focus == Some(dead) {
+                // The keyboard does not stay pointed at a process that is gone.
+                focus = None;
+            }
             reaped += 1;
             puts("[displaysrv] a client died; its windows are off the screen\n");
+        }
+        // Input before requests, for the same reason deaths come before both: a key
+        // is a fact about the outside world, and the client it belongs to may be
+        // blocked waiting for it while it sits here.
+        while let Some(event) = take_input() {
+            match focus {
+                Some(client) => {
+                    forward(client, &event);
+                    routed += 1;
+                }
+                None => dropped += 1,
+            }
         }
         let Some(client) = next_client(arrivals, clients, &mut turn) else {
             puts("[displaysrv] woken with nothing queued\n");
@@ -569,6 +645,10 @@ extern "C" fn main() -> ! {
             TAG_RAISE => raise(&mut compositor, &mut screen, client, &msg),
             TAG_DESTROY => destroy(&mut compositor, &mut screen, client, &msg),
             TAG_WATCH => watch(&mut watches, client, arrivals, &msg),
+            TAG_FOCUS => {
+                focus = Some(client);
+                Ok(1)
+            }
             _ => Err(ERR_MALFORMED),
         };
         match outcome {
@@ -577,7 +657,7 @@ extern "C" fn main() -> ! {
                     commits += 1;
                 }
                 pixels_drawn += match msg.tag {
-                    TAG_CREATE | TAG_WATCH => 0,
+                    TAG_CREATE | TAG_WATCH | TAG_FOCUS => 0,
                     _ => result as usize,
                 };
                 reply(client, TAG_OK, result);
@@ -590,8 +670,44 @@ extern "C" fn main() -> ! {
     }
 
     puts("[displaysrv] composited client surfaces onto a screen no client can touch\n");
-    report(compositor.count, commits, pixels_drawn, rejected, reaped);
-    exit();
+    report(compositor.count, commits, pixels_drawn, rejected, reaped, routed, dropped);
+
+    // The tally is printed and this server does **not** exit.
+    //
+    // The goodbyes say the drawing clients are finished; they say nothing about the
+    // keyboard, and a key can be pressed at any moment for as long as the machine
+    // runs. A server that stopped here was one that had already gone by the time
+    // anyone pressed anything — which is what happened, and the symptom was a
+    // decoded key press with nowhere to go.
+    //
+    // Living forever is what the UART driver already does, and the shutdown path
+    // accounts for it: the kernel reports how many tasks are still alive and holding
+    // an address space. One more of those is the price of a display server that is
+    // there when the user is.
+    loop {
+        while let Some(dead) = reap(&mut watches, clients) {
+            if let Some(rect) = compositor.remove_owner(dead) {
+                compositor.composite(&mut screen, rect);
+            }
+            if focus == Some(dead) {
+                focus = None;
+            }
+        }
+        while let Some(event) = take_input() {
+            if let Some(client) = focus {
+                forward(client, &event);
+            }
+        }
+        let handles = [arrivals as u32];
+        // SAFETY: `WaitAny` reads one handle from this array and parks; the array
+        // outlives the call.
+        let rc = unsafe {
+            syscall3(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, 0)
+        };
+        if rc < 0 {
+            exit();
+        }
+    }
 }
 
 /// `Create`: map the delegated buffer, check it is big enough for the geometry the
@@ -599,18 +715,34 @@ extern "C" fn main() -> ! {
 fn create(compositor: &mut Compositor, owner: usize, msg: &Message) -> Result<u64, u64> {
     let (width, height) = (msg.words[0] as usize, msg.words[1] as usize);
     let (x, y) = (msg.words[2] as usize, msg.words[3] as usize);
-    if msg.cap == 0 || width == 0 || height == 0 {
+    if width == 0 || height == 0 {
         return Err(ERR_MALFORMED);
     }
-    // The size comes from the *capability*, never from the message. A client that
-    // overstates its geometry would otherwise make this process walk off the end of
-    // a mapping and take the fault — the wrong process punished for a client's lie.
+    let pixels = accept_buffer(msg.cap, width, height)?;
+    compositor.add(owner, pixels, width, height, x, y).ok_or(ERR_FULL)
+}
+
+/// Map a delegated buffer and check it really holds `width * height` pixels.
+///
+/// The size comes from the *capability*, never from the message. A client that
+/// overstates its geometry would otherwise make this process walk off the end of a
+/// mapping and take the fault — the wrong process punished for a client's lie, and
+/// a display server that dies takes every window with it.
+///
+/// Shared by `Create` and `Commit`, which is the point: the second buffer of a
+/// double-buffered surface arrives through a different request and must be checked
+/// exactly as hard as the first. A check written once cannot be forgotten in one of
+/// two places.
+fn accept_buffer(cap: u32, width: usize, height: usize) -> Result<*const u32, u64> {
+    if cap == 0 {
+        return Err(ERR_MALFORMED);
+    }
     // SAFETY: both syscalls only read the capability table and return a negative
     // error rather than acting on a bad handle.
     let (pages, va) = unsafe {
         (
-            syscall1(SYS_SHARED_PAGES, u64::from(msg.cap)),
-            syscall1(SYS_MAP_SHARED, u64::from(msg.cap)),
+            syscall1(SYS_SHARED_PAGES, u64::from(cap)),
+            syscall1(SYS_MAP_SHARED, u64::from(cap)),
         )
     };
     if pages <= 0 || va < 0 {
@@ -618,12 +750,9 @@ fn create(compositor: &mut Compositor, owner: usize, msg: &Message) -> Result<u6
     }
     let needed = width.checked_mul(height).and_then(|p| p.checked_mul(BPP));
     match needed {
-        Some(bytes) if bytes <= pages as usize * PAGE => {}
-        _ => return Err(ERR_BUFFER),
+        Some(bytes) if bytes <= pages as usize * PAGE => Ok(va as *const u32),
+        _ => Err(ERR_BUFFER),
     }
-    compositor
-        .add(owner, va as *const u32, width, height, x, y)
-        .ok_or(ERR_FULL)
 }
 
 /// `Commit`: recomposite the rectangle the client says changed.
@@ -634,6 +763,14 @@ fn commit(
     msg: &Message,
 ) -> Result<u64, u64> {
     let index = compositor.index_of(owner, msg.words[0]).ok_or(ERR_NO_SURFACE)?;
+    // A buffer with the commit means the client has been drawing somewhere else and
+    // wants that shown instead. Swapped in *before* the rectangle is painted, and
+    // checked against this surface's geometry first: a second buffer is as good a
+    // place to lie about a size as the first.
+    if msg.cap != 0 {
+        let s = compositor.surfaces[index];
+        compositor.surfaces[index].pixels = accept_buffer(msg.cap, s.width, s.height)?;
+    }
     let surface = compositor.surfaces[index];
     let (dx, dy) = (low(msg.words[1]), high(msg.words[1]));
     let (dw, dh) = (low(msg.words[2]), high(msg.words[2]));
@@ -698,6 +835,38 @@ fn watch(watches: &mut [u32; MAX_CLIENTS], client: usize, _arrivals: u64, msg: &
     }
     watches[client] = msg.cap;
     Ok(1)
+}
+
+/// Take one input event from the driver, if one is waiting — non-blocking.
+///
+/// `EndpointPending` first and `Recv` only when it says there is something: `Recv`
+/// blocks, and a server that blocked here would stop serving windows the moment the
+/// keyboard went quiet, which is most of the time.
+fn take_input() -> Option<Message> {
+    // SAFETY: handle 9 is ours with receive rights; this only reads a queue length.
+    if unsafe { syscall1(SYS_ENDPOINT_PENDING, EP_INPUT) } <= 0 {
+        return None;
+    }
+    let mut msg = Message::new();
+    // SAFETY: a message is queued, so this cannot park us; `Recv` writes one
+    // `Message` through the pointer.
+    let rc = unsafe { syscall2(SYS_RECV, EP_INPUT, core::ptr::addr_of_mut!(msg) as u64) };
+    (rc >= 0).then_some(msg)
+}
+
+/// Hand an event to a client, unchanged.
+///
+/// Unchanged is the decision: the driver's tag is the Linux event kind, and a
+/// server that renumbered them would make every client carry a translation table
+/// for a mapping that already existed. The event is not tagged with a window
+/// either — the client has the focus or it does not, and a window id here would be
+/// a second answer to a question the focus already settled.
+fn forward(client: usize, event: &Message) {
+    // SAFETY: `Send` reads one `Message` through this pointer, to a send-only
+    // endpoint this task holds.
+    unsafe {
+        let _ = syscall2(SYS_SEND, EV_BASE + client as u64, core::ptr::from_ref(event) as u64);
+    }
 }
 
 /// Which client has died since this was last asked, if any — non-blocking.
@@ -800,7 +969,15 @@ fn next_client(arrivals: u64, clients: usize, turn: &mut usize) -> Option<usize>
 }
 
 /// Print the tally, without a formatter: this program has no libc.
-fn report(surfaces: usize, commits: u32, pixels: usize, rejected: u32, reaped: u32) {
+fn report(
+    surfaces: usize,
+    commits: u32,
+    pixels: usize,
+    rejected: u32,
+    reaped: u32,
+    routed: u32,
+    dropped: u32,
+) {
     let mut line = [0u8; 160];
     let mut n = 0;
     let put = |bytes: &[u8], line: &mut [u8; 160], n: &mut usize| {
@@ -821,7 +998,11 @@ fn report(surfaces: usize, commits: u32, pixels: usize, rejected: u32, reaped: u
     n += number(u64::from(rejected), &mut line[n..]);
     put(b" refused, ", &mut line, &mut n);
     n += number(u64::from(reaped), &mut line[n..]);
-    put(b" client(s) reaped\n", &mut line, &mut n);
+    put(b" client(s) reaped, ", &mut line, &mut n);
+    n += number(u64::from(routed), &mut line[n..]);
+    put(b" key(s) routed, ", &mut line, &mut n);
+    n += number(u64::from(dropped), &mut line[n..]);
+    put(b" dropped for want of focus\n", &mut line, &mut n);
     // SAFETY: `DebugWrite` reads `n` bytes from a buffer we own.
     unsafe {
         let _ = syscall2(SYS_DEBUG_WRITE, line.as_ptr() as u64, n as u64);

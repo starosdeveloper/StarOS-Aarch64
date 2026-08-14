@@ -1277,6 +1277,21 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     let ep_fb3_reply = obj::create(obj::Object::Endpoint { id: 16 }).expect("ep_fb3_reply object");
     let ep_fb4 = obj::create(obj::Object::Endpoint { id: 17 }).expect("ep_fb4 object");
     let ep_fb4_reply = obj::create(obj::Object::Endpoint { id: 18 }).expect("ep_fb4_reply object");
+    // Input events, per display client. The driver publishes to one endpoint and the
+    // *display server* decides who hears it, which is where that decision belongs: it
+    // is the only process that knows which window is in front. A driver routing input
+    // would have to be told about windows, and then it would be a display server with
+    // a virtqueue attached.
+    //
+    // A separate endpoint per client rather than the reply one they already hold: a
+    // client doing a request and waiting for its answer would otherwise find an event
+    // in its hand instead, and every call site would have to loop.
+    let ep_ev: [obj::ObjectRef; 4] = [
+        obj::create(obj::Object::Endpoint { id: 19 }).expect("ep_ev1 object"),
+        obj::create(obj::Object::Endpoint { id: 20 }).expect("ep_ev2 object"),
+        obj::create(obj::Object::Endpoint { id: 21 }).expect("ep_ev3 object"),
+        obj::create(obj::Object::Endpoint { id: 22 }).expect("ep_ev4 object"),
+    ];
     let ep_fs2 = obj::create(obj::Object::Endpoint { id: 10 }).expect("ep_fs2 object");
     let ep_fs2_reply = obj::create(obj::Object::Endpoint { id: 11 }).expect("ep_fs2_reply object");
 
@@ -1392,6 +1407,13 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb3_reply, send: true, recv: false });
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb4, send: false, recv: true });
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb4_reply, send: true, recv: false });
+        // Handle 9: input arriving from the driver. Handles 10..13: input leaving,
+        // one per client. The server is the hinge, because it is the only process
+        // that knows which window is in front.
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_events, send: false, recv: true });
+        for ev in ep_ev {
+            cap::install(&mut caps, cap::Cap::Endpoint { obj: ev, send: true, recv: false });
+        }
 
         // Its client: an ordinary `init` role with no privilege at all beyond the
         // two endpoint capabilities. It cannot reach the screen; it can only ask.
@@ -1559,12 +1581,15 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         Some((space, caps))
     })();
 
-    // The other end of the input path: a process holding nothing but "receive on
-    // the event endpoint". It cannot reach the keyboard, the interrupt line, or the
-    // driver's memory; a key press arrives as a message or not at all. That is the
-    // shape a toolkit sits in, and building it now is how the claim "input leaves
-    // the driver" gets tested rather than assumed.
+    // The other end of the input path: a display client that opens a window, claims
+    // the focus, and waits for a key. It cannot reach the keyboard, the interrupt
+    // line, or the driver's memory; a key press arrives as a message or not at all,
+    // and only because the display server decided this window should have it. That
+    // is the shape a toolkit sits in.
     let input_client = (|| {
+        // As the dying client: a window is what input is routed *to*, so without a
+        // screen there is nothing here to do and nobody to reply.
+        display.as_ref()?;
         // SAFETY: as every other space built here — the MMU is on with the frame
         // pool identity-mapped and writable, and these frames are uniquely ours.
         let space = mem::with(|frames| unsafe {
@@ -1582,7 +1607,11 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
             Some(s)
         })?;
         let mut caps = cap::empty_caps()?;
-        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_events, send: false, recv: true });
+        // The display server's fourth pair, then its own event endpoint — the same
+        // shape the C program holds, plus the channel focused input arrives on.
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb4, send: true, recv: false });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb4_reply, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_ev[3], send: false, recv: true });
         Some((space, caps))
     })();
 
@@ -1591,6 +1620,12 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // other client here is well behaved, which is why nothing had tested what the
     // server does when one is not.
     let dying_client = (|| {
+        // Only where there is a screen. A display client on a machine with no
+        // framebuffer has nobody to answer it and blocks in `Recv` for ever, and two
+        // extra tasks holding an address space at shutdown is enough to move the
+        // frame-reclaim verdict — which showed up as one config failing once in
+        // several matrix runs, and would have been chased as a memory bug.
+        display.as_ref()?;
         // SAFETY: as every other space built here.
         let space = mem::with(|frames| unsafe {
             let mut s = AddressSpace::new(frames)?;

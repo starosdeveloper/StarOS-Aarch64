@@ -34,8 +34,9 @@ use crate::sync::SpinLock;
 /// server; one is the contention endpoint several senders hammer at once; two
 /// carry the display protocol's commit and its reply, and six more do the same for
 /// its other three clients; four are two file servers' request/reply pairs (one per
-/// client — see `kmain`); the last carries decoded input events out of the input
-/// driver. A real system allocates them dynamically.
+/// client — see `kmain`); one carries decoded input events out of the input driver
+/// to the display server; the last four carry them on from there to whichever
+/// display client has the focus. A real system allocates them dynamically.
 ///
 /// A reply endpoint per client rather than one shared by all of them is not
 /// bookkeeping: two clients receiving on one endpoint means either may take the
@@ -46,7 +47,7 @@ use crate::sync::SpinLock;
 /// objects in `main`, which is exactly the kind of seam that bites: giving the
 /// display endpoint id 4 put its traffic into [`STORM_EP`], and the display server
 /// spent its life rejecting storm messages it had no business seeing.
-const NUM_ENDPOINTS: usize = 19;
+const NUM_ENDPOINTS: usize = 23;
 
 /// The endpoint the IPC contention test uses (see [`storm_stats`]).
 ///

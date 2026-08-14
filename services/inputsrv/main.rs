@@ -266,9 +266,11 @@ extern "C" fn main() -> ! {
             };
             if let Some(event) = read_event(buffers_va, id, len) {
                 if event.is_key_press() {
-                    puts("[inputsrv] key press from the device: code ");
-                    put_dec(u64::from(event.code));
-                    puts(" - decoded in EL0, the kernel never saw the event\n");
+                    put_line(
+                        "[inputsrv] key press from the device: code ",
+                        u64::from(event.code),
+                        " - decoded in EL0, the kernel never saw the event\n",
+                    );
                     publish(TAG_KEY, u64::from(event.code), u64::from(event.value));
                     presses += 1;
                 } else if event.kind == ev::REL || event.kind == ev::ABS {
@@ -370,24 +372,41 @@ fn puts(s: &str) {
 }
 
 /// Write a decimal number.
-fn put_dec(mut v: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
+/// Print `prefix`, a number, and `suffix` as **one** line, in one `DebugWrite`.
+///
+/// Three calls would be three chances for another task to write between them, and
+/// the result reads `key press from the device: code [ipc-storm] receiver drained…`.
+/// That is not hypothetical — it is what this function replaced, and it had passed
+/// for several runs before it did. One call is one line as far as the kernel's
+/// console lock is concerned; a line built from three is a line that is *usually*
+/// whole, which is the worst kind of test.
+fn put_line(prefix: &str, mut value: u64, suffix: &str) {
+    let mut line = [0u8; 160];
+    let mut n = 0;
+    let mut push = |bytes: &[u8], line: &mut [u8; 160], n: &mut usize| {
+        for &b in bytes {
+            if *n < line.len() {
+                line[*n] = b;
+                *n += 1;
+            }
+        }
+    };
+    push(prefix.as_bytes(), &mut line, &mut n);
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
     loop {
         i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
+        digits[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
             break;
         }
     }
-    // SAFETY: as `puts`; the slice is ASCII digits inside `buf`.
+    push(&digits[i..], &mut line, &mut n);
+    push(suffix.as_bytes(), &mut line, &mut n);
+    // SAFETY: as `puts`; `n` bytes of a buffer we own.
     unsafe {
-        let _ = syscall2(
-            SYS_DEBUG_WRITE,
-            buf[i..].as_ptr() as u64,
-            (buf.len() - i) as u64,
-        );
+        let _ = syscall2(SYS_DEBUG_WRITE, line.as_ptr() as u64, n as u64);
     }
 }
 

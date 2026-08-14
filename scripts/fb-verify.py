@@ -15,14 +15,19 @@ What this asserts, at named coordinates, is the claim the phase makes:
   * *in the overlap* the pixels are red, because the client raised the red surface
     after both were committed. Blue there means the stack order lives in the
     server's list and not on the screen;
-  * a 32x32 green surface at (300, 300) belongs to a *different process* — the C
+  * a 48x48 green surface at (300, 300) belongs to a *different process* — the C
     program, drawing through the same header a platform plugin is given. Two
     clients on one server is where a shared reply endpoint shows itself, as one of
-    them hanging on an answer the other took;
+    them hanging on an answer the other took. Its green is the one the program put
+    in its *second* buffer and handed over with a commit, so this pixel is also the
+    proof that double buffering swapped;
   * a fourth client opened a 32x32 yellow window at (450, 200) and then crashed on
     purpose, so those pixels must be **background**: the server holds a notification
     the kernel signals when that client's task exits, and reaping is the only thing
     that puts the background back;
+  * a fifth client — the one waiting for a key — has a 32x32 cyan window at
+    (520, 380). It is there because input is routed by this server to whichever
+    window claimed the focus, and a process with no window has nothing to focus;
   * around them is the display server's background, which only the server draws;
   * the kernel's green console text is *gone* from the region the server owns —
     a kernel that kept mirroring would be writing over the composited frame.
@@ -41,18 +46,23 @@ import time
 # fbclient role in init's image.rs).
 SURFACE = (0xFF, 0x00, 0x00)  # the client's red square, raised to the top
 SECOND = (0x00, 0x00, 0xFF)  # its blue square, underneath and offset
-THIRD = (0x00, 0xFF, 0x00)  # the C program's green square, a second client
+THIRD = (0x00, 0xC8, 0x00)  # the C program: its *second* buffer, a darker green
 BACKGROUND = (0x10, 0x20, 0x30)  # the server's background
 SURFACE_AT = (100, 80)
 SECOND_AT = (140, 110)
 THIRD_AT = (300, 300)
 SURFACE_SIZE = 64
-THIRD_SIZE = 32
+THIRD_SIZE = 48
 # A fourth client opened a yellow window here and then crashed. The display server
 # holds a notification the kernel signals when that client's task exits, so the
 # window comes off the screen — and the proof is that these pixels are background.
 CRASHED_AT = (450, 200)
 CRASHED_SIZE = 32
+# The client that waits for a key. It has a window because focus is a property of
+# a window, and a process with none has nothing for input to arrive at.
+FOCUSED = (0x00, 0xFF, 0xFF)
+FOCUSED_AT = (520, 380)
+FOCUSED_SIZE = 32
 
 
 def parse_ppm(path):
@@ -154,6 +164,15 @@ def check(path):
                 f"the crashed client's window is still at ({x},{y}): {at(x, y)}",
             )
 
+    # The focused client's window. It never receives a key in this run — nobody
+    # presses one — but it must be on screen, because that is what makes it a thing
+    # input can be routed *to*.
+    fx, fy = FOCUSED_AT
+    f = FOCUSED_SIZE
+    for x, y in [(fx + 1, fy + 1), (fx + f // 2, fy + f // 2), (fx + f - 2, fy + f - 2)]:
+        if not near(at(x, y), FOCUSED):
+            return (False, f"the focused client's window pixel ({x},{y}) is {at(x, y)}, not cyan")
+
     # And the server's background must cover the area the kernel's console used to
     # write in. Green text there means the kernel never stopped mirroring.
     greens = sum(1 for x in range(0, w, 4) for y in range(0, 40, 4) if at(x, y)[1] > 80)
@@ -163,7 +182,8 @@ def check(path):
         True,
         f"{w}x{h}: surfaces at {SURFACE_AT} and {SECOND_AT} from one client and "
         f"{THIRD_AT} from another, the raised one on top in the overlap, the crashed "
-        f"client's window at {CRASHED_AT} gone, background around them, no console text",
+        f"client's window at {CRASHED_AT} gone, the focused one at {FOCUSED_AT}, "
+        "background around them, no console text",
     )
 
 
