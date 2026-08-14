@@ -68,6 +68,7 @@ board `unsafe`.
 | `services/fssrv` | File server: owns the initramfs, answers `Open`/`Read`/`Stat`/`List`/`Close` over IPC through a client-supplied shared buffer |
 | `services/fsclient` | A process with no archive and no device, reading a file anyway — the only way "these bytes arrived over IPC" means anything |
 | `services/hello-c` | A program written in **C**, compiled by clang and linked against `crates/staros-libc` — the toolchain Qt will arrive through, exercised by something small enough to debug: formatting, mathematics, number parsing, the heap, `mmap`, the calendar, the clock, files through `FILE*`, a directory listing over a flat archive, the process layer, four threads with their own TLS, and `poll` |
+| `services/qstaros` | The **QPA plugin**: `QPlatformIntegration`, `QPlatformScreen`, `QPlatformWindow` over a `displaysrv` surface, and a `QPlatformBackingStore` that is a `QImage` over the shared pixels — no copy between `QPainter` and the compositor. Compiles for aarch64 against this tree's own sysroot; linking waits on a Qt cross-built against it |
 | `services/hello-cpp` | A program written in **C++** with the real standard library: `std::vector<std::string>`, `std::sort`, three `std::thread`s under a `std::mutex`, a namespace-scope constructor and a function-local static whose destructor runs at exit |
 
 All eight EL0 programs are built by `crates/kernel/build.rs` and embedded in the
@@ -110,6 +111,7 @@ cargo ktest-host             # portable-crate unit tests on the host (183 tests)
 ./scripts/gdb-check.sh       # break inside an EL0 program over QEMU's gdbstub and unwind its stack
 ./scripts/libc-progress.sh   # score crates/staros-libc against the symbols Qt needs
 ./scripts/header-check.sh    # every function the sysroot declares must be one the library defines
+./scripts/qpa-check.sh       # compile the QPA plugin for aarch64 against this tree's sysroot
 ./scripts/smoke-test.sh --quick   # same, minus the slow 8-core run
 ```
 

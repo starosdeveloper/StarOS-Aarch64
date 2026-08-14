@@ -127,3 +127,27 @@ wmemmove
 wmemset
 wprintf
 wscanf
+
+# Added when <cmath> was made to compile: libstdc++ requires a declaration for
+# every C99 name, and these are the `long double` ones. On this target long double
+# is 128-bit quad; nothing here does quad arithmetic, and forwarding through
+# `double` would answer with fifty-three bits of precision to a caller that asked
+# for a hundred and thirteen. `nexttowardf` is here for the same reason — its
+# second argument is a long double.
+erfcl
+erfl
+exp2l
+ilogbl
+lgammal
+llrintl
+llroundl
+logbl
+lrintl
+lroundl
+nanl
+nearbyintl
+nextafterl
+nexttowardf
+remquol
+scalblnl
+tgammal

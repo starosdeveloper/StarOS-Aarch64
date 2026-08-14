@@ -1377,6 +1377,82 @@ pub mod exports {
         fma(f64::from(x), f64::from(y), f64::from(z)) as f32
     }
 
+    /// `nan("...")`: a quiet NaN, optionally carrying a payload the caller names.
+    ///
+    /// The string is a payload in an implementation-defined notation, and nothing
+    /// here interprets it — every NaN this returns is the same quiet one. Reading
+    /// the tag and packing it into the mantissa would be a feature nobody has asked
+    /// for and a second place for a NaN to come from.
+    ///
+    /// # Safety
+    /// C ABI: `tag` is a NUL-terminated string or null; it is not read.
+    #[no_mangle]
+    pub unsafe extern "C" fn nan(_tag: *const core::ffi::c_char) -> f64 {
+        f64::NAN
+    }
+
+    /// # Safety
+    /// As [`nan`].
+    #[no_mangle]
+    pub unsafe extern "C" fn nanf(_tag: *const core::ffi::c_char) -> f32 {
+        f32::NAN
+    }
+
+    /// `scalbln`: `x * 2^n` with a `long` exponent.
+    ///
+    /// Separate from `scalbn` only in the width of `n`, and the difference is real
+    /// on a target where `long` is 64 bits: a caller passing an exponent that does
+    /// not fit an `int` would otherwise have it truncated into something plausible.
+    /// Clamped, so a huge exponent gives the infinity or zero it should rather than
+    /// whatever the low 32 bits happened to say.
+    #[no_mangle]
+    pub extern "C" fn scalbln(x: f64, n: i64) -> f64 {
+        let n = n.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as core::ffi::c_int;
+        super::ldexp(x, n)
+    }
+
+    #[no_mangle]
+    pub extern "C" fn scalblnf(x: f32, n: i64) -> f32 {
+        scalbln(f64::from(x), n) as f32
+    }
+
+    /// `remquo`: the IEEE remainder, plus the low bits of the quotient.
+    ///
+    /// The quotient bits are what make this different from `remainder`, and what
+    /// argument reduction uses them for is the quadrant: three bits of `x/y` say
+    /// which quarter turn a sine is in. C requires at least three and the sign of
+    /// the whole quotient, which is why the sign is applied separately rather than
+    /// falling out of the arithmetic.
+    ///
+    /// # Safety
+    /// C ABI: `quo` points at one writable `int`.
+    #[no_mangle]
+    pub unsafe extern "C" fn remquo(x: f64, y: f64, quo: *mut core::ffi::c_int) -> f64 {
+        let r = super::remainder(x, y);
+        if !quo.is_null() {
+            let n = if y == 0.0 || !x.is_finite() || !y.is_finite() {
+                0
+            } else {
+                // The quotient rounded to nearest, which is the one `remainder`
+                // subtracted — computing it any other way makes the two disagree.
+                let q = super::rint((x - r) / y);
+                (q as i64 & 0x7fff_ffff) as core::ffi::c_int
+            };
+            let sign = if (x < 0.0) != (y < 0.0) { -1 } else { 1 };
+            // SAFETY: the caller passes a writable int, as the prototype says.
+            unsafe { *quo = n * sign };
+        }
+        r
+    }
+
+    /// # Safety
+    /// As [`remquo`].
+    #[no_mangle]
+    pub unsafe extern "C" fn remquof(x: f32, y: f32, quo: *mut core::ffi::c_int) -> f32 {
+        // SAFETY: forwarded from the caller.
+        unsafe { remquo(f64::from(x), f64::from(y), quo) as f32 }
+    }
+
     #[no_mangle]
     pub extern "C" fn ilogb(x: f64) -> core::ffi::c_int {
         super::ilogb(x)
@@ -1430,6 +1506,23 @@ pub mod exports {
     #[no_mangle]
     pub extern "C" fn llroundf(x: f32) -> i64 {
         lround(f64::from(x))
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ldexpf(x: f32, n: core::ffi::c_int) -> f32 {
+        super::ldexp(f64::from(x), n) as f32
+    }
+
+    /// # Safety
+    /// C ABI: `out` points at one writable `int`.
+    #[no_mangle]
+    pub unsafe extern "C" fn frexpf(x: f32, out: *mut core::ffi::c_int) -> f32 {
+        let (m, e) = super::frexp(f64::from(x));
+        if !out.is_null() {
+            // SAFETY: the caller passes a writable int, as the prototype says.
+            unsafe { *out = e };
+        }
+        m as f32
     }
 
     /// # Safety

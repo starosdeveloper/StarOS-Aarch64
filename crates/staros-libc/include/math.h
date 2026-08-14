@@ -201,6 +201,74 @@ long long llrint(double x);
 int ilogb(double x);
 double logb(double x);
 
+/* What `<cmath>` requires, and what it means that this list exists.
+ *
+ * libstdc++'s <cmath> writes `using ::erff;` for every name C99 defines, so a
+ * declaration missing here fails the compile of any C++ file that includes it —
+ * far from the mistake, in a header nobody edited. The list was not written from
+ * memory: it is what clang named, one `no member named` at a time.
+ *
+ * The `long double` entries are declared and **not defined**, on purpose. On this
+ * target `long double` is 128-bit quad, nothing here does quad arithmetic, and a
+ * version that forwarded through `double` would answer with fifty-three bits of
+ * precision to a caller that asked for a hundred and thirteen. Undefined fails at
+ * the link, by name; docs/header-gap.txt lists every one with this reason. */
+
+/* `float_t` and `double_t`: the types intermediate results are computed in.
+ * FLT_EVAL_METHOD is 0 on AArch64 — float arithmetic really is done in float — so
+ * these are the obvious types rather than the `double`-widened ones an x87 needs. */
+typedef float float_t;
+typedef double double_t;
+
+float erff(float x);
+float erfcf(float x);
+float lgammaf(float x);
+float tgammaf(float x);
+long double erfl(long double x);
+long double erfcl(long double x);
+long double lgammal(long double x);
+long double tgammal(long double x);
+
+float exp2f(float x);
+long double exp2l(long double x);
+float acoshf(float x);
+float asinhf(float x);
+float fdimf(float x, float y);
+float fmaf(float x, float y, float z);
+float frexpf(float x, int *exponent);
+float ldexpf(float x, int n);
+float nearbyintf(float x);
+long double nearbyintl(long double x);
+
+float logbf(float x);
+long double logbl(long double x);
+int ilogbf(float x);
+int ilogbl(long double x);
+
+long lrintf(float x);
+long lrintl(long double x);
+long long llrintf(float x);
+long long llrintl(long double x);
+long lroundf(float x);
+long lroundl(long double x);
+long long llroundf(float x);
+long long llroundl(long double x);
+
+double nan(const char *tag);
+float nanf(const char *tag);
+long double nanl(const char *tag);
+
+long double nextafterl(long double x, long double y);
+float nexttowardf(float x, long double y);
+
+double remquo(double x, double y, int *quo);
+float remquof(float x, float y, int *quo);
+long double remquol(long double x, long double y, int *quo);
+
+double scalbln(double x, long n);
+float scalblnf(float x, long n);
+long double scalblnl(long double x, long n);
+
 #ifdef __cplusplus
 }
 #endif

@@ -115,6 +115,12 @@ size_t staros_shared_bytes(unsigned int cap);
 #define STAROS_DISPLAY_SCREEN  6u  /* reply: words[0..3] = width, height, bpp, format */
 #define STAROS_DISPLAY_WATCH   7u  /* cap = staros_death_notification(); the server
                                     * takes this client's windows down if it dies */
+#define STAROS_DISPLAY_FOCUS   8u  /* claim the keyboard; input goes here until
+                                    * another client claims it or this one dies.
+                                    * Separate from RAISE on purpose: putting a
+                                    * window in front and taking the keystroke
+                                    * someone is mid-way through typing are
+                                    * different acts. */
 #define STAROS_DISPLAY_BYE     9u  /* this client is done; its surfaces go with it */
 
 /* Refusal reasons, in words[0] of a STAROS_DISPLAY_ERROR reply. */
