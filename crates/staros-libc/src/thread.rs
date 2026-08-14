@@ -1295,6 +1295,100 @@ pub mod exports {
         }
     }
 
+    /// The timed read and write locks, and their `clock`-taking twins.
+    ///
+    /// `std::shared_mutex` references all four from libstdc++'s header, so a
+    /// translation unit that merely includes `<shared_mutex>` needs them — Qt does.
+    ///
+    /// Spin and yield, as [`pthread_mutex_timedlock`] does: the wait queue has no
+    /// deadline, and giving it one is a change to the kernel's parkers rather than
+    /// to this library. A waiter burns its timeslice, which is the honest cost and
+    /// is said here rather than discovered in a profile.
+    ///
+    /// # Safety
+    /// C ABI: `l` is an initialised lock; `deadline` is one `struct timespec`.
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_rwlock_timedrdlock(
+        l: *mut RwLock,
+        deadline: *const crate::time::Timespec,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { timed_rwlock(l, deadline, false) }
+    }
+
+    /// # Safety
+    /// As [`pthread_rwlock_timedrdlock`].
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_rwlock_timedwrlock(
+        l: *mut RwLock,
+        deadline: *const crate::time::Timespec,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { timed_rwlock(l, deadline, true) }
+    }
+
+    /// # Safety
+    /// As [`pthread_rwlock_timedrdlock`]. The clock is accepted and ignored:
+    /// there is one clock here, and `docs/LIBC-CONTRACT.md` says which.
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_rwlock_clockrdlock(
+        l: *mut RwLock,
+        _clock: c_int,
+        deadline: *const crate::time::Timespec,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { timed_rwlock(l, deadline, false) }
+    }
+
+    /// # Safety
+    /// As [`pthread_rwlock_clockrdlock`].
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_rwlock_clockwrlock(
+        l: *mut RwLock,
+        _clock: c_int,
+        deadline: *const crate::time::Timespec,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { timed_rwlock(l, deadline, true) }
+    }
+
+    /// The body all four share.
+    ///
+    /// # Safety
+    /// C ABI: as the four above.
+    unsafe fn timed_rwlock(
+        l: *mut RwLock,
+        deadline: *const crate::time::Timespec,
+        write: bool,
+    ) -> c_int {
+        if deadline.is_null() {
+            return EINVAL;
+        }
+        // SAFETY: the caller passes a readable `timespec`.
+        let want = unsafe { crate::time::join((*deadline).tv_sec, (*deadline).tv_nsec) };
+        loop {
+            // SAFETY: forwarded from the caller.
+            let taken = unsafe {
+                if write {
+                    (*l).try_write_lock()
+                } else {
+                    (*l).try_read_lock()
+                }
+            };
+            if taken {
+                return 0;
+            }
+            match sys::clock_now() {
+                Some(now) if now >= want => return 110, // ETIMEDOUT
+                // No clock: the deadline can never be observed to pass, so a loop
+                // waiting for it would never end. Refusing is what a caller can act
+                // on.
+                None => return EINVAL,
+                _ => sys::yield_now(),
+            }
+        }
+    }
+
     /// # Safety
     /// As [`pthread_rwlock_init`].
     #[no_mangle]

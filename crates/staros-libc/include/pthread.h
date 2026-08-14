@@ -122,6 +122,19 @@ int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *abstime);
 int pthread_mutex_clocklock(pthread_mutex_t *m, int clock, const struct timespec *abstime);
 int pthread_rwlock_tryrdlock(pthread_rwlock_t *l);
 int pthread_rwlock_trywrlock(pthread_rwlock_t *l);
+/* The timed forms, which `std::shared_mutex` calls unconditionally — libstdc++'s
+ * header references all four, so a translation unit that merely includes
+ * <shared_mutex> fails to compile without them. Qt includes it.
+ *
+ * They spin and yield until the lock is free or the deadline passes, exactly as
+ * `pthread_mutex_timedlock` does and for the same reason: the wait queue has no
+ * notion of a deadline, and adding one is a change to the kernel's parkers rather
+ * than to this library. A waiter burns its timeslice, which is written down in
+ * `crates/staros-libc/src/thread.rs` beside the loop. */
+int pthread_rwlock_timedrdlock(pthread_rwlock_t *l, const struct timespec *abstime);
+int pthread_rwlock_timedwrlock(pthread_rwlock_t *l, const struct timespec *abstime);
+int pthread_rwlock_clockrdlock(pthread_rwlock_t *l, int clock, const struct timespec *abstime);
+int pthread_rwlock_clockwrlock(pthread_rwlock_t *l, int clock, const struct timespec *abstime);
 int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void));
 int sched_yield(void);
 

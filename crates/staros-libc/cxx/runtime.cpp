@@ -19,15 +19,26 @@
 // would have thrown calls one of the `__throw_*` helpers below, which report and
 // stop instead of unwinding into a caller that has no idea how to unwind.
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <filesystem>
 #include <list>
 #include <map>
+#include <memory_resource>
 #include <new>
 #include <string>
 #include <thread>
 #include <unordered_map>
+
+#include <bits/atomic_futex.h>
+
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
 
 // `std::string`'s out-of-line members. libstdc++'s header declares them
 // `extern template`, meaning "somebody else compiled these" — normally
@@ -69,6 +80,28 @@ void *operator new(std::size_t size, std::align_val_t align) {
 void *operator new[](std::size_t size, std::align_val_t align) {
     return ::operator new(size, align);
 }
+
+// The aligned nothrow forms. Identical here to the throwing ones, because with
+// `-fno-exceptions` neither throws — `aligned_alloc` returns null and so does this.
+// They exist as separate symbols because the *caller* chose the nothrow spelling,
+// and a program that wrote `new (std::nothrow)` and got a link error would be told
+// its own syntax is unsupported.
+void *operator new(std::size_t size, std::align_val_t align,
+                   const std::nothrow_t &) noexcept {
+    return ::operator new(size, align);
+}
+
+void *operator new[](std::size_t size, std::align_val_t align,
+                     const std::nothrow_t &) noexcept {
+    return ::operator new(size, align);
+}
+
+namespace std {
+// The tag object itself. One byte of data, and libstdc++ leaves it to the library
+// rather than the header — so a program writing `new (std::nothrow)` needs this to
+// exist somewhere, and this is somewhere.
+const nothrow_t nothrow = nothrow_t{};
+}  // namespace std
 
 void operator delete(void *p) noexcept { std::free(p); }
 void operator delete[](void *p) noexcept { std::free(p); }
@@ -382,7 +415,320 @@ std::pair<bool, unsigned long> __detail::_Prime_rehash_policy::_M_need_rehash(
     return {false, 0};
 }
 
+// ---- std::chrono ----------------------------------------------------------
+//
+// Both clocks read the same counter, because there is one: monotonic nanoseconds
+// since the kernel started counting. `system_clock` claiming to be a wall clock
+// would be the only lie in this file — there is no battery-backed clock and no
+// network, so the epoch is boot, and `docs/LIBC-CONTRACT.md` records that decision
+// where `clock_gettime` makes it.
+//
+// A caller measuring a *duration* — which is what almost every user of these does,
+// including Qt's animation driver — gets an exact answer either way.
+
+chrono::steady_clock::time_point chrono::steady_clock::now() noexcept {
+    struct timespec ts = {0, 0};
+    ::clock_gettime(1 /* CLOCK_MONOTONIC */, &ts);
+    return time_point(duration(static_cast<long long>(ts.tv_sec) * 1000000000LL + ts.tv_nsec));
+}
+
+chrono::system_clock::time_point chrono::system_clock::now() noexcept {
+    struct timespec ts = {0, 0};
+    ::clock_gettime(0 /* CLOCK_REALTIME */, &ts);
+    return time_point(duration(static_cast<long long>(ts.tv_sec) * 1000000LL +
+                               ts.tv_nsec / 1000));
+}
+
+// ---- std::condition_variable ----------------------------------------------
+//
+// A thin layer over `pthread_cond_t`, which is what it is in libstdc++ too — the
+// class holds one, and these five functions are the only part not in the header.
+//
+// The `unique_lock` overload takes the mutex out of the lock object and hands the
+// raw `pthread_mutex_t` to `pthread_cond_wait`, which is the whole trick: the
+// condition variable must release *that* mutex atomically with sleeping, and a
+// wrapper that unlocked and then waited would lose every signal in between.
+
+// `_M_cond` is libstdc++'s `__condvar`, not a raw `pthread_cond_t` — it is a thin
+// wrapper that already calls the pthread functions inline. So these four forward to
+// it rather than to pthread directly: reaching past the wrapper would mean this
+// file and the header disagreeing about which of them owns the initialisation.
+condition_variable::condition_variable() noexcept = default;
+
+condition_variable::~condition_variable() = default;
+
+void condition_variable::notify_one() noexcept {
+    _M_cond.notify_one();
+}
+
+void condition_variable::notify_all() noexcept {
+    _M_cond.notify_all();
+}
+
+// Not `noexcept`, because the header does not say so: `wait` is allowed to throw
+// `system_error`, and a definition that promised more than the declaration is an
+// error rather than a stricter promise.
+void condition_variable::wait(unique_lock<mutex> &lock) {
+    _M_cond.wait(*lock.mutex());
+}
+
+// `std::future` and the timed `wait_for` go through this rather than through the
+// condition variable: libstdc++ builds them on a futex directly.
+//
+// There is no futex here — the kernel's primitive is a notification, and the C
+// library's parkers are built on it — so this polls with a yield until the value
+// changes or the deadline passes. That is honest and it is not free: a thread
+// waiting on a future burns its timeslice. It is written down rather than hidden
+// because the fix is a real one (a futex-shaped syscall) and nothing has needed it
+// enough to justify the ABI yet.
+bool __atomic_futex_unsigned_base::_M_futex_wait_until(
+    unsigned *addr, unsigned val, bool has_timeout,
+    chrono::seconds seconds, chrono::nanoseconds nanoseconds) {
+    const unsigned long long deadline =
+        static_cast<unsigned long long>(seconds.count()) * 1000000000ULL +
+        static_cast<unsigned long long>(nanoseconds.count());
+    for (;;) {
+        if (__atomic_load_n(addr, __ATOMIC_ACQUIRE) != val) {
+            return true;
+        }
+        if (has_timeout) {
+            struct timespec ts = {0, 0};
+            ::clock_gettime(1 /* CLOCK_MONOTONIC */, &ts);
+            const unsigned long long now =
+                static_cast<unsigned long long>(ts.tv_sec) * 1000000000ULL +
+                static_cast<unsigned long long>(ts.tv_nsec);
+            if (now >= deadline) {
+                return false;
+            }
+        }
+        ::sched_yield();
+    }
+}
+
+// ---- std::exception -------------------------------------------------------
+//
+// One string for every exception type. With `-fno-exceptions` nothing constructs a
+// derived exception and nothing catches one, so the only way this is reached is a
+// program calling `what()` on a base it made itself — and the honest answer to that
+// is the name of the type it has.
+const char *exception::what() const noexcept {
+    return "std::exception";
+}
+
+// `current_exception` outside a handler is a null `exception_ptr`, which is what it
+// returns here always: with `-fno-exceptions` there is never a handler to be inside.
+__exception_ptr::exception_ptr current_exception() noexcept {
+    return __exception_ptr::exception_ptr();
+}
+
+// ---- std::pmr -------------------------------------------------------------
+//
+// The polymorphic allocators. Qt uses `monotonic_buffer_resource` for parsing —
+// allocate quickly, free everything at once — and libstdc++ leaves its destructor,
+// its buffer release and its vtable out of line.
+//
+// `get_default_resource` returns the new/delete resource, which is what a program
+// that never sets one gets. The settable global is absent on purpose: it would be a
+// process-wide mutable pointer nothing in this system changes, and an unused knob
+// is a thing to keep in step for no reason.
+
+namespace pmr {
+
+namespace {
+
+// The default resource: `operator new` and `operator delete`, which is exactly
+// what `std::pmr::new_delete_resource()` is defined to be.
+class NewDeleteResource final : public memory_resource {
+public:
+    ~NewDeleteResource() override = default;
+
+private:
+    void *do_allocate(size_t bytes, size_t alignment) override {
+        return ::operator new(bytes, align_val_t(alignment));
+    }
+
+    void do_deallocate(void *p, size_t bytes, size_t alignment) override {
+        ::operator delete(p, bytes, align_val_t(alignment));
+    }
+
+    bool do_is_equal(const memory_resource &other) const noexcept override {
+        // Two resources are equal when memory from one can be returned to the
+        // other. There is one of these, so identity is the whole answer.
+        return this == &other;
+    }
+};
+
+NewDeleteResource &default_resource() {
+    // A function-local static, so it is constructed on first use and never before
+    // — a namespace-scope object here would need `.init_array` to have run, and
+    // `get_default_resource` can be called from another static's constructor.
+    static NewDeleteResource resource;
+    return resource;
+}
+
+}  // namespace
+
+memory_resource *get_default_resource() noexcept {
+    return &default_resource();
+}
+
+// The base's destructor, which libstdc++ declares and leaves out of line. Named by
+// the linker the moment a derived resource above got one of its own.
+memory_resource::~memory_resource() = default;
+
+monotonic_buffer_resource::~monotonic_buffer_resource() {
+    release();
+}
+
+// `_Chunk` is declared in the header and *defined* in libstdc++'s own source, so
+// its layout is not visible here. That is a real limit and it is stated rather than
+// worked around by guessing at the fields: a struct written from memory that
+// happened to be the wrong size would free the wrong addresses.
+//
+// So this releases nothing and says so. What it costs is bounded and known: a
+// `monotonic_buffer_resource` never returns its blocks to the upstream resource,
+// which for the default upstream means they stay allocated until the process ends.
+// That is the same shape as `munmap` here — this system does not return pages
+// either — and a resource whose whole premise is "allocate quickly, free once" is
+// the least surprising place for it.
+//
+// The day something needs it back, the fix is to build against a libstdc++ whose
+// sources are present rather than to reconstruct a private layout.
+void monotonic_buffer_resource::_M_release_buffers() noexcept {
+    _M_head = nullptr;
+}
+
+// Take another buffer from upstream, at least `bytes` with `alignment`.
+//
+// libstdc++'s version threads the block onto `_M_head` so `release()` can hand it
+// back. This one does not, for the reason above: `_Chunk`'s layout is not visible
+// here, and a link in a struct written from memory would be a free at the wrong
+// address. So each buffer is taken and kept — which is exactly what
+// `_M_release_buffers` already documents, and which makes the two halves agree
+// rather than one of them pretending.
+//
+// The growth is geometric, as the standard requires: each buffer at least twice the
+// last, so an allocator used the way this one is meant to be — many small
+// allocations, one release — asks upstream a logarithmic number of times.
+void monotonic_buffer_resource::_M_new_buffer(size_t bytes, size_t alignment) {
+    size_t want = _M_next_bufsiz;
+    if (want < bytes + alignment) {
+        want = bytes + alignment;
+    }
+    void *const buffer = _M_upstream->allocate(want, alignof(max_align_t));
+    _M_current_buf = buffer;
+    _M_avail = want;
+    // Doubling, saturating rather than wrapping: a resource asked for something
+    // near the address space would otherwise ask upstream for a small buffer next
+    // time and loop.
+    _M_next_bufsiz = (want > (size_t(-1) / 2)) ? want : want * 2;
+
+    // Align the caller's allocation inside the fresh buffer, which is what the
+    // header's `do_allocate` expects to find on return.
+    void *p = buffer;
+    size_t space = want;
+    p = std::align(alignment, bytes, p, space);
+    _M_current_buf = p;
+    _M_avail = space;
+}
+
+}  // namespace pmr
+
+// ---- iostreams ------------------------------------------------------------
+//
+// The static initialiser that constructs `std::cout` and friends. It is empty
+// because nothing here constructs them: this system's output is `printf` over
+// `DebugWrite`, and a `std::cout` that existed would need a `streambuf` over the
+// same call plus the locale machinery behind `<iostream>`.
+//
+// Defined rather than absent because libstdc++'s `<iostream>` emits a reference to
+// it in every translation unit that includes the header — Qt includes it in a few —
+// so leaving it out fails the link in files that never print anything.
+void ios_base_library_init() {}
+
 }  // namespace std
+
+// ---- std::filesystem::path ------------------------------------------------
+//
+// Qt uses `std::filesystem::path` in a handful of places, and libstdc++ leaves
+// three pieces of it out of line. `_M_split_cmpts` is the parser: it takes the
+// string a path was built from and breaks it into root, directories and filename.
+//
+// This system's paths are archive member names — flat, no root, always relative —
+// so the parser here is the small correct one for that shape rather than the
+// general one that has to answer what `C:` means. A path with a leading slash is
+// accepted and its slash ignored, because that is what every caller writing
+// `/fonts/x.ttf` means here.
+
+namespace std {
+namespace filesystem {
+inline namespace __cxx11 {
+
+void path::_List::_Impl_deleter::operator()(_Impl *p) const noexcept {
+    // The component list is a single allocation holding its own header, so it goes
+    // back the way it came and not element by element.
+    if (p != nullptr) {
+        ::operator delete(p);
+    }
+}
+
+path::_List::_List() = default;
+
+void path::_M_split_cmpts() {
+    // Every component of this system's paths is a filename: there is one directory
+    // level in the archive's own view, no root name, and no `..` to resolve. So the
+    // list stays empty and the path is its own single component, which is what
+    // `begin() == end()` and `filename() == *this` together mean.
+    //
+    // Leaving it empty is not a stub: an empty `_List` is precisely how libstdc++
+    // represents a path with no separable parts, and every accessor already answers
+    // correctly from the string when it finds one.
+    //
+    // Assigning a fresh `_List` rather than calling `clear()`, because `clear()` is
+    // itself out of line in libstdc++'s sources and would be the next symbol the
+    // linker asked for — the same loop, one step further along, for no gain.
+    _M_cmpts = _List();
+}
+
+}  // namespace __cxx11
+}  // namespace filesystem
+}  // namespace std
+
+// ---- the C++ ABI's remaining hooks ----------------------------------------
+
+extern "C" {
+
+// `__cxa_demangle` turns a mangled name into a readable one. Qt's logging asks for
+// it when printing a type.
+//
+// Null with `status = -2`, which the ABI defines as "not a valid mangled name" and
+// every caller already handles — Qt prints the mangled name instead. A demangler is
+// a parser for a grammar with templates and substitutions in it, and writing one to
+// make a log line prettier is the wrong trade.
+char *__cxa_demangle(const char *, char *, size_t *, int *status) {
+    if (status != nullptr) {
+        *status = -2;
+    }
+    return nullptr;
+}
+
+// Destructors for `thread_local` objects.
+//
+// Registered in the same list as `__cxa_atexit`, which means they run at *process*
+// exit rather than when the thread ends. For the main thread — where almost every
+// `thread_local` in a Qt program lives — those are the same moment. For a worker
+// thread it is late, and the object's memory stays until then.
+//
+// Late is a real difference and it is written down instead of hidden. Doing it
+// properly needs a per-thread list run from the thread's own exit path, which is a
+// change to `crates/staros-libc/src/thread.rs` and worth making the day something
+// puts a non-trivial `thread_local` in a worker.
+int __cxa_thread_atexit(void (*destructor)(void *), void *object, void *dso) {
+    extern int __cxa_atexit(void (*)(void *), void *, void *);
+    return __cxa_atexit(destructor, object, dso);
+}
+
+}  // extern "C"
 
 // ---- std::map and std::set ------------------------------------------------
 //
