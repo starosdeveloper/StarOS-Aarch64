@@ -404,6 +404,96 @@ pub mod exports {
         }
     }
 
+    /// The 26-byte buffer `asctime` and `ctime` return a pointer into.
+    ///
+    /// One for the process, which is what the specification says and what makes
+    /// both functions unusable from two threads at once. `asctime_r` exists for that
+    /// reason; these two are here because `<ctime>` requires them and old code calls
+    /// them, and the shared buffer is written down rather than quietly fixed —
+    /// a version with a per-thread buffer would work here and break on glibc.
+    static mut ASCTIME_BUF: [u8; 26] = [0; 26];
+
+    /// `asctime`: the fixed 24-character form plus a newline, exactly as C
+    /// specifies it — `"Www Mmm dd hh:mm:ss yyyy\n"`.
+    ///
+    /// Built by hand rather than through `strftime`, because the format is fixed by
+    /// the standard down to the space-padded day of month, and routing it through a
+    /// formatter that also honours a locale would be a way to make it stop matching.
+    ///
+    /// # Safety
+    /// C ABI: `tm` points at one `struct tm`.
+    #[no_mangle]
+    pub unsafe extern "C" fn asctime(tm: *const Tm) -> *mut core::ffi::c_char {
+        if tm.is_null() {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: the caller passes a readable `struct tm`, as the prototype says.
+        let tm = unsafe { &*tm };
+        const DAYS: [&[u8; 3]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+        const MONTHS: [&[u8; 3]; 12] = [
+            b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct",
+            b"Nov", b"Dec",
+        ];
+        // SAFETY: one process-wide buffer; see the note on `ASCTIME_BUF`.
+        let buf = unsafe { &mut *core::ptr::addr_of_mut!(ASCTIME_BUF) };
+        let day = DAYS[(tm.tm_wday.clamp(0, 6)) as usize];
+        let month = MONTHS[(tm.tm_mon.clamp(0, 11)) as usize];
+        let two = |v: i32, pad: u8| -> [u8; 2] {
+            let v = v.clamp(0, 99);
+            let tens = (v / 10) as u8;
+            [if tens == 0 { pad } else { b'0' + tens }, b'0' + (v % 10) as u8]
+        };
+        let year = tm.tm_year + 1900;
+        let y = [
+            b'0' + ((year / 1000) % 10) as u8,
+            b'0' + ((year / 100) % 10) as u8,
+            b'0' + ((year / 10) % 10) as u8,
+            b'0' + (year % 10) as u8,
+        ];
+        // The day of month is space-padded and everything else zero-padded, which
+        // is the one detail of this format people get wrong.
+        let mday = two(tm.tm_mday, b' ');
+        let (h, m, s) = (two(tm.tm_hour, b'0'), two(tm.tm_min, b'0'), two(tm.tm_sec, b'0'));
+        let parts: [&[u8]; 12] = [
+            day, b" ", month, b" ", &mday, b" ", &h, b":", &m, b":", &s, b" ",
+        ];
+        let mut n = 0;
+        for p in parts {
+            for &b in p {
+                buf[n] = b;
+                n += 1;
+            }
+        }
+        for &b in &y {
+            buf[n] = b;
+            n += 1;
+        }
+        buf[n] = b'\n';
+        buf[n + 1] = 0;
+        buf.as_mut_ptr().cast::<core::ffi::c_char>()
+    }
+
+    /// `ctime(t)` is `asctime(gmtime(t))`. There is no local time here — the system
+    /// has no timezone database and no way to learn one — so it is UTC, which
+    /// `gmtime_r` already says.
+    ///
+    /// # Safety
+    /// C ABI: `t` points at one `time_t`.
+    #[no_mangle]
+    pub unsafe extern "C" fn ctime(t: *const i64) -> *mut core::ffi::c_char {
+        if t.is_null() {
+            return core::ptr::null_mut();
+        }
+        let mut tm = Tm::default();
+        // SAFETY: forwarded from the caller; `tm` is a local.
+        unsafe {
+            if gmtime_r(t, &mut tm).is_null() {
+                return core::ptr::null_mut();
+            }
+            asctime(&tm)
+        }
+    }
+
     /// # Safety
     /// C ABI: `t` points at one `time_t`, `out` at one `struct tm`.
     #[no_mangle]

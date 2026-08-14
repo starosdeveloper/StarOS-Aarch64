@@ -101,6 +101,12 @@ ssize_t write(int fd, const void *buf, size_t count);
 /* And the header whose fourteen functions had been declared by nobody's
  * implementation. Included rather than redeclared, for the same reason. */
 #include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#ifndef DBL_EPSILON
+#define DBL_EPSILON 2.2204460492503131e-16
+#endif
 #ifndef EOF
 #define EOF (-1)
 #endif
@@ -1891,6 +1897,83 @@ static void check_ctype(void)
     puts("[hello-c] ctype: fourteen classifications the header had promised and nobody had written");
 }
 
+/* The stdlib and libm functions G6 found missing.
+ *
+ * Every one of these was declared by this sysroot and implemented by nobody. They
+ * are exercised here rather than trusted, because "the symbol links" is a much
+ * weaker claim than "the answer is right" — and for `qsort` the difference is a
+ * sort that returns and leaves the array shuffled. */
+static int compare_ints(const void *a, const void *b)
+{
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+static void check_stdlib(void)
+{
+    /* The three inputs that make a naive quicksort quadratic — and, on a stack that
+     * grows into a guard page, make it fault rather than merely crawl. */
+    int up[64], down[64], same[64];
+    for (int i = 0; i < 64; i++) {
+        up[i] = i;
+        down[i] = 63 - i;
+        same[i] = 7;
+    }
+    qsort(down, 64, sizeof down[0], compare_ints);
+    check(memcmp(down, up, sizeof up) == 0, "qsort sorted a reversed array");
+    qsort(up, 64, sizeof up[0], compare_ints);
+    check(up[0] == 0 && up[63] == 63, "and left a sorted one alone");
+    qsort(same, 64, sizeof same[0], compare_ints);
+    check(same[0] == 7 && same[63] == 7, "and did not disturb an array of equals");
+
+    int key = 42;
+    int *found = bsearch(&key, up, 64, sizeof up[0], compare_ints);
+    check(found != 0 && *found == 42, "bsearch found what is there");
+    key = 100;
+    check(bsearch(&key, up, 64, sizeof up[0], compare_ints) == 0,
+          "and refused what is not");
+
+    /* rand is seeded to 1 by specification, so a program that never calls srand
+     * gets the same sequence every run — the property that makes a bug
+     * reproducible. Two draws differing is the weakest useful claim; that srand
+     * changes the sequence is the one that says the seed is used at all. */
+    int first = rand(), second = rand();
+    check(first != second, "rand produced two different values");
+    srand(1234);
+    int seeded = rand();
+    srand(1234);
+    check(rand() == seeded, "the same seed gives the same sequence");
+    check(first >= 0 && second >= 0 && seeded >= 0, "rand is never negative");
+
+    check(labs(-5L) == 5L && llabs(-5LL) == 5LL, "labs and llabs");
+
+    /* strdup, and the free that must match it. */
+    char *copy = strdup("initramfs");
+    check(copy != 0 && strcmp(copy, "initramfs") == 0, "strdup copied the string");
+    free(copy);
+
+    check(strpbrk("hello world", "aeiou") != 0, "strpbrk found a vowel");
+    check(strpbrk("xyz", "aeiou") == 0, "and none where there are none");
+
+    /* The special functions. Values from a known-good implementation; the point is
+     * that they are computed here rather than resolved from a weak fallback in
+     * compiler_builtins, which is where erf and tgamma came from until now. */
+    check(fabs(erf(1.0) - 0.8427007929497149) < 1e-12, "erf(1)");
+    check(fabs(erfc(2.0) - 0.004677734981047266) < 1e-14, "erfc(2)");
+    check(erfc(6.0) > 0.0, "erfc keeps its tail where 1 - erf rounds to zero");
+    check(fabs(tgamma(5.0) - 24.0) < 1e-9, "tgamma(5) = 4!");
+    check(fabs(lgamma(100.0) - 359.1342053695754) < 1e-6,
+          "lgamma past where tgamma overflows");
+
+    check(ilogb(8.0) == 3 && logb(8.0) == 3.0, "ilogb and logb");
+    check(lround(2.5) == 3 && lround(-2.5) == -3, "lround rounds half away from zero");
+    check(nextafter(1.0, 2.0) > 1.0 && nextafter(1.0, 2.0) - 1.0 == DBL_EPSILON,
+          "nextafter steps one representable value");
+
+    printf("[hello-c] stdlib: qsort, bsearch, rand, strdup and the special functions "
+           "this sysroot had only promised\n");
+}
+
 int main(void)
 {
     puts("[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight");
@@ -1915,6 +1998,7 @@ int main(void)
     check_display();
     check_font();
     check_ctype();
+    check_stdlib();
 
     if (failures == 0)
         puts("[hello-c] C RUNTIME OK - every check passed");

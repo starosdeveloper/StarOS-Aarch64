@@ -491,6 +491,45 @@ impl RwLock {
         }
     }
 
+    /// Take a read lock if no writer holds or is taking it. Never blocks.
+    ///
+    /// One attempt and no retry: `try` means "tell me whether it was free", and a
+    /// version that looped on the writer-took-it-in-the-window case would block for
+    /// as long as writers kept arriving — which is the one thing its caller chose it
+    /// to avoid.
+    fn try_read_lock(&self) -> bool {
+        if self.writer.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.readers.fetch_add(1, Ordering::AcqRel);
+        if self.writer.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        self.readers.fetch_sub(1, Ordering::AcqRel);
+        false
+    }
+
+    /// Take the write lock if nothing holds it. Never blocks.
+    fn try_write_lock(&self) -> bool {
+        if self
+            .writer
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if self.readers.load(Ordering::Acquire) == 0 {
+            self.owner.store(current(), Ordering::Release);
+            return true;
+        }
+        // Readers are still inside. Give the flag back and wake whoever was waiting
+        // on it — leaving it set would lock out every reader for ever on behalf of a
+        // writer that gave up.
+        self.writer.store(0, Ordering::Release);
+        Queue::wake_all(self.queue.take());
+        false
+    }
+
     fn write_lock(&self) {
         loop {
             if self
@@ -739,6 +778,76 @@ pub mod exports {
         0
     }
 
+    /// A mutex attribute object.
+    ///
+    /// One word, and the only thing anybody sets in it is the type. `PTHREAD_MUTEX_
+    /// RECURSIVE` is the one that matters — libstdc++'s `std::recursive_mutex` asks
+    /// for it — and this system's mutex is not recursive, so asking is refused with
+    /// `EINVAL` rather than accepted and forgotten. A recursive lock that silently
+    /// is not one deadlocks a thread against itself, which looks like a hang in
+    /// whatever the second lock was for.
+    #[repr(C)]
+    pub struct MutexAttr {
+        kind: c_int,
+    }
+
+    /// `PTHREAD_MUTEX_NORMAL`, the only type there is here.
+    const PTHREAD_MUTEX_NORMAL: c_int = 0;
+
+    /// # Safety
+    /// C ABI: `a` points at one writable `pthread_mutexattr_t`.
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_mutexattr_init(a: *mut MutexAttr) -> c_int {
+        if a.is_null() {
+            return EINVAL;
+        }
+        // SAFETY: the caller passes a writable attribute object.
+        unsafe { (*a).kind = PTHREAD_MUTEX_NORMAL };
+        0
+    }
+
+    /// # Safety
+    /// As [`pthread_mutexattr_init`].
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_mutexattr_destroy(a: *mut MutexAttr) -> c_int {
+        if a.is_null() {
+            EINVAL
+        } else {
+            0
+        }
+    }
+
+    /// # Safety
+    /// As [`pthread_mutexattr_init`].
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_mutexattr_settype(a: *mut MutexAttr, kind: c_int) -> c_int {
+        if a.is_null() {
+            return EINVAL;
+        }
+        if kind != PTHREAD_MUTEX_NORMAL {
+            // Refused, not ignored. See the note on `MutexAttr`.
+            return EINVAL;
+        }
+        // SAFETY: the caller passes a writable attribute object.
+        unsafe { (*a).kind = kind };
+        0
+    }
+
+    /// `pthread_atfork`: run handlers around `fork`.
+    ///
+    /// There is no `fork` here — it returns `ENOSYS` — so a handler registered
+    /// against it can never run. Accepting the registration would be a promise this
+    /// system cannot keep; `ENOSYS` says so at the moment it is made, which is the
+    /// only moment a caller can do anything about it.
+    #[no_mangle]
+    pub extern "C" fn pthread_atfork(
+        _prepare: Option<extern "C" fn()>,
+        _parent: Option<extern "C" fn()>,
+        _child: Option<extern "C" fn()>,
+    ) -> c_int {
+        38 // ENOSYS
+    }
+
     /// # Safety
     /// As [`pthread_mutex_init`].
     #[no_mangle]
@@ -758,6 +867,59 @@ pub mod exports {
         } else {
             EBUSY
         }
+    }
+
+    /// `pthread_mutex_timedlock`: try until an absolute deadline.
+    ///
+    /// Spin-and-yield rather than parking with a timeout. The mutex's wait queue has
+    /// no notion of a deadline — a parked thread is woken by the unlock and by
+    /// nothing else — and adding one would mean a timer per waiter for a call that,
+    /// so far, nothing makes. What is here is honest and correct; it burns a
+    /// timeslice while it waits, and that is written down rather than hidden.
+    ///
+    /// # Safety
+    /// C ABI: `m` is an initialised mutex; `deadline` is one `struct timespec`.
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_mutex_timedlock(
+        m: *mut Mutex,
+        deadline: *const crate::time::Timespec,
+    ) -> c_int {
+        if deadline.is_null() {
+            return EINVAL;
+        }
+        // SAFETY: the caller passes a readable `timespec`.
+        let want = unsafe { crate::time::join((*deadline).tv_sec, (*deadline).tv_nsec) };
+        loop {
+            // SAFETY: forwarded from the caller.
+            if unsafe { (*m).try_lock() } {
+                return 0;
+            }
+            match sys::clock_now() {
+                Some(now) if now >= want => return 110, // ETIMEDOUT
+                // No clock at all: the deadline can never be observed to pass, and a
+                // loop that waited for it would never end. Refusing is the answer a
+                // caller can act on.
+                None => return EINVAL,
+                _ => sys::yield_now(),
+            }
+        }
+    }
+
+    /// `pthread_mutex_clocklock`: the same, with the clock named. There is one
+    /// clock here (see [`crate::time`]), so the argument is accepted and the answer
+    /// is the same — which is worth saying, because a caller passing
+    /// `CLOCK_REALTIME` and expecting wall-clock behaviour will get monotonic.
+    ///
+    /// # Safety
+    /// As [`pthread_mutex_timedlock`].
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_mutex_clocklock(
+        m: *mut Mutex,
+        _clock: c_int,
+        deadline: *const crate::time::Timespec,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { pthread_mutex_timedlock(m, deadline) }
     }
 
     /// # Safety
@@ -1107,6 +1269,30 @@ pub mod exports {
         // SAFETY: forwarded from the caller.
         unsafe { (*l).read_lock() };
         0
+    }
+
+    /// # Safety
+    /// As [`pthread_rwlock_init`].
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_rwlock_tryrdlock(l: *mut RwLock) -> c_int {
+        // SAFETY: forwarded from the caller.
+        if unsafe { (*l).try_read_lock() } {
+            0
+        } else {
+            EBUSY
+        }
+    }
+
+    /// # Safety
+    /// As [`pthread_rwlock_init`].
+    #[no_mangle]
+    pub unsafe extern "C" fn pthread_rwlock_trywrlock(l: *mut RwLock) -> c_int {
+        // SAFETY: forwarded from the caller.
+        if unsafe { (*l).try_write_lock() } {
+            0
+        } else {
+            EBUSY
+        }
     }
 
     /// # Safety

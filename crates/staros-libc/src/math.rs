@@ -923,6 +923,240 @@ pub(crate) fn acosh(x: f64) -> f64 {
 
 // ───────────────────────────── the C ABI ─────────────────────────────
 
+// ---------------------------------------------------------------------------
+// The special functions, and the ones that return integers.
+//
+// These arrived with G6, and the reason is worth recording. `erf`, `erfc` and
+// `tgamma` had looked implemented for months: `nm` found them in the archive and
+// `header-check` called the promise kept. They came from `compiler_builtins`, which
+// bundles a whole libm and exports every name of it **weakly** — a floor under
+// everything this file writes, invisible because a strong definition beside a weak
+// one simply wins. Nothing in this tree had written them, and a program calling
+// `erf` was running code nobody here had chosen.
+//
+// So they are written here, and the check now counts a weak fallback apart from a
+// definition. `lgamma` was the one the fallback did not even cover (it has
+// `lgamma_r`), which is how the whole thing came to light.
+// ---------------------------------------------------------------------------
+
+use core::ffi::c_int;
+
+/// Lanczos coefficients for `g = 7`, `n = 9` — the set Numerical Recipes uses and
+/// the one every implementation of this shape borrows, good to about 15 digits over
+/// the half-plane it is applied to.
+const LANCZOS: [f64; 9] = [
+    0.999_999_999_999_809_93,
+    676.520_368_121_885_1,
+    -1259.139_216_722_402_8,
+    771.323_428_777_653_13,
+    -176.615_029_162_140_6,
+    12.507_343_278_686_905,
+    -0.138_571_095_265_720_12,
+    9.984_369_578_019_572e-6,
+    1.505_632_735_149_311_6e-7,
+];
+
+/// The Lanczos sum and the shifted argument, shared by [`tgamma`] and [`lgamma`].
+///
+/// Both need exactly this and differ only in what they do with it, so computing it
+/// once is not a micro-optimisation — it is what keeps the two functions agreeing.
+/// Two copies of a nine-term sum drift the moment one of them is edited.
+fn lanczos(z: f64) -> (f64, f64) {
+    let mut sum = LANCZOS[0];
+    for (i, c) in LANCZOS.iter().enumerate().skip(1) {
+        sum += c / (z + i as f64 - 1.0);
+    }
+    (sum, z + 6.5)
+}
+
+/// The gamma function.
+///
+/// Reflection for `x < 0.5`, Lanczos above it. The reflection is not an
+/// optimisation: the Lanczos sum is only accurate in the right half-plane, and
+/// applying it to a negative argument gives a plausible wrong answer rather than an
+/// error.
+pub(crate) fn tgamma(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    // The poles. Gamma is infinite at every non-positive integer, and C says a
+    // negative one is a domain error — NaN, not an infinity with a sign nobody can
+    // justify.
+    if x <= 0.0 && x == floor(x) {
+        return if x == 0.0 {
+            copysign(f64::INFINITY, x)
+        } else {
+            f64::NAN
+        };
+    }
+    if x < 0.5 {
+        // Euler's reflection: Γ(x)Γ(1-x) = π / sin(πx).
+        return core::f64::consts::PI / (sin(core::f64::consts::PI * x) * tgamma(1.0 - x));
+    }
+    let z = x - 1.0;
+    let (sum, t) = lanczos(z + 1.0);
+    let two_pi = 2.0 * core::f64::consts::PI;
+    sqrt(two_pi) * pow(t, z + 0.5) * exp(-t) * sum
+}
+
+/// The natural logarithm of |Γ(x)|.
+///
+/// Not `log(tgamma(x))`: gamma overflows a `double` at about 171, and every use of
+/// this function — a log-likelihood, a binomial coefficient — is exactly the case
+/// where the value is wanted well past that. Computed in logs throughout.
+pub(crate) fn lgamma(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x <= 0.0 && x == floor(x) {
+        return f64::INFINITY;
+    }
+    if x < 0.5 {
+        // The reflection again, in logs. `sin` can be negative, hence the absolute
+        // value: this is log|Γ|, which is what C specifies.
+        let s = sin(core::f64::consts::PI * x);
+        return log(core::f64::consts::PI / fabs(s)) - lgamma(1.0 - x);
+    }
+    let z = x - 1.0;
+    let (sum, t) = lanczos(z + 1.0);
+    let two_pi = 2.0 * core::f64::consts::PI;
+    0.5 * log(two_pi) + (z + 0.5) * log(t) - t + log(sum)
+}
+
+/// The error function.
+///
+/// Three regimes, because no single expansion is good across the range. The series
+/// near zero converges fast and is exact where the continued fraction is worst; the
+/// tail is `1 - erfc`, and computing it the other way round would subtract two
+/// nearly equal numbers and lose every digit that mattered.
+pub(crate) fn erf(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x == 0.0 {
+        return x; // preserves the sign of a signed zero, as C requires
+    }
+    if fabs(x) > 6.0 {
+        return copysign(1.0, x);
+    }
+    if fabs(x) < 2.0 {
+        // Maclaurin: erf(x) = 2/√π · Σ (-1)^n x^(2n+1) / (n!(2n+1)).
+        // Written as a running term rather than factorials, which overflow long
+        // before the series has converged.
+        let mut term = x;
+        let mut sum = x;
+        let xx = x * x;
+        let mut n = 0.0;
+        while fabs(term) > 1e-18 * fabs(sum) && n < 200.0 {
+            n += 1.0;
+            term *= -xx / n;
+            sum += term / (2.0 * n + 1.0);
+        }
+        return 2.0 / sqrt(core::f64::consts::PI) * sum;
+    }
+    copysign(1.0, x) - copysign(erfc_tail(fabs(x)), x)
+}
+
+/// The complementary error function, `1 - erf(x)` computed so the tail survives.
+pub(crate) fn erfc(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x < 2.0 {
+        // Near zero and negative, `erf` is the accurate one and this subtraction
+        // loses nothing: both terms are of order one.
+        return 1.0 - erf(x);
+    }
+    erfc_tail(x)
+}
+
+/// `erfc` for `x >= 2`, by Lentz's continued fraction.
+///
+/// erfc(x) = exp(-x²)/(x√π) · 1/(1 + 1/(2x²) / (1 + 2/(2x²) / (1 + …)))
+///
+/// The fraction converges quickly out here and is what keeps `erfc(6)` meaningful
+/// instead of the zero that `1 - erf(6)` rounds to.
+fn erfc_tail(x: f64) -> f64 {
+    let xx = x * x;
+    let mut f = 1.0;
+    // Backwards recurrence: start deep and work down. Simpler to reason about than
+    // Lentz's forward form, and the depth is fixed because the convergence rate out
+    // here is known.
+    for n in (1..=60).rev() {
+        f = 1.0 + (n as f64 / 2.0) / (xx * f);
+    }
+    exp(-xx) / (x * sqrt(core::f64::consts::PI) * f)
+}
+
+/// `logb`: the exponent of `x` as a floating-point value, base 2.
+pub(crate) fn logb(x: f64) -> f64 {
+    if x == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if !x.is_finite() {
+        return if x.is_nan() { x } else { f64::INFINITY };
+    }
+    frexp(x).1 as f64 - 1.0
+}
+
+/// `ilogb`, the same answer as an `int`, with C's three special returns.
+///
+/// `FP_ILOGB0` and `FP_ILOGBNAN` are `INT_MIN` on this target and `INT_MAX` is the
+/// answer for an infinity. Returning 0 for a zero argument — the tempting shortcut —
+/// makes `ilogb(0)` indistinguishable from `ilogb(1)`.
+pub(crate) fn ilogb(x: f64) -> c_int {
+    if x == 0.0 {
+        return c_int::MIN;
+    }
+    if x.is_nan() {
+        return c_int::MIN;
+    }
+    if !x.is_finite() {
+        return c_int::MAX;
+    }
+    frexp(x).1 - 1
+}
+
+/// The next representable value from `x` towards `y`.
+///
+/// Done on the bit pattern, which is what makes it exact: IEEE-754 orders finite
+/// values of one sign the same way their bit patterns order as integers, so "next"
+/// is an increment. Arithmetic cannot express this — there is no value small enough
+/// to add.
+pub(crate) fn nextafter(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        return x + y; // propagates whichever is NaN, as C requires
+    }
+    if x == y {
+        return y; // C says the *second* argument, which matters for signed zeros
+    }
+    if x == 0.0 {
+        return copysign(f64::from_bits(1), y);
+    }
+    let bits = x.to_bits();
+    // Away from zero when x and y point the same way, towards it otherwise.
+    let step_up = (x < y) == (x > 0.0);
+    f64::from_bits(if step_up { bits + 1 } else { bits - 1 })
+}
+
+/// As [`nextafter`], in `f32`. Not the double version narrowed: the neighbouring
+/// `float` is a step in `float` bits, and rounding a double step back down lands on
+/// the same value it started from.
+pub(crate) fn nextafterf(x: f32, y: f32) -> f32 {
+    if x.is_nan() || y.is_nan() {
+        return x + y;
+    }
+    if x == y {
+        return y;
+    }
+    if x == 0.0 {
+        return copysign(f64::from(f32::from_bits(1)), f64::from(y)) as f32;
+    }
+    let bits = x.to_bits();
+    let step_up = (x < y) == (x > 0.0);
+    f32::from_bits(if step_up { bits + 1 } else { bits - 1 })
+}
+
 /// The exported names. Split from the logic above for the reason the whole crate
 /// is: a host test binary that defined `sin` would collide with the system's own.
 #[cfg(not(test))]
@@ -1102,6 +1336,100 @@ pub mod exports {
     #[no_mangle]
     pub extern "C" fn scalbnf(x: f32, n: core::ffi::c_int) -> f32 {
         super::ldexp(f64::from(x), n) as f32
+    }
+
+    c_math! {
+        erf => super::erf,
+        erfc => super::erfc,
+        tgamma => super::tgamma,
+        lgamma => super::lgamma,
+        logb => super::logb,
+    }
+
+    c_mathf! {
+        erff => super::erf,
+        erfcf => super::erfc,
+        tgammaf => super::tgamma,
+        lgammaf => super::lgamma,
+        logbf => super::logb,
+        exp2f => super::exp2,
+        acoshf => super::acosh,
+        asinhf => super::asinh,
+        nearbyintf => super::rint,
+    }
+
+    c_math2! {
+        nextafter => super::nextafter,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn nextafterf(x: f32, y: f32) -> f32 {
+        super::nextafterf(x, y)
+    }
+
+    #[no_mangle]
+    pub extern "C" fn fdimf(x: f32, y: f32) -> f32 {
+        fdim(f64::from(x), f64::from(y)) as f32
+    }
+
+    #[no_mangle]
+    pub extern "C" fn fmaf(x: f32, y: f32, z: f32) -> f32 {
+        fma(f64::from(x), f64::from(y), f64::from(z)) as f32
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ilogb(x: f64) -> core::ffi::c_int {
+        super::ilogb(x)
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ilogbf(x: f32) -> core::ffi::c_int {
+        super::ilogb(f64::from(x))
+    }
+
+    /// The four rounding-to-integer entry points.
+    ///
+    /// `lrint` follows the current rounding mode and `lround` rounds half away from
+    /// zero — the two really are different functions, and a libm that made them the
+    /// same would be wrong for exactly the halfway cases anyone would test with.
+    /// There is no way to change the rounding mode here, so `lrint` is
+    /// round-to-nearest-even, which is the mode this machine starts in.
+    macro_rules! to_integer {
+        ($($name:ident => $imp:path, $ty:ty),* $(,)?) => {$(
+            #[no_mangle]
+            pub extern "C" fn $name(x: f64) -> $ty {
+                let r = $imp(x);
+                // Out of range is undefined in C. Saturating is the least
+                // surprising answer and the only one that cannot produce a value
+                // the caller will read as valid.
+                if r >= <$ty>::MAX as f64 { <$ty>::MAX }
+                else if r <= <$ty>::MIN as f64 { <$ty>::MIN }
+                else { r as $ty }
+            }
+        )*};
+    }
+
+    to_integer! {
+        lrint => super::rint, i64,
+        llrint => super::rint, i64,
+        lround => super::round, i64,
+        llround => super::round, i64,
+        lrintf => super::rint, i64,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn llrintf(x: f32) -> i64 {
+        lrint(f64::from(x))
+    }
+
+    #[no_mangle]
+    pub extern "C" fn lroundf(x: f32) -> i64 {
+        lround(f64::from(x))
+    }
+
+    #[no_mangle]
+    pub extern "C" fn llroundf(x: f32) -> i64 {
+        lround(f64::from(x))
     }
 
     /// # Safety
@@ -1472,5 +1800,131 @@ mod tests {
         }
         assert_eq!(f32_wrap2(pow, 2.0, 10.0), 1024.0f32);
         assert_eq!(f32_wrap2(hypot, 3.0, 4.0), 5.0f32);
+    }
+
+    /// `erf` and `erfc` against values from a known-good implementation.
+    ///
+    /// The table is not hand-derived — it was produced by CPython's `math.erf`,
+    /// which is the platform's libm, and pasted here. A test whose expected values
+    /// came from the code under test proves the code equals itself.
+    #[test]
+    fn the_error_function_agrees_with_a_known_good_one() {
+        const ERF: [(f64, f64); 11] = [
+            (0.0, 0.0),
+            (0.1, 0.1124629160182849),
+            (0.5, 0.5204998778130465),
+            (1.0, 0.8427007929497149),
+            (1.5, 0.9661051464753108),
+            (2.0, 0.9953222650189527),
+            (3.0, 0.9999779095030014),
+            (-0.5, -0.5204998778130465),
+            (-2.0, -0.9953222650189527),
+            (0.25, 0.27632639016823696),
+            (4.0, 0.9999999845827421),
+        ];
+        for (x, want) in ERF {
+            let got = erf(x);
+            assert!((got - want).abs() <= 1e-14 * want.abs().max(1e-12), "erf({x}) = {got}, want {want}");
+        }
+    }
+
+    /// `erfc` matters most where `1 - erf` has thrown the answer away. At x = 6 the
+    /// true value is about 2e-17, and the subtraction rounds to zero — so the tail
+    /// is checked to a *relative* tolerance, which is the only kind that means
+    /// anything there.
+    #[test]
+    fn the_complementary_error_function_survives_its_tail() {
+        const ERFC: [(f64, f64); 6] = [
+            (0.0, 1.0),
+            (0.5, 0.4795001221869535),
+            (1.0, 0.15729920705028513),
+            (2.0, 0.004677734981047266),
+            (3.0, 2.209049699858544e-05),
+            (4.0, 1.541725790028002e-08),
+        ];
+        for (x, want) in ERFC {
+            let got = erfc(x);
+            assert!((got - want).abs() <= 1e-12 * want.abs(), "erfc({x}) = {got}, want {want}");
+        }
+        // And the thing the naive definition cannot do at all.
+        assert!(erfc(6.0) > 0.0, "erfc(6) rounded to zero, which is what erfc exists to avoid");
+    }
+
+    #[test]
+    fn gamma_agrees_with_a_known_good_one() {
+        const TGAMMA: [(f64, f64); 11] = [
+            (0.5, 1.7724538509055159),
+            (1.0, 1.0),
+            (1.5, 0.886226925452758),
+            (2.0, 1.0),
+            (3.0, 2.0),
+            (5.0, 24.0),
+            (10.0, 362880.0),
+            (0.25, 3.6256099082219087),
+            (-0.5, -3.544907701811032),
+            (-1.5, 2.3632718012073544),
+            (20.0, 1.21645100408832e+17),
+        ];
+        for (x, want) in TGAMMA {
+            let got = tgamma(x);
+            assert!((got - want).abs() <= 1e-11 * want.abs(), "tgamma({x}) = {got}, want {want}");
+        }
+        // The poles, where C wants a domain error rather than a plausible number.
+        assert!(tgamma(-1.0).is_nan(), "gamma has a pole at every negative integer");
+        assert!(tgamma(0.0).is_infinite());
+    }
+
+    /// `lgamma` past the point where `tgamma` overflows, which is the whole reason
+    /// it is a separate function: gamma leaves the range of a double near 171, and
+    /// every caller of `lgamma` wants values well beyond that.
+    #[test]
+    fn log_gamma_keeps_going_after_gamma_overflows() {
+        const LGAMMA: [(f64, f64); 8] = [
+            (0.5, 0.5723649429247004),
+            (1.0, 0.0),
+            (1.5, -0.12078223763524543),
+            (5.0, 3.178053830347945),
+            (10.0, 12.801827480081467),
+            (-0.5, 1.265512123484645),
+            (100.0, 359.1342053695754),
+            (10000.0, 82099.71749644238),
+        ];
+        for (x, want) in LGAMMA {
+            let got = lgamma(x);
+            assert!((got - want).abs() <= 1e-10 * want.abs().max(1e-9), "lgamma({x}) = {got}, want {want}");
+        }
+        assert!(tgamma(200.0).is_infinite(), "gamma really does overflow here");
+        assert!(lgamma(200.0).is_finite(), "and log gamma really does not");
+    }
+
+    #[test]
+    fn nextafter_steps_by_one_representable_value() {
+        // Arithmetic cannot express this: there is no value small enough to add.
+        assert_eq!(nextafter(1.0, 2.0), f64::from_bits(1.0f64.to_bits() + 1));
+        assert_eq!(nextafter(1.0, 0.0), f64::from_bits(1.0f64.to_bits() - 1));
+        assert!(nextafter(1.0, 2.0) > 1.0);
+        assert_eq!(nextafter(1.0, 2.0) - 1.0, f64::EPSILON);
+        // Zero has no bit pattern to step from, and the direction comes from y.
+        assert_eq!(nextafter(0.0, 1.0), f64::from_bits(1));
+        assert!(nextafter(0.0, -1.0) < 0.0);
+        // C says equal arguments return the *second*, which is visible only for
+        // signed zeros — and is exactly where a careless version returns the first.
+        assert!(nextafter(0.0, -0.0).is_sign_negative());
+        assert_eq!(nextafterf(1.0, 2.0), f32::from_bits(1.0f32.to_bits() + 1));
+    }
+
+    #[test]
+    fn logb_and_ilogb_answer_the_specials_apart() {
+        assert_eq!(logb(1.0), 0.0);
+        assert_eq!(logb(8.0), 3.0);
+        assert_eq!(logb(0.5), -1.0);
+        assert_eq!(ilogb(1.0), 0);
+        assert_eq!(ilogb(8.0), 3);
+        // Zero must not answer the same as one. The tempting shortcut — return 0 —
+        // makes ilogb(0) indistinguishable from ilogb(1).
+        assert_ne!(ilogb(0.0), ilogb(1.0));
+        assert_eq!(ilogb(0.0), i32::MIN);
+        assert_eq!(ilogb(f64::INFINITY), i32::MAX);
+        assert_eq!(logb(0.0), f64::NEG_INFINITY);
     }
 }

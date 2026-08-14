@@ -69,6 +69,7 @@ pub mod math;
 pub mod mmap;
 pub mod proc;
 pub mod scan;
+pub mod sort;
 pub mod stdio;
 pub mod stream;
 pub mod string;
@@ -333,6 +334,80 @@ mod exports {
         stdio::write_bytes(b"[libc] abort()\n");
         stdio::flush();
         sys::exit(134) // 128 + SIGABRT, what a shell would report
+    }
+
+    /// `rand`'s state. One word for the process, seeded to 1 as C requires so a
+    /// program that never calls `srand` gets the same sequence every run — which is
+    /// the property that makes a bug reproducible, and the reason `rand` must never
+    /// be used where unpredictability matters.
+    static mut RAND_STATE: u32 = 1;
+
+    /// `RAND_MAX` here, and the value `stdlib.h` declares.
+    const RAND_MAX: c_int = 0x7fff_ffff;
+
+    /// A linear congruential generator, the constants from Numerical Recipes.
+    ///
+    /// The low bits of an LCG are famously poor — bit 0 alternates — so the result
+    /// is taken from the *top* of the word. A version returning `state % RAND_MAX`
+    /// passes every test anyone writes and produces an obviously periodic sequence
+    /// in the one place it is visible, which is a die roll in a game.
+    #[no_mangle]
+    pub extern "C" fn rand() -> c_int {
+        // SAFETY: a single word; `rand` is not thread-safe by specification, and
+        // `rand_r` is the function that is.
+        unsafe {
+            RAND_STATE = RAND_STATE.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((RAND_STATE >> 1) & RAND_MAX as u32) as c_int
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn srand(seed: core::ffi::c_uint) {
+        // SAFETY: as `rand`.
+        unsafe { RAND_STATE = seed };
+    }
+
+    /// # Safety
+    /// C ABI: `state` points at one writable `unsigned`.
+    #[no_mangle]
+    pub unsafe extern "C" fn rand_r(state: *mut core::ffi::c_uint) -> c_int {
+        if state.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller passes a writable word, as the prototype says.
+        unsafe {
+            *state = (*state).wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((*state >> 1) & RAND_MAX as u32) as c_int
+        }
+    }
+
+    /// `quick_exit`: end the process without running `atexit` handlers.
+    ///
+    /// The distinction from `exit` is the whole point — `quick_exit` is what a
+    /// program calls when its own invariants are broken and running destructors
+    /// would make things worse. Its own handler list (`at_quick_exit`) is separate,
+    /// and empty here because nothing has registered one.
+    #[no_mangle]
+    pub extern "C" fn quick_exit(status: c_int) -> ! {
+        stdio::flush();
+        sys::exit(status)
+    }
+
+    /// Register a handler for `quick_exit`. Always refuses.
+    ///
+    /// Refusing rather than accepting-and-forgetting: a handler that is silently
+    /// never run is the failure this library exists not to have. C says a non-zero
+    /// return means the registration failed, which a caller can act on.
+    #[no_mangle]
+    pub extern "C" fn at_quick_exit(_handler: Option<extern "C" fn()>) -> c_int {
+        -1
+    }
+
+    /// `_Exit`: end immediately, no flushing, no handlers. The C name for what
+    /// `_exit` does, and the same function.
+    #[no_mangle]
+    pub extern "C" fn _Exit(status: c_int) -> ! {
+        sys::exit(status)
     }
 
     /// What a failed `assert` calls.

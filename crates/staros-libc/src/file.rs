@@ -969,6 +969,21 @@ pub mod exports {
         crate::fail(25, -1) // ENOTTY
     }
 
+    /// `tmpnam`: a name no file has. There is no writable filesystem here, so
+    /// there is no name a caller could then create, and C allows returning null
+    /// when one cannot be produced.
+    ///
+    /// Null rather than a plausible `/tmp/...`: a name that looks usable sends the
+    /// caller to `fopen`, which refuses with `EROFS` several frames away from the
+    /// decision that caused it.
+    ///
+    /// # Safety
+    /// C ABI: `s` is ignored, and nothing is written through it.
+    #[no_mangle]
+    pub unsafe extern "C" fn tmpnam(_s: *mut c_char) -> *mut c_char {
+        core::ptr::null_mut()
+    }
+
     /// Everything that changes the filesystem, refused with `EROFS` — one place, so
     /// that the list of what this system cannot do is readable rather than scattered.
     ///
@@ -989,6 +1004,9 @@ pub mod exports {
     }
 
     read_only! {
+        // `remove` is C's name for "unlink a file or rmdir a directory", and it
+        // belongs in this list for the same reason both of those do.
+        remove(path: *const c_char),
         mkdir(path: *const c_char, mode: u32),
         mkdirat(dirfd: c_int, path: *const c_char, mode: u32),
         rmdir(path: *const c_char),

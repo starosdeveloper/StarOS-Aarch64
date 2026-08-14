@@ -39,11 +39,23 @@ if [ -z "$nm_tool" ]; then
     exit 2
 fi
 
-# Symbols the archive defines, as a lookup file. `T` is a definition in text; `D`
-# and `B` cover data, which a declared `extern` object needs just as much.
+# Symbols the archive defines, split by how.
+#
+# `T`/`D`/`B`/`R` are definitions this tree wrote. `W` and `V` are **weak**, and in
+# this archive they are almost all `compiler_builtins`, which bundles a complete
+# libm — `sin`, `pow`, `memcpy`, `erf` — and exports every one of it weakly. A
+# strong definition beside a weak one wins, so the functions written here are the
+# ones that run; the weak set is a floor underneath.
+#
+# That floor is why `erf` and `tgamma` looked implemented when nothing here had
+# written them. Counting the two together would let this check report a promise as
+# kept because a library nobody chose happened to keep it — so they are counted
+# apart, and a name that only the fallback defines is reported as such.
 DEFINED="$(mktemp)"
-trap 'rm -f "$DEFINED"' EXIT
-"$nm_tool" -g "$ARCHIVE" 2>/dev/null | awk '$2 ~ /^[TDBRWV]$/ {print $3}' | sort -u >"$DEFINED"
+WEAK="$(mktemp)"
+trap 'rm -f "$DEFINED" "$WEAK"' EXIT
+"$nm_tool" -g "$ARCHIVE" 2>/dev/null | awk '$2 ~ /^[TDBR]$/ {print $3}' | sort -u >"$DEFINED"
+"$nm_tool" -g "$ARCHIVE" 2>/dev/null | awk '$2 ~ /^[WV]$/ {print $3}' | sort -u >"$WEAK"
 
 # Function names these headers declare.
 #
@@ -53,7 +65,7 @@ trap 'rm -f "$DEFINED"' EXIT
 # make one class of mistake impossible to leave in, and a check that catches most of
 # a thing is worth more than an argument about the rest.
 DECLARED="$(mktemp)"
-trap 'rm -f "$DEFINED" "$DECLARED"' EXIT
+trap 'rm -f "$DEFINED" "$WEAK" "$DECLARED"' EXIT
 grep -hoE '^[a-z_][a-zA-Z0-9_ *]*\**[[:space:]]+\**([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\(' \
     "$INCLUDE"/*.h |
     grep -oE '[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\($' |
@@ -66,18 +78,22 @@ grep -hoE '^[a-z_][a-zA-Z0-9_ *]*\**[[:space:]]+\**([a-zA-Z_][a-zA-Z0-9_]*)[[:sp
 # which puts a reason next to it in a diff.
 KNOWN="docs/header-gap.txt"
 ALLOWED="$(mktemp)"
-trap 'rm -f "$DEFINED" "$DECLARED" "$ALLOWED"' EXIT
+trap 'rm -f "$DEFINED" "$WEAK" "$DECLARED" "$ALLOWED"' EXIT
 grep -vE '^\s*(#|$)' "$KNOWN" 2>/dev/null | sort -u >"$ALLOWED"
 
 missing=0
 unexpected=0
 fixed=0
+weak=0
 total=0
 while read -r name; do
     [ -z "$name" ] && continue
     total=$((total + 1))
     if grep -qxF "$name" "$DEFINED"; then
         [ "$LIST" = 1 ] && echo "  ok       $name"
+    elif grep -qxF "$name" "$WEAK"; then
+        weak=$((weak + 1))
+        [ "$LIST" = 1 ] && echo "  fallback $name — only compiler_builtins defines this"
     elif grep -qxF "$name" "$ALLOWED"; then
         missing=$((missing + 1))
         [ "$LIST" = 1 ] && echo "  known    $name"
@@ -99,8 +115,9 @@ while read -r name; do
 done <"$ALLOWED"
 
 echo
-echo "  headers declare $total function(s); the archive defines $((total - missing))"
-echo "  $missing known to be declared and undefined (see $KNOWN)"
+echo "  headers declare $total function(s)"
+echo "  $((total - missing - weak)) defined here, $weak by compiler_builtins' weak libm,"
+echo "  $missing declared and undefined (see $KNOWN)"
 if [ "$unexpected" -gt 0 ] || [ "$fixed" -gt 0 ]; then
     echo
     [ "$unexpected" -gt 0 ] && echo "  $unexpected promise(s) added without being kept"

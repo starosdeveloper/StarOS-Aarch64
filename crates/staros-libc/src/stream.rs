@@ -504,6 +504,49 @@ pub mod exports {
         position
     }
 
+    /// `fpos_t`: an opaque position. C says it need not be an integer — a
+    /// multibyte-encoded stream would need shift state alongside the offset — so it
+    /// is a struct here rather than a `long`, which keeps a caller from doing
+    /// arithmetic on it that would stop working the day it needs to be more.
+    #[repr(C)]
+    pub struct FPos {
+        offset: i64,
+    }
+
+    /// # Safety
+    /// C ABI: `pos` points at one writable `fpos_t`.
+    #[no_mangle]
+    pub unsafe extern "C" fn fgetpos(f: *mut File, pos: *mut FPos) -> c_int {
+        if pos.is_null() {
+            return fail(EINVAL, -1);
+        }
+        // SAFETY: forwarded from the caller.
+        let at = unsafe { ftello(f) };
+        if at < 0 {
+            return -1;
+        }
+        // SAFETY: the caller passes a writable `fpos_t`.
+        unsafe { (*pos).offset = at };
+        0
+    }
+
+    /// # Safety
+    /// C ABI: `pos` points at one `fpos_t` a previous `fgetpos` filled in.
+    #[no_mangle]
+    pub unsafe extern "C" fn fsetpos(f: *mut File, pos: *const FPos) -> c_int {
+        if pos.is_null() {
+            return fail(EINVAL, -1);
+        }
+        // SAFETY: forwarded from the caller.
+        let want = unsafe { (*pos).offset };
+        // SAFETY: as above; 0 is SEEK_SET.
+        if unsafe { fseeko(f, want, 0) } < 0 {
+            -1
+        } else {
+            0
+        }
+    }
+
     /// # Safety
     /// As [`fseeko`].
     #[no_mangle]

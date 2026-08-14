@@ -461,6 +461,178 @@ pub mod exports {
         v.wrapping_abs()
     }
 
+    #[no_mangle]
+    pub extern "C" fn labs(v: i64) -> i64 {
+        v.wrapping_abs()
+    }
+
+    #[no_mangle]
+    pub extern "C" fn llabs(v: i64) -> i64 {
+        v.wrapping_abs()
+    }
+
+    /// `div_t` and friends: quotient and remainder together.
+    ///
+    /// The struct is returned by value, which is the whole reason these exist —
+    /// a caller wanting both would otherwise divide twice and hope the compiler
+    /// noticed. Layout is quotient first, as every ABI on this platform has it.
+    #[repr(C)]
+    pub struct DivT {
+        pub quot: c_int,
+        pub rem: c_int,
+    }
+
+    #[repr(C)]
+    pub struct LdivT {
+        pub quot: i64,
+        pub rem: i64,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn div(numer: c_int, denom: c_int) -> DivT {
+        DivT { quot: numer.wrapping_div(denom), rem: numer.wrapping_rem(denom) }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ldiv(numer: i64, denom: i64) -> LdivT {
+        LdivT { quot: numer.wrapping_div(denom), rem: numer.wrapping_rem(denom) }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn lldiv(numer: i64, denom: i64) -> LdivT {
+        ldiv(numer, denom)
+    }
+
+    /// `strpbrk`: the first byte of `s` that appears in `accept`.
+    ///
+    /// # Safety
+    /// C ABI: both are NUL-terminated strings.
+    #[no_mangle]
+    pub unsafe extern "C" fn strpbrk(s: *const c_char, accept: *const c_char) -> *mut c_char {
+        // SAFETY: forwarded from the caller.
+        let (haystack, set) = unsafe { (as_bytes(s), as_bytes(accept)) };
+        match haystack.iter().position(|b| set.contains(b)) {
+            // SAFETY: the index is inside the string.
+            Some(i) => unsafe { s.add(i) as *mut c_char },
+            None => core::ptr::null_mut(),
+        }
+    }
+
+    /// `memccpy`: copy until `c` has been copied, or `n` bytes have.
+    ///
+    /// Returns the byte *after* the copied `c`, or null if it never appeared —
+    /// which is the only way a caller can tell "found it" from "ran out of room".
+    ///
+    /// # Safety
+    /// C ABI: `dst` and `src` are valid for `n` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn memccpy(
+        dst: *mut c_void,
+        src: *const c_void,
+        c: c_int,
+        n: usize,
+    ) -> *mut c_void {
+        let needle = c as u8;
+        let (d, s) = (dst.cast::<u8>(), src.cast::<u8>());
+        for i in 0..n {
+            // SAFETY: `i < n` and both runs are `n` bytes by the caller's contract.
+            unsafe {
+                let b = *s.add(i);
+                *d.add(i) = b;
+                if b == needle {
+                    return d.add(i + 1).cast::<c_void>();
+                }
+            }
+        }
+        core::ptr::null_mut()
+    }
+
+    /// `strdup`: a copy of `s` from `malloc`.
+    ///
+    /// # Safety
+    /// C ABI: `s` is a NUL-terminated string. The caller owns the result and must
+    /// `free` it.
+    #[no_mangle]
+    pub unsafe extern "C" fn strdup(s: *const c_char) -> *mut c_char {
+        // SAFETY: forwarded from the caller.
+        let bytes = unsafe { as_bytes(s) };
+        // SAFETY: `malloc` returns either null or `len + 1` writable bytes.
+        let out = unsafe { crate::exports::malloc(bytes.len() + 1) }.cast::<u8>();
+        if out.is_null() {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: `out` has room for the bytes and the NUL.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+            *out.add(bytes.len()) = 0;
+        }
+        out.cast::<c_char>()
+    }
+
+    /// `strndup`: at most `n` bytes of `s`, always NUL-terminated.
+    ///
+    /// # Safety
+    /// As [`strdup`], except `s` need only be readable for `n` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn strndup(s: *const c_char, n: usize) -> *mut c_char {
+        let mut len = 0;
+        // SAFETY: the caller promises `n` readable bytes; we stop at the NUL or at n.
+        while len < n && unsafe { *s.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `malloc` returns either null or `len + 1` writable bytes.
+        let out = unsafe { crate::exports::malloc(len + 1) }.cast::<u8>();
+        if out.is_null() {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: `len` bytes are readable and `out` has room for them and the NUL.
+        unsafe {
+            core::ptr::copy_nonoverlapping(s.cast::<u8>(), out, len);
+            *out.add(len) = 0;
+        }
+        out.cast::<c_char>()
+    }
+
+    /// Where `strtok` left off. One word for the process, which is what makes
+    /// `strtok` the function every style guide tells you not to use: two callers
+    /// interleaving calls corrupt each other's traversal, and `strtok_r` exists for
+    /// exactly that reason. Implemented in terms of it so there is one algorithm.
+    static mut STRTOK_SAVE: *mut c_char = core::ptr::null_mut();
+
+    /// # Safety
+    /// C ABI: `s` is a NUL-terminated string or null; `delim` is one.
+    #[no_mangle]
+    pub unsafe extern "C" fn strtok(s: *mut c_char, delim: *const c_char) -> *mut c_char {
+        // SAFETY: forwarded; the saved pointer is this library's own.
+        unsafe { strtok_r(s, delim, core::ptr::addr_of_mut!(STRTOK_SAVE)) }
+    }
+
+    /// `strxfrm`: transform for collation.
+    ///
+    /// In the "C" locale collation *is* byte order, so the transform is a copy and
+    /// `strcoll` is `strcmp`. Saying that plainly beats a table that encodes the
+    /// identity: the day a real locale exists, this is the function to change, and
+    /// it should not look like it already does something.
+    ///
+    /// # Safety
+    /// C ABI: `src` is a NUL-terminated string; `dst` is writable for `n` bytes.
+    #[no_mangle]
+    pub unsafe extern "C" fn strxfrm(dst: *mut c_char, src: *const c_char, n: usize) -> usize {
+        // SAFETY: forwarded from the caller.
+        let bytes = unsafe { as_bytes(src) };
+        if n > 0 {
+            let copy = bytes.len().min(n - 1);
+            // SAFETY: `copy < n` and `dst` is writable for `n`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.cast::<u8>(), copy);
+                *dst.add(copy) = 0;
+            }
+        }
+        // C returns the length the transform *would* need, which may exceed `n` —
+        // that is how a caller learns to allocate and try again.
+        bytes.len()
+    }
+
     // `isspace` and `isdigit` used to be here, alone, because `strtol` needed them
     // and nothing else did. They live in `crate::ctype` now with the other twelve —
     // a header that declared fourteen against an archive that defined two is the

@@ -319,6 +319,12 @@ if [ -n "$INITRAMFS" ]; then
     # demand — libstdc++'s <cctype> says `using ::isalpha;` and fails at compile
     # time in a file that has nothing to do with the mistake.
     req "[hello-c] ctype: fourteen classifications the header had promised and nobody had written"
+    # And the rest of what starting G6 found declared and unwritten: qsort and
+    # bsearch, rand, strdup, and the special functions. erf and tgamma had *looked*
+    # implemented — they came from compiler_builtins' weak libm, which is a floor
+    # under everything this tree writes and was invisible until the check learned to
+    # count a weak definition apart from a real one.
+    req "[hello-c] stdlib: qsort, bsearch, rand, strdup and the special functions this sysroot had only promised"
     # The system font, read the way FreeType will read it: 133796 bytes through a
     # 4 KiB bounce buffer, twice — once in 512-byte bites through FILE*, once as a
     # single 33-page read of the descriptor — and the two agree byte for byte. The

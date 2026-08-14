@@ -216,6 +216,85 @@ pub mod exports {
         }
     }
 
+    // The `v` forms: the same four functions taking an already-started `va_list`
+    // instead of `...`.
+    //
+    // They are not a convenience. A program with its own `log(const char *fmt, ...)`
+    // has no way to hand its `...` on to `printf` — C provides `va_start` and
+    // nothing that forwards — so every wrapper anyone writes ends here. Qt's
+    // `qDebug` is one, and so is every logging macro in every library it pulls in.
+
+    /// # Safety
+    /// C ABI: `args` is a started `va_list` whose values match `format`.
+    #[no_mangle]
+    pub unsafe extern "C" fn vprintf(format: *const c_char, args: core::ffi::VaList) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let mut source = VaArgs(args);
+            super::with_out(|out| {
+                fmt::format(&mut ConsoleSink { out }, bytes, &mut source) as c_int
+            })
+        }
+    }
+
+    /// # Safety
+    /// As [`vprintf`]; the stream is ignored because both go to the console.
+    #[no_mangle]
+    pub unsafe extern "C" fn vfprintf(
+        _stream: *mut File,
+        format: *const c_char,
+        args: core::ffi::VaList,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { vprintf(format, args) }
+    }
+
+    /// # Safety
+    /// C ABI: `buf` is valid for `size` bytes; `args` as [`vprintf`].
+    #[no_mangle]
+    pub unsafe extern "C" fn vsnprintf(
+        buf: *mut c_char,
+        size: usize,
+        format: *const c_char,
+        args: core::ffi::VaList,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let out = core::slice::from_raw_parts_mut(buf.cast::<u8>(), size);
+            let mut sink = BufSink { buf: out, written: 0 };
+            let mut source = VaArgs(args);
+            let n = fmt::format(&mut sink, bytes, &mut source);
+            if size > 0 {
+                let last = n.min(size - 1);
+                *buf.add(last) = 0;
+            }
+            n as c_int
+        }
+    }
+
+    /// # Safety
+    /// C ABI: `buf` must be large enough for the result, which nothing here can
+    /// check — the bounded form is always the better choice.
+    #[no_mangle]
+    pub unsafe extern "C" fn vsprintf(
+        buf: *mut c_char,
+        format: *const c_char,
+        args: core::ffi::VaList,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            let bytes = crate::string::as_bytes(format);
+            let out = core::slice::from_raw_parts_mut(buf.cast::<u8>(), usize::MAX / 2);
+            let mut sink = BufSink { buf: out, written: 0 };
+            let mut source = VaArgs(args);
+            let n = fmt::format(&mut sink, bytes, &mut source);
+            *buf.add(n) = 0;
+            n as c_int
+        }
+    }
+
     /// # Safety
     /// C ABI: NUL-terminated string.
     #[no_mangle]

@@ -669,6 +669,61 @@ pub mod exports {
         }
     }
 
+    // `scanf` and `fscanf` read from a stream. There is no readable stream here —
+    // `stdin` is a console this system has no driver for on the read side, and the
+    // file layer is a server that answers paths rather than a byte source with a
+    // position. They are declared because libstdc++'s `<cstdio>` requires it, and
+    // they return `EOF` with `errno` set to `ENOSYS`.
+    //
+    // Returning 0 would be worse than useless: 0 means "no conversions assigned
+    // yet", which is exactly what a program sees when the input did not match, so a
+    // caller would retry for ever on input that will never arrive. `EOF` is the
+    // answer that ends a read loop, and `ENOSYS` is the reason a caller can print.
+
+    /// `ENOSYS`.
+    const ENOSYS: c_int = 38;
+    /// What C's read functions return at end of input.
+    const EOF: c_int = -1;
+
+    /// # Safety
+    /// C ABI; nothing is read and no argument is written.
+    #[no_mangle]
+    pub unsafe extern "C" fn scanf(_format: *const c_char, _args: ...) -> c_int {
+        crate::fail(ENOSYS, EOF)
+    }
+
+    /// # Safety
+    /// As [`scanf`].
+    #[no_mangle]
+    pub unsafe extern "C" fn fscanf(
+        _stream: *mut core::ffi::c_void,
+        _format: *const c_char,
+        _args: ...
+    ) -> c_int {
+        crate::fail(ENOSYS, EOF)
+    }
+
+    /// # Safety
+    /// As [`scanf`].
+    #[no_mangle]
+    pub unsafe extern "C" fn vscanf(
+        _format: *const c_char,
+        _args: core::ffi::VaList,
+    ) -> c_int {
+        crate::fail(ENOSYS, EOF)
+    }
+
+    /// # Safety
+    /// As [`scanf`].
+    #[no_mangle]
+    pub unsafe extern "C" fn vfscanf(
+        _stream: *mut core::ffi::c_void,
+        _format: *const c_char,
+        _args: core::ffi::VaList,
+    ) -> c_int {
+        crate::fail(ENOSYS, EOF)
+    }
+
     /// # Safety
     /// As [`sscanf`], with the list already started by the caller.
     #[no_mangle]
