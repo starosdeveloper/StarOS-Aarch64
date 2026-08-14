@@ -111,6 +111,29 @@ pub mod exports {
         sys::shared_pages(cap) * 4096
     }
 
+    /// Create a notification and arrange for the kernel to signal it when this
+    /// task exits, however it exits. Returns its capability handle, or 0.
+    ///
+    /// The handle is meant to be **delegated** — put in a message's `cap` and sent
+    /// to a service that must clean up after this process. That is the whole
+    /// mechanism: a server cannot ask to watch a task that did not offer, so the
+    /// authority to be told about a death is something the dying party hands out.
+    ///
+    /// A plugin calls this once, from the thread whose death means the program is
+    /// over. It is per *task*: a worker thread ending is not the program ending,
+    /// and a registration inherited by every thread would fire on the first one to
+    /// finish.
+    #[no_mangle]
+    pub extern "C" fn staros_death_notification() -> u32 {
+        let Some(handle) = sys::notify_create() else {
+            return 0;
+        };
+        if sys::notify_on_exit(handle) != 0 {
+            return 0;
+        }
+        handle
+    }
+
     /// Send one message on an endpoint descriptor, carrying `msg.cap` if it is not
     /// zero. Returns 0, or a negated errno.
     ///

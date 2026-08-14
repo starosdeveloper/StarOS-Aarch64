@@ -259,6 +259,22 @@ pub(crate) fn endpoint_bind(endpoint: u32, notification: u32) -> isize {
     unsafe { syscall2(Syscall::EndpointBind, u64::from(endpoint), u64::from(notification)) }
 }
 
+/// Ask the kernel to signal `handle` when this task exits. Returns 0 on success.
+pub(crate) fn notify_on_exit(handle: u32) -> isize {
+    // SAFETY: `NotifyOnExit` resolves the handle in our own table and stores it.
+    unsafe { syscall1(Syscall::NotifyOnExit, u64::from(handle)) }
+}
+
+/// Take back whatever notification this endpoint was bound to. Silent about
+/// failure on purpose: this runs on the close path, where there is nobody left to
+/// tell and nothing that could be done about it.
+pub(crate) fn endpoint_unbind(endpoint: u32) {
+    // SAFETY: handle 0 means "no notification"; the endpoint handle is our own.
+    unsafe {
+        syscall2(Syscall::EndpointBind, u64::from(endpoint), 0);
+    }
+}
+
 /// How many messages are queued at an endpoint. Returns 0 for a handle that is not
 /// ours, which is the same answer as an empty endpoint on purpose: `poll` reports
 /// the bad descriptor through `POLLNVAL`, and a readiness query is not the place to

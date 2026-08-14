@@ -19,6 +19,10 @@ What this asserts, at named coordinates, is the claim the phase makes:
     program, drawing through the same header a platform plugin is given. Two
     clients on one server is where a shared reply endpoint shows itself, as one of
     them hanging on an answer the other took;
+  * a fourth client opened a 32x32 yellow window at (450, 200) and then crashed on
+    purpose, so those pixels must be **background**: the server holds a notification
+    the kernel signals when that client's task exits, and reaping is the only thing
+    that puts the background back;
   * around them is the display server's background, which only the server draws;
   * the kernel's green console text is *gone* from the region the server owns —
     a kernel that kept mirroring would be writing over the composited frame.
@@ -44,6 +48,11 @@ SECOND_AT = (140, 110)
 THIRD_AT = (300, 300)
 SURFACE_SIZE = 64
 THIRD_SIZE = 32
+# A fourth client opened a yellow window here and then crashed. The display server
+# holds a notification the kernel signals when that client's task exits, so the
+# window comes off the screen — and the proof is that these pixels are background.
+CRASHED_AT = (450, 200)
+CRASHED_SIZE = 32
 
 
 def parse_ppm(path):
@@ -133,6 +142,18 @@ def check(path):
         if not near(at(x, y), BACKGROUND):
             return (False, f"pixel ({x},{y}) beside the third surface is {at(x, y)}, not the background")
 
+    # The crashed client's window must be *gone*. Its middle and its corners: a
+    # server that repainted only part of what it reaped would leave an edge, and an
+    # edge is exactly what a bounding-rectangle bug produces.
+    cx, cy = CRASHED_AT
+    c = CRASHED_SIZE
+    for x, y in [(cx + 1, cy + 1), (cx + c // 2, cy + c // 2), (cx + c - 2, cy + c - 2)]:
+        if not near(at(x, y), BACKGROUND):
+            return (
+                False,
+                f"the crashed client's window is still at ({x},{y}): {at(x, y)}",
+            )
+
     # And the server's background must cover the area the kernel's console used to
     # write in. Green text there means the kernel never stopped mirroring.
     greens = sum(1 for x in range(0, w, 4) for y in range(0, 40, 4) if at(x, y)[1] > 80)
@@ -141,8 +162,8 @@ def check(path):
     return (
         True,
         f"{w}x{h}: surfaces at {SURFACE_AT} and {SECOND_AT} from one client and "
-        f"{THIRD_AT} from another, the raised one on top in the overlap, background "
-        "around them, no console text",
+        f"{THIRD_AT} from another, the raised one on top in the overlap, the crashed "
+        f"client's window at {CRASHED_AT} gone, background around them, no console text",
     )
 
 

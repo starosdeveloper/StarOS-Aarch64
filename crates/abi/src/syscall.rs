@@ -262,6 +262,12 @@ pub enum Syscall {
     /// this hands out is "be told that something is here for you to take", which is
     /// meaningless to a task that may not take it, and is a side channel to a task
     /// that may only send.
+    ///
+    /// A notification handle of **0 unbinds**, which is the only way to take a
+    /// binding back. Without it a program that closes an endpoint descriptor leaves
+    /// the kernel signalling a notification whose slot has been handed to something
+    /// else, and the new owner gets wake-ups belonging to a connection that no
+    /// longer exists.
     EndpointBind = 30,
     /// How many messages are queued at an endpoint right now: `arg0` = an endpoint
     /// capability with **receive** rights. Non-destructive; returns 0 or more.
@@ -273,6 +279,29 @@ pub enum Syscall {
     /// descriptor and then block forever in the read that follows. Readiness has to
     /// be a question asked of the endpoint, every time round the loop.
     EndpointPending = 31,
+    /// Signal the notification named by `arg0` when the calling **task** exits, for
+    /// any reason: `Exit`, or the kernel killing it after a fault. `arg0` = 0
+    /// cancels a previous registration.
+    ///
+    /// A server cannot clean up after a client that crashed, because nothing tells
+    /// it that anything happened. It goes on holding the dead client's surfaces,
+    /// which stay on the screen for ever — the most ordinary way a window system
+    /// accumulates ghosts. Polling for liveness is the alternative and it is worse:
+    /// it costs wake-ups on a system that is doing nothing, and it still cannot tell
+    /// "crashed" from "busy".
+    ///
+    /// The authority flows the way capabilities require: the *client* creates the
+    /// notification and delegates it to the server over IPC. Nobody can ask to be
+    /// told about a task that did not offer, so this discloses nothing — and a
+    /// client that simply never registers is a client the server cannot clean up
+    /// after, which is honest. A server that must not depend on client goodwill has
+    /// to bound what a client can hold, and that is a different mechanism.
+    ///
+    /// Registered per **task**, not per process: it fires when the task that
+    /// registered it exits. A thread of a multi-threaded program dying is not that
+    /// program dying, so a library registers on the thread whose death means the
+    /// program is over.
+    NotifyOnExit = 32,
 }
 
 impl Syscall {
@@ -312,6 +341,7 @@ impl Syscall {
             29 => Some(Syscall::TaskId),
             30 => Some(Syscall::EndpointBind),
             31 => Some(Syscall::EndpointPending),
+            32 => Some(Syscall::NotifyOnExit),
             _ => None,
         }
     }
@@ -323,11 +353,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=31 {
+        for n in 0..=32 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(32), None);
+        assert_eq!(Syscall::from_raw(33), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

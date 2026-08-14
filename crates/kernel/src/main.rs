@@ -1268,6 +1268,15 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // id in the message that a client could get wrong.
     let ep_fb2 = obj::create(obj::Object::Endpoint { id: 13 }).expect("ep_fb2 object");
     let ep_fb2_reply = obj::create(obj::Object::Endpoint { id: 14 }).expect("ep_fb2_reply object");
+    // Two more pairs, held only by the server. A shell and an application is two
+    // clients before anything else opens a window, and a display server that has to
+    // be rebuilt to accept a third is a display server that will be rebuilt at the
+    // worst moment. The server discovers how many it has from its own capability
+    // table, so these cost four endpoints and no code.
+    let ep_fb3 = obj::create(obj::Object::Endpoint { id: 15 }).expect("ep_fb3 object");
+    let ep_fb3_reply = obj::create(obj::Object::Endpoint { id: 16 }).expect("ep_fb3_reply object");
+    let ep_fb4 = obj::create(obj::Object::Endpoint { id: 17 }).expect("ep_fb4 object");
+    let ep_fb4_reply = obj::create(obj::Object::Endpoint { id: 18 }).expect("ep_fb4_reply object");
     let ep_fs2 = obj::create(obj::Object::Endpoint { id: 10 }).expect("ep_fs2 object");
     let ep_fs2_reply = obj::create(obj::Object::Endpoint { id: 11 }).expect("ep_fs2_reply object");
 
@@ -1379,6 +1388,10 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb_reply, send: true, recv: false });
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb2, send: false, recv: true });
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb2_reply, send: true, recv: false });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb3, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb3_reply, send: true, recv: false });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb4, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb4_reply, send: true, recv: false });
 
         // Its client: an ordinary `init` role with no privilege at all beyond the
         // two endpoint capabilities. It cannot reach the screen; it can only ask.
@@ -1573,6 +1586,28 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         Some((space, caps))
     })();
 
+    // The client that crashes. It holds the display server's third pair and nothing
+    // else, opens a window, asks to be watched, and dies without a goodbye. Every
+    // other client here is well behaved, which is why nothing had tested what the
+    // server does when one is not.
+    let dying_client = (|| {
+        // SAFETY: as every other space built here.
+        let space = mem::with(|frames| unsafe {
+            let mut s = AddressSpace::new(frames)?;
+            if !load_segments(&mut s, frames, &image) {
+                s.destroy(frames);
+                return None;
+            }
+            s.set_entry(image.entry());
+            s.write_id(22);
+            Some(s)
+        })?;
+        let mut caps = cap::empty_caps()?;
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb3, send: true, recv: false });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb3_reply, send: false, recv: true });
+        Some((space, caps))
+    })();
+
     // Remember the client's root table frame; after the tasks exit, teardown
     // returns it to the buddy allocator, and the next allocation should hand that
     // very frame back — visible proof the space was reclaimed, not leaked.
@@ -1591,6 +1626,9 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // the consumer must already be blocked in `Recv` when the first event is sent,
     // or the ordering rather than the wake path is what makes the demo work.
     if let Some((space, caps)) = input_client {
+        sched::spawn_user(user_task_entry, space, caps);
+    }
+    if let Some((space, caps)) = dying_client {
         sched::spawn_user(user_task_entry, space, caps);
     }
     if let Some((space, caps)) = input {

@@ -75,6 +75,19 @@ unsigned int staros_shared_create(size_t bytes);
  * simply ask again, which is cheaper than the bookkeeping that avoids asking. */
 void *staros_shared_map(unsigned int cap);
 
+/* Create a notification the kernel signals when this task exits, however it exits,
+ * and return its capability handle (0 on failure).
+ *
+ * Meant to be delegated: put it in a message's `cap` and send it to a service that
+ * must clean up after this process. A server cannot ask to watch a task that did
+ * not offer, so the authority to be told about a death is something the dying party
+ * hands out — and a service given one can take a crashed client's windows off the
+ * screen instead of leaving them there for ever.
+ *
+ * Per *task*. Call it from the thread whose death means the program is over; a
+ * worker thread ending is not the program ending. */
+unsigned int staros_death_notification(void);
+
 /* How many bytes a shared buffer holds; 0 for a handle that is not ours.
  *
  * A server must ask this rather than believe the message that delegated the
@@ -100,7 +113,9 @@ size_t staros_shared_bytes(unsigned int cap);
 #define STAROS_DISPLAY_RAISE   4u  /* words[0] = surface */
 #define STAROS_DISPLAY_DESTROY 5u  /* words[0] = surface */
 #define STAROS_DISPLAY_SCREEN  6u  /* reply: words[0..3] = width, height, bpp, format */
-#define STAROS_DISPLAY_BYE     9u  /* this client is done */
+#define STAROS_DISPLAY_WATCH   7u  /* cap = staros_death_notification(); the server
+                                    * takes this client's windows down if it dies */
+#define STAROS_DISPLAY_BYE     9u  /* this client is done; its surfaces go with it */
 
 /* Refusal reasons, in words[0] of a STAROS_DISPLAY_ERROR reply. */
 #define STAROS_DISPLAY_ERR_MALFORMED  1u  /* unknown tag, no buffer, zero geometry,

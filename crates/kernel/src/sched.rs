@@ -161,6 +161,14 @@ struct Task {
     /// loads a half-saved context, and there is no cross-core spin to deadlock. Set
     /// when a task is marked `Running`; every access is under the scheduler lock.
     on_cpu: AtomicBool,
+    /// A notification to signal when this task exits, however it exits.
+    ///
+    /// The table id and not a capability: a capability is resolved through this
+    /// task's own table, and by the time it is signalled that table is being torn
+    /// down. Resolving once, at registration, is also what makes the promise
+    /// keepable — a handle that stopped resolving between the registration and the
+    /// death would turn "you will be told" into "you might be".
+    death_notify: Option<usize>,
     /// Where each shared-memory object this task has mapped landed in its address
     /// space, and how far the placement cursor has advanced.
     ///
@@ -554,6 +562,9 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
         mailbox: None,
         wake_pending: false,
         on_cpu: AtomicBool::new(false),
+        // Not inherited. A thread's death is not its creator's, and a registration
+        // copied into every thread would fire the moment any of them ended.
+        death_notify: None,
         // A *copy* of the creator's placements, exactly like the capability table
         // above and for a sharper reason: the pages are already in this address
         // space at those addresses. A thread starting with an empty table would put
@@ -632,6 +643,7 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         mailbox: None,
         wake_pending: false,
         on_cpu: AtomicBool::new(false),
+        death_notify: None,
         shared: SharedPlacements::new(),
     })?;
 
@@ -843,6 +855,22 @@ fn reschedule() {
 
 /// Terminate the current task and switch away for good. Never returns.
 pub fn exit() -> ! {
+    // Announce the death *before* anything else, and before the scheduler lock is
+    // taken. `notify::signal` reaches into the scheduler to wake a parked waiter,
+    // so signalling while holding that lock is the deadlock the notification
+    // module's own comment describes. Everything after this point is teardown that
+    // cannot fail, so a server told here is never told about a task that then
+    // carried on.
+    let departing = {
+        let mut sched = SCHED.lock();
+        let cpu = me();
+        let me = sched.current[cpu];
+        sched.tasks[me].death_notify.take()
+    };
+    if let Some(id) = departing {
+        crate::notify::signal(id);
+    }
+
     // SAFETY: mask IRQs for the final switch; this task never runs again so the
     // mask is not restored on its behalf.
     let _ = unsafe { exceptions::irq_save() };
@@ -949,6 +977,19 @@ pub fn current_pid() -> u64 {
     let sched = SCHED.lock();
     let cur = sched.current[me()];
     sched.tasks[cur].pid
+}
+
+/// Arrange for `notif` to be signalled when the current task exits, or clear a
+/// previous registration with `None`. Backs [`NotifyOnExit`](staros_abi::syscall::Syscall::NotifyOnExit).
+///
+/// One per task, last registration wins. A list would be a promise to several
+/// parties, and this system has no way to say who they were once the task is
+/// gone — a server that outlives its client must ask for its own notification
+/// rather than share one.
+pub fn set_death_notify(notif: Option<usize>) {
+    let mut sched = SCHED.lock();
+    let cur = sched.current[me()];
+    sched.tasks[cur].death_notify = notif;
 }
 
 /// How many task slots the table holds.

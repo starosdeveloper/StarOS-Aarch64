@@ -1076,7 +1076,7 @@ extern "C" fn _start() -> ! {
         // print "no input" on a working system whose user was slow.
         ".Linputclient:",
         "cmp w19, #21",
-        "b.ne .Lloaded",             // id != 21 -> the loaded-from-a-file role
+        "b.ne .Ldyingclient",        // id != 21 -> the client that crashes, then the rest
         "mov x0, #1",                // handle 1 = the event endpoint (recv)
         "mov x1, x11",
         "mov x8, #2",                // Syscall::Recv
@@ -1097,6 +1097,120 @@ extern "C" fn _start() -> ! {
         "bl .Lputs",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
+
+        // ============ the client that crashes (id 22) ============
+        // Opens a window, tells the display server to watch it, and then dies on
+        // purpose. Every other client in this system is well behaved, which is
+        // exactly why nothing had ever tested what a display server does when one
+        // is not — and "the dead application's window is still on the screen" is
+        // how a window system accumulates ghosts.
+        //
+        // The proof is the screenshot: the yellow square must be *absent* from the
+        // last frame. A server that only reaps in principle leaves it there.
+        ".Ldyingclient:",
+        "cmp w19, #22",
+        "b.ne .Lloaded",             // id != 22 -> the loaded-from-a-file role
+        // 32x32 pixels: 4096 bytes, exactly one page.
+        "mov x0, #1",
+        "mov x8, #14",               // Syscall::CreateShared
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Ldc_bad",
+        "mov x21, x0",               // x21 = the buffer's capability
+        "mov x8, #15",               // Syscall::MapShared
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Ldc_bad",
+        "mov x22, x0",
+        "movz w23, #0x00FF, lsl #16",
+        "movk w23, #0xFF00",         // 0x00FFFF00, yellow
+        "mov x9, #1024",
+        "mov x10, x22",
+        ".Ldc_fill:",
+        "str w23, [x10], #4",
+        "subs x9, x9, #1",
+        "b.ne .Ldc_fill",
+        // A notification of our own, and the kernel's promise to signal it when we
+        // stop. The capability is then *given away* — that is what makes this safe
+        // to accept from anyone: nobody can ask to watch a task that did not offer.
+        "mov x8, #22",               // Syscall::NotifyCreate
+        "svc #0",
+        "cmp x0, #0",
+        "b.le .Ldc_bad",
+        "mov x24, x0",               // x24 = the death notification
+        "mov x8, #32",               // Syscall::NotifyOnExit
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Ldc_bad",
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #7",
+        "str x0, [x11]",             // msg.tag = 7 (Watch)
+        "str w24, [x11, #40]",       // msg.cap = the death notification, delegated
+        "bl .Ldc_call",
+        // The window itself, at (450, 200) — clear of everything else on screen, so
+        // its absence at the end means this and nothing else.
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #1",
+        "str x0, [x11]",             // msg.tag = 1 (Create)
+        "mov x0, #32",
+        "str x0, [x11, #8]",         // words[0] = width
+        "str x0, [x11, #16]",        // words[1] = height
+        "mov x0, #450",
+        "str x0, [x11, #24]",        // words[2] = x
+        "mov x0, #200",
+        "str x0, [x11, #32]",        // words[3] = y
+        "str w21, [x11, #40]",       // msg.cap = the pixels
+        "bl .Ldc_call",
+        "mov x25, x0",               // x25 = the surface id
+        "stp xzr, xzr, [x11]",
+        "stp xzr, xzr, [x11, #16]",
+        "stp xzr, xzr, [x11, #32]",
+        "mov x0, #3",
+        "str x0, [x11]",             // msg.tag = 3 (Commit)
+        "str x25, [x11, #8]",        // words[0] = surface id
+        "mov x0, #32",
+        "lsl x1, x0, #32",
+        "orr x0, x0, x1",
+        "str x0, [x11, #24]",        // words[2] = 32 | 32 << 32
+        "bl .Ldc_call",
+        "mov x9, #1024",
+        "cmp x0, x9",
+        "b.ne .Ldc_bad",
+        "adr x2, 32f",
+        "bl .Lputs",
+        // And die, without a goodbye. A null store is the shortest way to be an
+        // application that crashed rather than one that exited.
+        "mov x9, xzr",
+        "str xzr, [x9]",
+        "mov x8, #4",                // Syscall::Exit (never reached)
+        "svc #0",
+        ".Ldc_bad:",
+        "adr x2, 33f",
+        "bl .Lputs",
+        "mov x8, #4",                // Syscall::Exit
+        "svc #0",
+        // Send the message at x11 on handle 1, take the reply on handle 2, and
+        // return words[0]; anything but an OK reply ends this role.
+        ".Ldc_call:",
+        "mov x14, x30",
+        "mov x0, #1",
+        "mov x1, x11",
+        "mov x8, #1",                // Syscall::Send
+        "svc #0",
+        "mov x0, #2",
+        "mov x1, x11",
+        "mov x8, #2",                // Syscall::Recv
+        "svc #0",
+        "ldr x0, [x11]",
+        "cmp x0, #2",                // 2 = OK
+        "b.ne .Ldc_bad",
+        "ldr x0, [x11, #8]",
+        "mov x30, x14",
+        "ret",
 
         // ============ loaded from a file (id 12) ============
         // Same bytes as every other role here, but this copy did not come from the
@@ -1275,6 +1389,10 @@ extern "C" fn _start() -> ! {
         ".asciz \" arrived over IPC - I hold no device, no interrupt and no sight of the driver's memory\\n\"",
         "31:",
         ".asciz \"[inputclient] EVENT WRONG - the receive failed, or what arrived was not a key event\\n\"",
+        "32:",
+        ".asciz \"[dyingclient] a 32x32 window on screen, the server watching me, and now I crash\\n\"",
+        "33:",
+        ".asciz \"[dyingclient] WINDOW WRONG - the buffer, the death notification or the server refused\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,

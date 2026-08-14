@@ -26,13 +26,34 @@
 //!                  -> words[0] = pixels written to the screen
 //! tag = 4 Raise    words[0] = surface id              to the top of the stack
 //! tag = 5 Destroy  words[0] = surface id
-//! tag = 9 Bye      the last client is done; the server may report and exit
+//! tag = 7 Watch    cap = a notification the kernel signals when this client dies
+//!                  -> words[0] = 1
+//! tag = 9 Bye      this client will send nothing more (its windows stay)
 //! ```
 //!
 //! A reply is `tag = 2` with its result in `words[0]`, or `tag = 0` with a reason in
 //! `words[0]` for a refusal. "Refused" and "did nothing" are different answers, and
 //! a client that cannot tell them apart will one day show a blank window and call it
 //! a slow frame.
+//!
+//! ## What happens when a client crashes
+//!
+//! Nothing, until it says so in advance. `Watch` hands the server a notification the
+//! *kernel* signals when the client's task exits, however it exits — and the server
+//! puts it in the same `WaitAny` set as the request endpoints. When it fires, that
+//! client's surfaces come off the screen and the area they covered is repainted.
+//!
+//! The authority runs the way capabilities require: the client creates the
+//! notification and delegates it. A client that never sends `Watch` is a client the
+//! server cannot clean up after, and that is the honest shape — nothing here can ask
+//! the kernel about a task that did not offer. A server that must not depend on
+//! client goodwill has to bound what a client can hold, which is a different
+//! mechanism and not this one.
+//!
+//! A client's windows outlive `Bye`. This server cleans up what a client *cannot*:
+//! a crashed one never gets to call `Destroy`, while one that says goodbye and
+//! leaves a window up has made a choice. The polite case is covered by the same
+//! mechanism anyway — `NotifyOnExit` fires on an ordinary exit too.
 //!
 //! `Screen` comes first in that list because it has to come first in time: a client
 //! cannot size a buffer before it knows what it is drawing onto, and the geometry is
@@ -87,15 +108,21 @@ const SYS_SHARED_PAGES: usize = 28;
 const SYS_ENDPOINT_BIND: usize = 30;
 const SYS_ENDPOINT_PENDING: usize = 31;
 
-/// Our capability table, as the kernel granted it: request/reply pairs, one per
-/// client, so handle 1 is answered on handle 2 and handle 3 on handle 4.
+/// The most client pairs this server will look for in its capability table.
 ///
-/// A reply endpoint per client rather than one shared by all of them is not
-/// bookkeeping. Two clients receiving on one endpoint means either may take the
-/// other's answer, and the symptom is a program acting on the reply to a question
-/// it never asked — which looks like a rendering bug in whichever of them noticed
-/// first.
-const MAX_CLIENTS: usize = 2;
+/// The kernel grants request/reply pairs, so handle 1 is answered on handle 2 and
+/// handle 3 on handle 4. A reply endpoint per client rather than one shared by all
+/// of them is not bookkeeping: two clients receiving on one endpoint means either
+/// may take the other's answer, and the symptom is a program acting on the reply to
+/// a question it never asked — which looks like a rendering bug in whichever of
+/// them noticed first.
+///
+/// How many clients this server *has* is not this number. It is however many of
+/// those handles the kernel actually granted, which it finds out by trying to bind
+/// them. A shell and an application is two clients before anything else opens a
+/// window, so a server needing a rebuild to accept a third is one that will be
+/// rebuilt at the worst moment.
+const MAX_CLIENTS: usize = 4;
 fn request_handle(client: usize) -> u64 {
     (client * 2 + 1) as u64
 }
@@ -109,6 +136,7 @@ const TAG_COMMIT: u64 = 3;
 const TAG_RAISE: u64 = 4;
 const TAG_DESTROY: u64 = 5;
 const TAG_SCREEN: u64 = 6;
+const TAG_WATCH: u64 = 7;
 const TAG_BYE: u64 = 9;
 
 /// The only pixel format this server composites. Named in the reply so a client
@@ -151,7 +179,11 @@ const BACKGROUND: u32 = 0x0010_2030;
 /// runs until the machine stops; this one has to end so the demo can print its
 /// tallies, and ending on a message rather than a commit count is what makes it a
 /// server loop instead of a script.
-const CLIENTS_EXPECTED: u32 = MAX_CLIENTS as u32;
+///
+/// Two, not "however many endpoints there are": the extra pairs exist so a third
+/// and fourth client *can* connect, and waiting for goodbyes from clients that were
+/// never started would be a server that never stops.
+const CLIENTS_EXPECTED: u32 = 2;
 
 /// A message, laid out exactly as `staros_ipc::Message`: tag, `MESSAGE_WORDS`
 /// words, then the capability handle. Four words, not six — getting that wrong
@@ -175,6 +207,10 @@ impl Message {
 #[derive(Clone, Copy)]
 struct Surface {
     id: u64,
+    /// Which client asked for it. Kept so a dead client's windows can be taken off
+    /// the screen — and so a surface id cannot be used by the client next door,
+    /// which the old code allowed because ids were global and nothing checked.
+    owner: usize,
     pixels: *const u32,
     width: usize,
     height: usize,
@@ -281,6 +317,7 @@ impl Compositor {
     const fn new() -> Self {
         const EMPTY: Surface = Surface {
             id: 0,
+            owner: 0,
             pixels: core::ptr::null(),
             width: 0,
             height: 0,
@@ -290,23 +327,66 @@ impl Compositor {
         Self { surfaces: [EMPTY; MAX_SURFACES], count: 0, next_id: 1 }
     }
 
-    /// The index of the surface with this id, if it is live.
-    fn index_of(&self, id: u64) -> Option<usize> {
-        self.surfaces[..self.count].iter().position(|s| s.id == id)
+    /// The index of `owner`'s surface with this id, if it is live.
+    ///
+    /// The owner is part of the lookup and not a check bolted on afterwards. Ids
+    /// are global and sequential, so a client can name its neighbour's window by
+    /// adding one to its own — and until this took an owner, moving or destroying
+    /// it worked.
+    fn index_of(&self, owner: usize, id: u64) -> Option<usize> {
+        self.surfaces[..self.count]
+            .iter()
+            .position(|s| s.id == id && s.owner == owner)
     }
 
     /// Add a surface at the top of the stack and return its id.
-    fn add(&mut self, pixels: *const u32, width: usize, height: usize, x: usize, y: usize)
-        -> Option<u64>
-    {
+    fn add(
+        &mut self,
+        owner: usize,
+        pixels: *const u32,
+        width: usize,
+        height: usize,
+        x: usize,
+        y: usize,
+    ) -> Option<u64> {
         if self.count == MAX_SURFACES {
             return None;
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.surfaces[self.count] = Surface { id, pixels, width, height, x, y };
+        self.surfaces[self.count] = Surface { id, owner, pixels, width, height, x, y };
         self.count += 1;
         Some(id)
+    }
+
+    /// Take every surface belonging to `owner` off the stack, returning the
+    /// rectangle that covers all of them — what has to be repainted, and `None` if
+    /// the client had no windows.
+    ///
+    /// One bounding rectangle rather than one repaint per surface: two windows far
+    /// apart make it wasteful and correct, and the alternative is a loop whose every
+    /// step invalidates the indices of the one before it.
+    fn remove_owner(&mut self, owner: usize) -> Option<Rect> {
+        let mut bounds: Option<(usize, usize, usize, usize)> = None;
+        let mut i = 0;
+        while i < self.count {
+            if self.surfaces[i].owner != owner {
+                i += 1;
+                continue;
+            }
+            let s = self.surfaces[i];
+            bounds = Some(match bounds {
+                None => (s.x, s.y, s.x + s.width, s.y + s.height),
+                Some((x0, y0, x1, y1)) => (
+                    x0.min(s.x),
+                    y0.min(s.y),
+                    x1.max(s.x + s.width),
+                    y1.max(s.y + s.height),
+                ),
+            });
+            self.remove(i);
+        }
+        bounds.map(|(x0, y0, x1, y1)| Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
     }
 
     /// Move a surface to the top, keeping everything below it in order.
@@ -381,14 +461,24 @@ extern "C" fn main() -> ! {
         exit();
     }
     let arrivals = arrivals as u64;
+    // How many clients this server can serve is a question for its capability
+    // table, not for a constant. A handle the kernel never granted refuses to bind,
+    // and that refusal is the answer — so the same binary serves one client on a
+    // machine configured for one and four on a machine configured for four, with
+    // nothing to keep in step.
+    let mut clients = 0;
     for client in 0..MAX_CLIENTS {
-        // SAFETY: both handles are ours; the request one carries receive rights,
-        // which is what the kernel requires here.
+        // SAFETY: both handles are this task's own; the kernel checks that the
+        // request one carries receive rights and refuses if not.
         let rc = unsafe { syscall2(SYS_ENDPOINT_BIND, request_handle(client), arrivals) };
         if rc < 0 {
-            puts("[displaysrv] a client endpoint would not bind\n");
-            exit();
+            break;
         }
+        clients = client + 1;
+    }
+    if clients == 0 {
+        puts("[displaysrv] no client endpoints; nobody can ask for a window\n");
+        exit();
     }
 
     let mut goodbyes = 0;
@@ -406,8 +496,27 @@ extern "C" fn main() -> ! {
     // found by writing a client that exercises the refusals on purpose and getting
     // five of the eight in one run.
     let mut rejected = 0;
+    // Where the next scan starts. See `next_client`.
+    let mut turn = 0;
+    // Each client's death notification, once it has sent `Watch`. Bound to the same
+    // notification the request endpoints are, so one `WaitAny` covers messages and
+    // deaths alike — a server with a second wait for deaths would be a server that
+    // hears about them only when a message happens to arrive.
+    let mut watches = [0u32; MAX_CLIENTS];
+    let mut reaped = 0u32;
     while goodbyes < CLIENTS_EXPECTED {
-        let Some(client) = next_client(arrivals) else {
+        // A death is not a message, so it is checked before the queues: a client
+        // that crashed after sending its last request has both waiting, and taking
+        // the request first would serve a window belonging to a process that no
+        // longer exists.
+        while let Some(dead) = reap(&mut watches, clients) {
+            if let Some(rect) = compositor.remove_owner(dead) {
+                pixels_drawn += compositor.composite(&mut screen, rect);
+            }
+            reaped += 1;
+            puts("[displaysrv] a client died; its windows are off the screen\n");
+        }
+        let Some(client) = next_client(arrivals, clients, &mut turn) else {
             puts("[displaysrv] woken with nothing queued\n");
             break;
         };
@@ -424,6 +533,17 @@ extern "C" fn main() -> ! {
         }
         if msg.tag == TAG_BYE {
             goodbyes += 1;
+            // `Bye` does **not** take the client's windows down, and that is a
+            // decision rather than an omission.
+            //
+            // The rule this server follows is that it cleans up what a client
+            // *cannot*. A crashed client never gets to call `Destroy`; a client that
+            // says goodbye and leaves its windows up made a choice, and taking them
+            // away would make `Destroy` unreachable in practice. The cleanup that
+            // covers the polite case is the same one that covers the crash —
+            // `NotifyOnExit` fires on an ordinary `Exit` too, so a client that sent
+            // `Watch` is tidied up either way, and one that did not is a client
+            // that asked for its windows to outlive it.
             reply(client, TAG_OK, 0);
             continue;
         }
@@ -444,10 +564,11 @@ extern "C" fn main() -> ! {
         }
 
         let outcome = match msg.tag {
-            TAG_CREATE => create(&mut compositor, &msg),
-            TAG_COMMIT => commit(&mut compositor, &mut screen, &msg),
-            TAG_RAISE => raise(&mut compositor, &mut screen, &msg),
-            TAG_DESTROY => destroy(&mut compositor, &mut screen, &msg),
+            TAG_CREATE => create(&mut compositor, client, &msg),
+            TAG_COMMIT => commit(&mut compositor, &mut screen, client, &msg),
+            TAG_RAISE => raise(&mut compositor, &mut screen, client, &msg),
+            TAG_DESTROY => destroy(&mut compositor, &mut screen, client, &msg),
+            TAG_WATCH => watch(&mut watches, client, arrivals, &msg),
             _ => Err(ERR_MALFORMED),
         };
         match outcome {
@@ -455,7 +576,10 @@ extern "C" fn main() -> ! {
                 if msg.tag == TAG_COMMIT {
                     commits += 1;
                 }
-                pixels_drawn += if msg.tag == TAG_CREATE { 0 } else { result as usize };
+                pixels_drawn += match msg.tag {
+                    TAG_CREATE | TAG_WATCH => 0,
+                    _ => result as usize,
+                };
                 reply(client, TAG_OK, result);
             }
             Err(reason) => {
@@ -466,13 +590,13 @@ extern "C" fn main() -> ! {
     }
 
     puts("[displaysrv] composited client surfaces onto a screen no client can touch\n");
-    report(compositor.count, commits, pixels_drawn, rejected);
+    report(compositor.count, commits, pixels_drawn, rejected, reaped);
     exit();
 }
 
 /// `Create`: map the delegated buffer, check it is big enough for the geometry the
 /// client claims, and put a surface at the top of the stack.
-fn create(compositor: &mut Compositor, msg: &Message) -> Result<u64, u64> {
+fn create(compositor: &mut Compositor, owner: usize, msg: &Message) -> Result<u64, u64> {
     let (width, height) = (msg.words[0] as usize, msg.words[1] as usize);
     let (x, y) = (msg.words[2] as usize, msg.words[3] as usize);
     if msg.cap == 0 || width == 0 || height == 0 {
@@ -498,13 +622,18 @@ fn create(compositor: &mut Compositor, msg: &Message) -> Result<u64, u64> {
         _ => return Err(ERR_BUFFER),
     }
     compositor
-        .add(va as *const u32, width, height, x, y)
+        .add(owner, va as *const u32, width, height, x, y)
         .ok_or(ERR_FULL)
 }
 
 /// `Commit`: recomposite the rectangle the client says changed.
-fn commit(compositor: &mut Compositor, screen: &mut Screen, msg: &Message) -> Result<u64, u64> {
-    let index = compositor.index_of(msg.words[0]).ok_or(ERR_NO_SURFACE)?;
+fn commit(
+    compositor: &mut Compositor,
+    screen: &mut Screen,
+    owner: usize,
+    msg: &Message,
+) -> Result<u64, u64> {
+    let index = compositor.index_of(owner, msg.words[0]).ok_or(ERR_NO_SURFACE)?;
     let surface = compositor.surfaces[index];
     let (dx, dy) = (low(msg.words[1]), high(msg.words[1]));
     let (dw, dh) = (low(msg.words[2]), high(msg.words[2]));
@@ -525,8 +654,13 @@ fn commit(compositor: &mut Compositor, screen: &mut Screen, msg: &Message) -> Re
 
 /// `Raise`: move a surface to the top and repaint the area it covers, so the new
 /// order is on the glass and not only in the list.
-fn raise(compositor: &mut Compositor, screen: &mut Screen, msg: &Message) -> Result<u64, u64> {
-    let index = compositor.index_of(msg.words[0]).ok_or(ERR_NO_SURFACE)?;
+fn raise(
+    compositor: &mut Compositor,
+    screen: &mut Screen,
+    owner: usize,
+    msg: &Message,
+) -> Result<u64, u64> {
+    let index = compositor.index_of(owner, msg.words[0]).ok_or(ERR_NO_SURFACE)?;
     compositor.raise(index);
     let surface = compositor.surfaces[compositor.count - 1];
     let rect = Rect { x: surface.x, y: surface.y, w: surface.width, h: surface.height };
@@ -535,12 +669,64 @@ fn raise(compositor: &mut Compositor, screen: &mut Screen, msg: &Message) -> Res
 
 /// `Destroy`: forget the surface and repaint what it used to cover, so whatever was
 /// underneath — another window, or the background — comes back.
-fn destroy(compositor: &mut Compositor, screen: &mut Screen, msg: &Message) -> Result<u64, u64> {
-    let index = compositor.index_of(msg.words[0]).ok_or(ERR_NO_SURFACE)?;
+fn destroy(
+    compositor: &mut Compositor,
+    screen: &mut Screen,
+    owner: usize,
+    msg: &Message,
+) -> Result<u64, u64> {
+    let index = compositor.index_of(owner, msg.words[0]).ok_or(ERR_NO_SURFACE)?;
     let surface = compositor.surfaces[index];
     compositor.remove(index);
     let rect = Rect { x: surface.x, y: surface.y, w: surface.width, h: surface.height };
     Ok(compositor.composite(screen, rect) as u64)
+}
+
+/// `Watch`: take the notification a client delegated and bind it into the same
+/// wait set the request endpoints use, so a death and a message wake this server
+/// the same way.
+///
+/// The handle arrives *because the client sent it* — the kernel installed it here
+/// when the message was delivered. Nothing in this server can ask to watch a task
+/// that did not offer, which is the property that makes this safe to accept from
+/// anyone: the worst a client can do is ask to be watched.
+fn watch(watches: &mut [u32; MAX_CLIENTS], client: usize, _arrivals: u64, msg: &Message)
+    -> Result<u64, u64>
+{
+    if msg.cap == 0 {
+        return Err(ERR_MALFORMED);
+    }
+    watches[client] = msg.cap;
+    Ok(1)
+}
+
+/// Which client has died since this was last asked, if any — non-blocking.
+///
+/// `WaitAny` with a deadline already in the past is the non-blocking form: it
+/// consumes a pending signal and returns its index, or reports that it would have
+/// blocked. A deadline of zero means "no deadline" to the kernel, so the value here
+/// is 1 nanosecond, which is in the past on every machine that has finished booting.
+fn reap(watches: &mut [u32; MAX_CLIENTS], clients: usize) -> Option<usize> {
+    for client in 0..clients {
+        let handle = watches[client];
+        if handle == 0 {
+            continue;
+        }
+        let handles = [handle];
+        // SAFETY: `WaitAny` reads one handle from this array and returns at once
+        // because the deadline has passed; the array outlives the call.
+        let rc = unsafe {
+            syscall3(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, 1)
+        };
+        if rc >= 0 {
+            // Once. A dead client cannot die again, and leaving the registration in
+            // place would have the next scan report the same death for ever if the
+            // kernel ever counted two signals.
+            watches[client] = 0;
+            return Some(client);
+        }
+    }
+    None
 }
 
 /// The low and high halves of a packed pair. Two 32-bit values in one word because
@@ -580,17 +766,24 @@ fn reply_words(client: usize, tag: u64, words: [u64; 4]) {
 /// answer. So the notification only ends the sleep, and the queues are asked
 /// afresh, in order, every time round.
 ///
-/// Scanning from client zero every time is deliberately unfair: with two clients
-/// and a demo that ends, starving one would show up as a hang rather than as a
-/// slow window, which is the failure worth having. Real fairness is a scheduler
-/// question and belongs with the phase that has frames to be late for.
-fn next_client(arrivals: u64) -> Option<usize> {
+/// Round robin, not "scan from zero". `turn` is where the scan starts and it moves
+/// past whoever was just served, so a client that always has a request queued
+/// cannot hold the server while another waits.
+///
+/// This is not a refinement of a working policy — starting from zero every time is
+/// starvation with two clients and a busy first one, and the shape it takes is a
+/// window that never repaints while another animates smoothly. Cheap enough that
+/// there is no reason to leave the unfair version in and find out later which of
+/// the two windows was the shell.
+fn next_client(arrivals: u64, clients: usize, turn: &mut usize) -> Option<usize> {
     loop {
-        for client in 0..MAX_CLIENTS {
+        for step in 0..clients {
+            let client = (*turn + step) % clients;
             // SAFETY: `EndpointPending` only reads the queue length of a handle we
             // hold with receive rights.
             let pending = unsafe { syscall1(SYS_ENDPOINT_PENDING, request_handle(client)) };
             if pending > 0 {
+                *turn = (client + 1) % clients;
                 return Some(client);
             }
         }
@@ -607,7 +800,7 @@ fn next_client(arrivals: u64) -> Option<usize> {
 }
 
 /// Print the tally, without a formatter: this program has no libc.
-fn report(surfaces: usize, commits: u32, pixels: usize, rejected: u32) {
+fn report(surfaces: usize, commits: u32, pixels: usize, rejected: u32, reaped: u32) {
     let mut line = [0u8; 160];
     let mut n = 0;
     let put = |bytes: &[u8], line: &mut [u8; 160], n: &mut usize| {
@@ -626,7 +819,9 @@ fn report(surfaces: usize, commits: u32, pixels: usize, rejected: u32) {
     n += number(pixels as u64, &mut line[n..]);
     put(b" pixel(s) composited, ", &mut line, &mut n);
     n += number(u64::from(rejected), &mut line[n..]);
-    put(b" refused\n", &mut line, &mut n);
+    put(b" refused, ", &mut line, &mut n);
+    n += number(u64::from(reaped), &mut line[n..]);
+    put(b" client(s) reaped\n", &mut line, &mut n);
     // SAFETY: `DebugWrite` reads `n` bytes from a buffer we own.
     unsafe {
         let _ = syscall2(SYS_DEBUG_WRITE, line.as_ptr() as u64, n as u64);

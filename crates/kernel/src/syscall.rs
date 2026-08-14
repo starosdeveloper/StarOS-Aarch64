@@ -451,9 +451,15 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
                 Ok(id) => id,
                 Err(e) => return e.as_raw(),
             };
-            let notif = match resolve_notification(req.args[1] as u32) {
-                Ok(id) => id,
-                Err(e) => return e.as_raw(),
+            // Handle 0 is never a live capability, so it is free to mean "none"
+            // without an extra argument or a second syscall number.
+            let notif = if req.args[1] == 0 {
+                None
+            } else {
+                match resolve_notification(req.args[1] as u32) {
+                    Ok(id) => Some(id),
+                    Err(e) => return e.as_raw(),
+                }
             };
             if ipc::bind_notify(ep, notif) {
                 0
@@ -469,6 +475,23 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             Ok(id) => ipc::pending(id) as isize,
             Err(e) => e.as_raw(),
         },
+
+        // Signal the notification named by `x0` when this task exits, for any
+        // reason. `x0` = 0 cancels. Resolved here, once, rather than at death: by
+        // then this task's capability table is being torn down, and a promise that
+        // depends on a handle still resolving later is not a promise.
+        Some(Syscall::NotifyOnExit) => {
+            let notif = if req.args[0] == 0 {
+                None
+            } else {
+                match resolve_notification(req.args[0] as u32) {
+                    Ok(id) => Some(id),
+                    Err(e) => return e.as_raw(),
+                }
+            };
+            sched::set_death_notify(notif);
+            0
+        }
 
         // Allocate a physically-contiguous, non-cacheable DMA buffer of `x0`
         // pages and hand the caller a DMA capability for it.

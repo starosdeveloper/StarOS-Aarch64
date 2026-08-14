@@ -437,7 +437,14 @@ req "[displaysrv] composited client surfaces onto a screen no client can touch"
 # made-up surface id, a destroyed one, a surface claiming more pixels than its
 # buffer holds, one with no buffer at all, and damage past the bottom edge. The
 # third of those is what keeps a lying client from making the *server* fault.
-req "[displaysrv] 3 surface(s) live, 6 commit(s), 15440 pixel(s) composited, 5 refused"
+req "[displaysrv] 3 surface(s) live, 7 commit(s), 17488 pixel(s) composited, 7 refused, 1 client(s) reaped"
+# A fourth client opened a window, asked the server to watch it, and crashed. The
+# kernel signals the notification it delegated, the server takes its windows off
+# the screen, and the count says it happened. Whether the *pixels* went back is
+# fb-check.sh: this line would pass on a server that reaped in principle.
+req "[dyingclient] a 32x32 window on screen, the server watching me, and now I crash"
+req "[displaysrv] a client died; its windows are off the screen"
+forbid "[dyingclient] WINDOW WRONG"
 # And that a second *process* was served: the C program's window, drawn through the
 # same header a platform plugin is given. Two clients on one server is where a
 # shared reply endpoint shows itself — as one of them hanging on an answer the

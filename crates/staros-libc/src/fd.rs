@@ -551,12 +551,13 @@ pub(crate) fn release(fd: c_int) -> Option<u64> {
             sys::notify_signal(w.writable.load(Ordering::Acquire));
             None
         }
-        // The slot comes back; the binding in the kernel does not, and cannot until
-        // an endpoint can be unbound. A signal to a notification whose slot has been
-        // reused is a spurious wake-up for its next owner, which costs one trip
-        // round a poll loop — the price of not adding an unbind syscall for a
-        // descriptor that in practice lives as long as the program.
-        Kind::Endpoint { slot, .. } => {
+        // Unbind *before* the slot goes back. The other order leaves a window in
+        // which the kernel still signals a notification whose slot has already been
+        // handed to a new eventfd, and its owner is woken for a connection it has
+        // never heard of — a spurious readiness, which is the one kind of event-loop
+        // bug that reproduces once a week and never under a debugger.
+        Kind::Endpoint { cap, slot } => {
+            sys::endpoint_unbind(cap);
             if let Some(slot) = slot {
                 WAITABLES[slot].used.store(0, Ordering::Release);
             }

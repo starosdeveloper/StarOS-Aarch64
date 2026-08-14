@@ -1608,6 +1608,27 @@ static void check_display(void)
     check(msg.tag == STAROS_DISPLAY_ERROR, "a made-up surface is refused");
     check(msg.words[0] == STAROS_DISPLAY_ERR_NO_SURFACE, "and the refusal says which");
 
+    /* Surface ids are global and sequential, so the neighbour's window is one away
+     * from this one. Naming it must fail: a client that can destroy or move another
+     * client's window has been handed authority nobody granted it, and the ids look
+     * like a capability without being one.
+     *
+     * Which of the neighbouring ids exists depends on what else has run, so both
+     * sides are tried and neither may be accepted. */
+    for (unsigned long long other = surface - 1; other <= surface + 1; other += 2) {
+        if (other == 0 || other == surface)
+            continue;
+        memset(&msg, 0, sizeof msg);
+        msg.tag = STAROS_DISPLAY_COMMIT;
+        msg.words[0] = other;
+        msg.words[2] = 1u | (1ull << 32);
+        staros_msg_send(display, &msg);
+        staros_msg_recv(reply, &msg);
+        check(msg.tag == STAROS_DISPLAY_ERROR, "another client's surface id is refused");
+        check(msg.words[0] == STAROS_DISPLAY_ERR_NO_SURFACE,
+              "as one that does not exist, which from here it does not");
+    }
+
     /* Now lie about the geometry, which is the refusal that protects the *server*.
      *
      * A client claiming a 640x480 surface while delegating 32x32 worth of pixels

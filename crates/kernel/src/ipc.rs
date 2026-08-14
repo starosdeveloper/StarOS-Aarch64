@@ -32,8 +32,8 @@ use crate::sync::SpinLock;
 /// Number of endpoints the kernel exposes. Two carry the client<->server request
 /// and reply; two more carry the device manager's grants to the driver and the
 /// server; one is the contention endpoint several senders hammer at once; two
-/// carry the display protocol's commit and its reply, and two more do the same for
-/// its *second* client; four are two file servers' request/reply pairs (one per
+/// carry the display protocol's commit and its reply, and six more do the same for
+/// its other three clients; four are two file servers' request/reply pairs (one per
 /// client — see `kmain`); the last carries decoded input events out of the input
 /// driver. A real system allocates them dynamically.
 ///
@@ -46,7 +46,7 @@ use crate::sync::SpinLock;
 /// objects in `main`, which is exactly the kind of seam that bites: giving the
 /// display endpoint id 4 put its traffic into [`STORM_EP`], and the display server
 /// spent its life rejecting storm messages it had no business seeing.
-const NUM_ENDPOINTS: usize = 15;
+const NUM_ENDPOINTS: usize = 19;
 
 /// The endpoint the IPC contention test uses (see [`storm_stats`]).
 ///
@@ -348,18 +348,23 @@ pub fn recv(ep: usize) -> Result<KMessage, KError> {
 }
 
 /// Bind notification `notif` to endpoint `ep`, so every message that arrives there
-/// signals it. Returns `false` if `ep` names no endpoint.
+/// signals it — or unbind, with `None`. Returns `false` if `ep` names no endpoint.
 ///
 /// One notification per endpoint, last binding wins. A list would let two event
 /// loops watch one endpoint, which reads as a feature and is a race: both wake, one
 /// takes the message, and the other has been told about a message that is no longer
 /// there. With one binding the surprise is at least confined to whoever asked for
 /// it, and a server that wants to share an endpoint has to say how.
-pub fn bind_notify(ep: usize, notif: usize) -> bool {
+///
+/// Unbinding matters because notification slots are reused. A program that closes
+/// an endpoint descriptor and leaves the binding behind has the kernel signalling a
+/// slot that now belongs to something else — and the new owner is woken for a
+/// connection it has never heard of.
+pub fn bind_notify(ep: usize, notif: Option<usize>) -> bool {
     let mut table = IPC.lock();
     match table.get_mut(ep) {
         Some(e) => {
-            e.notify = Some(notif);
+            e.notify = notif;
             true
         }
         None => false,
