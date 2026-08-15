@@ -35,6 +35,8 @@
 #include <unordered_map>
 
 #include <bits/atomic_futex.h>
+// For the `__cxxabiv1::__*_type_info` classes, whose vtables this file has to emit.
+#include <cxxabi.h>
 
 #include <pthread.h>
 #include <sched.h>
@@ -147,7 +149,19 @@ void __cxa_deleted_virtual(void) {
 // The waiting is a yield loop rather than a futex: construction of a static local
 // is short, and a second lock in the C++ runtime would need the thread layer,
 // which needs the allocator, which needs this.
-int __cxa_guard_acquire(unsigned char *guard) {
+//
+// The parameter is `__cxxabiv1::__guard*` rather than the `unsigned char*` this was
+// first written with. The two behave identically — the code below only ever touches
+// the first two bytes, which is what the generic Itanium ABI specifies — but the
+// declared type has to match `<cxxabi.h>`, which this file now includes for the
+// `type_info` classes further down. It is a 64-bit integer here; `bytes_of` is where
+// the reinterpretation happens, once, instead of at every use.
+static unsigned char *bytes_of(__cxxabiv1::__guard *guard) {
+    return reinterpret_cast<unsigned char *>(guard);
+}
+
+int __cxa_guard_acquire(__cxxabiv1::__guard *g) {
+    unsigned char *guard = bytes_of(g);
     if (__atomic_load_n(&guard[0], __ATOMIC_ACQUIRE) != 0) {
         return 0;  // already constructed
     }
@@ -167,13 +181,14 @@ int __cxa_guard_acquire(unsigned char *guard) {
     return 1;  // we own the construction
 }
 
-void __cxa_guard_release(unsigned char *guard) {
+void __cxa_guard_release(__cxxabiv1::__guard *g) noexcept {
+    unsigned char *guard = bytes_of(g);
     __atomic_store_n(&guard[0], 1, __ATOMIC_RELEASE);
     __atomic_store_n(&guard[1], 0, __ATOMIC_RELEASE);
 }
 
-void __cxa_guard_abort(unsigned char *guard) {
-    __atomic_store_n(&guard[1], 0, __ATOMIC_RELEASE);
+void __cxa_guard_abort(__cxxabiv1::__guard *g) noexcept {
+    __atomic_store_n(&bytes_of(g)[1], 0, __ATOMIC_RELEASE);
 }
 
 }  // extern "C"
@@ -1065,4 +1080,432 @@ std::_Rb_tree_node_base *std::_Rb_tree_rebalance_for_erase(
         }
     }
     return y;
+}
+
+// ---------------------------------------------------------------------------
+// The exception ABI, which exists so that it can refuse
+// ---------------------------------------------------------------------------
+//
+// Everything here is built `-fno-exceptions`, and the header at the top of this
+// file said that keeps `__cxa_throw` out. It does — out of code *this tree*
+// compiles. It does not keep it out of libstdc++'s headers, which are not compiled
+// with that flag when they are written and which contain `throw` in inline and
+// template code that a `-fno-exceptions` translation unit still instantiates. Qt
+// found it: linking `services/qt-hello` asked for eight names in one go.
+//
+// So they are here, and every one of them stops the program. That is not a
+// placeholder standing in for a real unwinder — it is the only behaviour that can
+// be correct without one. `__cxa_throw` cannot return: its caller has already given
+// up on the current control flow and there is nothing after the call. It cannot
+// unwind: unwinding needs `.eh_frame`, a personality routine and a stack walker,
+// none of which this build produces. What is left is to say which exception was
+// thrown, on the console, and stop — which is more than a program that jumps into
+// a garbage return address would have said.
+//
+// The message matters. A C++ program that dies here died at a `throw`, and the
+// type name is usually enough to find it.
+
+namespace {
+
+// The type name out of a `std::type_info`, without RTTI.
+//
+// `type_info::name()` is a virtual call, and calling it needs the vtable this build
+// may not have emitted for the concrete type. The mangled name is the first member
+// of the object after the vtable pointer, which is layout the Itanium ABI fixes, so
+// reading it directly works where the call would not. It is the mangled form —
+// `St9bad_alloc` rather than `std::bad_alloc` — and `__cxa_demangle` is in this file
+// for anyone who wants the other.
+const char *type_name(const void *type) {
+    if (type == nullptr) {
+        return "<no type>";
+    }
+    const char *name = *reinterpret_cast<const char *const *>(
+        reinterpret_cast<const char *>(type) + sizeof(void *));
+    return name != nullptr ? name : "<unnamed type>";
+}
+
+}  // namespace
+
+extern "C" {
+
+// The buffer a thrown object is constructed into.
+//
+// A real implementation allocates, so that a throw during stack unwinding has
+// somewhere to put a second exception. Here the first throw ends the program, so
+// there is never a second one and one static buffer is enough. 256 bytes covers
+// every standard exception type; anything larger stops here rather than being
+// silently truncated into it, because a `throw` of an object too large to hold is
+// still a `throw` and still ends the program — just with a clearer reason.
+alignas(16) static unsigned char exception_storage[256];
+
+void *__cxa_allocate_exception(std::size_t size) noexcept {
+    if (size > sizeof(exception_storage)) {
+        fail("an exception object larger than the throw buffer was allocated");
+    }
+    return exception_storage;
+}
+
+void __cxa_free_exception(void *) noexcept {}
+
+void __cxa_throw(void *object, std::type_info *type, void (*destructor)(void *)) {
+    (void)object;
+    (void)destructor;
+    std::fprintf(stderr, "[c++] throw of %s, and this build has no unwinder\n",
+                 type_name(type));
+    std::fflush(stderr);
+    std::abort();
+}
+
+void __cxa_rethrow() {
+    fail("rethrow, and there was nothing in flight to rethrow");
+}
+
+// `catch` cannot be entered, because nothing ever unwinds into one. Reaching either
+// of these means the unwinder ran, which it cannot.
+void *__cxa_begin_catch(void *) noexcept {
+    fail("entered a catch block, which requires an unwinder this build does not have");
+}
+
+void __cxa_end_catch() {
+    fail("left a catch block that was never entered");
+}
+
+// What `std::current_exception` and `std::exception_ptr` ask. There is never one in
+// flight — a throw ends the program — so the honest answer is null, and unlike the
+// functions above this one is *reachable*: `std::current_exception()` outside a
+// catch block is legal and returns an empty pointer.
+std::type_info *__cxa_current_exception_type() noexcept { return nullptr; }
+
+// The personality routine, named in every `.eh_frame` CIE the compiler emits even
+// under `-fno-exceptions` when it inlines code that was not. It is called by the
+// unwinder, so reaching it means an unwind began.
+int __gxx_personality_v0(int, int, unsigned long long, void *, void *) {
+    fail("the unwinder ran, and there is no unwinder");
+}
+
+[[noreturn]] void _Unwind_Resume(void *) {
+    fail("_Unwind_Resume: unwinding cannot be resumed because it never started");
+}
+
+}  // extern "C"
+
+// ---------------------------------------------------------------------------
+// The exception classes themselves
+// ---------------------------------------------------------------------------
+//
+// Not the throwing machinery above but the objects: `std::exception` and
+// `std::bad_alloc` are ordinary polymorphic classes whose *vtables* are emitted
+// wherever their key function is defined, and their key functions live in
+// libstdc++.a. Defining them here is what puts the vtables in this object.
+//
+// They are reachable code, not refusals. Nothing throws, but `std::bad_alloc` is a
+// complete type that code constructs, copies and destroys — libstdc++'s
+// `__throw_bad_alloc` above builds one on the way to reporting — and `what()` is an
+// ordinary virtual call that has to return something.
+
+namespace std {
+
+exception::~exception() noexcept {}
+bad_alloc::~bad_alloc() noexcept {}
+
+const char *bad_alloc::what() const noexcept { return "std::bad_alloc"; }
+
+// `std::make_shared`'s tag. `_S_eq` compares a `type_info` against the tag's own to
+// decide whether a `shared_ptr`'s control block came from `make_shared` — which
+// matters for `_M_get_deleter` and for nothing else here. With no RTTI there is no
+// type to compare, and false is the answer that says "this control block was not
+// made that way": it makes `get_deleter` return null, which is a documented result,
+// rather than handing back a pointer into a block of the wrong shape.
+bool _Sp_make_shared_tag::_S_eq(const type_info &) noexcept { return false; }
+
+}  // namespace std
+
+// ---------------------------------------------------------------------------
+// The RTTI class hierarchy, which exists for its vtables
+// ---------------------------------------------------------------------------
+//
+// Every polymorphic class has a `type_info` object, and every `type_info` object
+// for a class is an instance of one of the `__cxxabiv1::__*_type_info` types — so
+// the moment libstdc++'s headers emit the type information for `std::bad_alloc`,
+// the linker wants the vtables of those types. `-fno-rtti` does not prevent this:
+// it stops `typeid` and `dynamic_cast` in *our* code, and the exception classes
+// still carry their type information because `__cxa_throw` takes it as an argument.
+//
+// A vtable is emitted where the class's key function is defined, and it references
+// every virtual — so defining one destructor pulls the whole set in. All of them are
+// here, and the split between them is the interesting part:
+//
+//   * The destructors are real. They do nothing, which is correct — these objects
+//     are static and own nothing — and defining them is the entire reason this
+//     section exists.
+//   * The comparison functions stop the program. They are only called during a
+//     `catch` match or a `dynamic_cast`, neither of which can happen: a throw ends
+//     the program before any handler is looked for, and `-fno-rtti` removes
+//     `dynamic_cast` at the point of use. Reaching one means an assumption in this
+//     paragraph is wrong, which is worth a message rather than a wrong answer.
+//
+// Answering `false` instead — "no, this handler does not match" — was the
+// alternative, and it is worse in the one case it would arise: a `catch` that
+// silently never matches turns an exception into a call to `std::terminate` from a
+// place unrelated to the throw.
+
+namespace std {
+
+// The base of the hierarchy, and the first thing the linker asked for once the two
+// derived classes below had vtables. `~type_info` is its key function.
+//
+// `__is_pointer_p` and `__is_function_p` are the two that answer rather than stop,
+// and they can: a `std::type_info` that is neither a `__pointer_type_info` nor a
+// `__function_type_info` describes something that is not a pointer and not a
+// function, and those derived classes override these to say otherwise. False is the
+// base class's correct answer, not a shrug.
+type_info::~type_info() {}
+
+bool type_info::__is_pointer_p() const { return false; }
+bool type_info::__is_function_p() const { return false; }
+
+bool type_info::__do_catch(const type_info *, void **, unsigned) const {
+    fail("type_info::__do_catch: matching a handler without an unwinder");
+}
+
+bool type_info::__do_upcast(const __cxxabiv1::__class_type_info *, void **) const {
+    fail("type_info::__do_upcast: dynamic_cast in a build without RTTI");
+}
+
+}  // namespace std
+
+namespace __cxxabiv1 {
+
+__class_type_info::~__class_type_info() {}
+__si_class_type_info::~__si_class_type_info() {}
+
+bool __class_type_info::__do_upcast(const __class_type_info *, void **) const {
+    fail("__do_upcast: dynamic_cast in a build without RTTI");
+}
+
+bool __class_type_info::__do_catch(const std::type_info *, void **, unsigned) const {
+    fail("__do_catch: matching a handler in a build without an unwinder");
+}
+
+bool __class_type_info::__do_upcast(const __class_type_info *, const void *,
+                                    __upcast_result &) const {
+    fail("__do_upcast: dynamic_cast in a build without RTTI");
+}
+
+bool __class_type_info::__do_dyncast(std::ptrdiff_t, __sub_kind,
+                                     const __class_type_info *, const void *,
+                                     const __class_type_info *, const void *,
+                                     __dyncast_result &) const {
+    fail("__do_dyncast: dynamic_cast in a build without RTTI");
+}
+
+__class_type_info::__sub_kind __class_type_info::__do_find_public_src(
+    std::ptrdiff_t, const void *, const __class_type_info *, const void *) const {
+    fail("__do_find_public_src: dynamic_cast in a build without RTTI");
+}
+
+bool __si_class_type_info::__do_upcast(const __class_type_info *, const void *,
+                                       __upcast_result &) const {
+    fail("__do_upcast: dynamic_cast in a build without RTTI");
+}
+
+bool __si_class_type_info::__do_dyncast(std::ptrdiff_t, __sub_kind,
+                                        const __class_type_info *, const void *,
+                                        const __class_type_info *, const void *,
+                                        __dyncast_result &) const {
+    fail("__do_dyncast: dynamic_cast in a build without RTTI");
+}
+
+__class_type_info::__sub_kind __si_class_type_info::__do_find_public_src(
+    std::ptrdiff_t, const void *, const __class_type_info *, const void *) const {
+    fail("__do_find_public_src: dynamic_cast in a build without RTTI");
+}
+
+}  // namespace __cxxabiv1
+
+// ---------------------------------------------------------------------------
+// `std::locale`, exactly as far as it is asked for
+// ---------------------------------------------------------------------------
+//
+// This is the smallest section in this file with the longest justification, because
+// what it does *not* do is the decision.
+//
+// A real `std::locale` is a reference-counted `_Impl` holding an array of facets
+// indexed by `locale::id`, with `use_facet` doing the lookup and `_M_install_facet`
+// building it. That is a subsystem, and on this machine it would have exactly one
+// instance — `crate::locale` in the C library accepts the name "C" and nothing else,
+// because there is no second locale's data anywhere in the system to switch to.
+//
+// So what is built here is the one thing that is asked for and can be answered
+// truthfully: `use_facet<ctype<char>>` returns the classic `ctype<char>`, because
+// that is the only `ctype<char>` there is, whatever locale it is asked about.
+//
+// Qt reaches it through one line in a bundled third-party file:
+// `double-conversion/string-to-double.cc` lowercases a character to match "infinity"
+// and "nan" case-insensitively. That is the whole demand.
+//
+// The limit is deliberate and it is sharp: any *other* facet — `numpunct`,
+// `num_get`, `collate`, the stream facets — fails at the link, naming itself. That
+// is the intended behaviour, not an oversight. Each one is a decision about what
+// this system's locale means, and a decision should be made when something asks
+// rather than pre-empted by a lookup table full of guesses.
+
+namespace std {
+
+// `locale::id` needs storage; the value is never read here, because nothing does a
+// lookup by id.
+locale::id ctype<char>::id;
+
+// The base every facet derives from. Its destructor is the key function, so this one
+// line is what puts `locale::facet`'s vtable in this object — and `ctype<char>`'s
+// vtable references it, which is how the linker came to ask.
+//
+// It does nothing, which is right: a facet owns the table it was given only when it
+// was constructed with `del` set, and the one facet in this system was not.
+locale::facet::~facet() {}
+
+// The classic table is the C library's own, which is already correct and already
+// used by `isalpha` and friends: one table, one answer, no chance of the C and C++
+// halves disagreeing about whether a byte is a letter.
+//
+// glibc's table is indexed from -128 so that `isalpha(EOF)` works; the pointer
+// `__ctype_b_loc` yields is at index 0, and libstdc++ indexes it with an
+// `unsigned char`, so the ranges line up without adjustment.
+const ctype_base::mask *ctype<char>::classic_table() throw() {
+    return *__ctype_b_loc();
+}
+
+ctype<char>::ctype(const mask *table, bool del, size_t refs)
+    : facet(refs),
+      // Never used: the `__c_locale` handle is glibc's locale object, which is what
+      // `ctype_byname` needs and what this build has no equivalent of. Every path
+      // reachable here goes through `_M_table` instead.
+      _M_c_locale_ctype(nullptr),
+      _M_del(table != nullptr && del),
+      _M_toupper(*__ctype_toupper_loc()),
+      _M_tolower(*__ctype_tolower_loc()),
+      _M_table(table != nullptr ? table : classic_table()),
+      _M_widen_ok(0),
+      _M_narrow_ok(0) {
+    __builtin_memset(_M_widen, 0, sizeof(_M_widen));
+    __builtin_memset(_M_narrow, 0, sizeof(_M_narrow));
+}
+
+ctype<char>::~ctype() {}
+
+// The four case-conversion virtuals, over the C library's tables. `_M_toupper` and
+// `_M_tolower` are `const int*` indexed the same way as the mask table.
+char ctype<char>::do_toupper(char c) const {
+    return static_cast<char>(_M_toupper[static_cast<unsigned char>(c)]);
+}
+
+const char *ctype<char>::do_toupper(char *lo, const char *hi) const {
+    while (lo < hi) {
+        *lo = do_toupper(*lo);
+        ++lo;
+    }
+    return hi;
+}
+
+char ctype<char>::do_tolower(char c) const {
+    return static_cast<char>(_M_tolower[static_cast<unsigned char>(c)]);
+}
+
+const char *ctype<char>::do_tolower(char *lo, const char *hi) const {
+    while (lo < hi) {
+        *lo = do_tolower(*lo);
+        ++lo;
+    }
+    return hi;
+}
+
+// The two caches libstdc++'s inline `widen` and `narrow` fill on first use. For
+// `char` both conversions are the identity, so the tables are their own indices —
+// which is what the C locale means by widening a `char` to a `char`.
+void ctype<char>::_M_widen_init() const {
+    for (size_t i = 0; i < sizeof(_M_widen); ++i) {
+        _M_widen[i] = static_cast<char>(i);
+    }
+    _M_widen_ok = 1;
+}
+
+void ctype<char>::_M_narrow_init() const {
+    for (size_t i = 0; i < sizeof(_M_narrow); ++i) {
+        _M_narrow[i] = static_cast<char>(i);
+    }
+    _M_narrow_ok = 1;
+}
+
+namespace {
+
+// The one `ctype<char>` in the system, built once into static storage.
+//
+// Placement new rather than a plain `static ctype<char>`, because `~ctype()` is
+// protected — a facet is meant to be destroyed by the locale that owns it and by
+// nothing else, so the language will not let a static object of this type be
+// declared. Constructing in place says the same thing the access specifier does:
+// this object is never destroyed.
+//
+// `refs` is 1 rather than 0, which is the other half of it: with 0 the reference
+// count starts at zero and the first locale to install the facet would take
+// ownership and free it.
+alignas(ctype<char>) unsigned char classic_ctype_storage[sizeof(ctype<char>)];
+
+ctype<char> &classic_ctype() {
+    static ctype<char> *facet = new (classic_ctype_storage) ctype<char>(nullptr, false, 1);
+    return *facet;
+}
+
+// Storage shaped like a `std::locale`, never constructed.
+//
+// `locale`'s constructor is out-of-line in libstdc++ and would drag `_Impl` in with
+// it. `classic()` has to return a reference to *something*, and this is a reference
+// to storage whose only property is its address — the `use_facet` below ignores it,
+// which is the whole reason this is enough.
+//
+// Anything that reads through the returned reference — `name()`, a copy, an
+// equality test — fails at the link naming the member it needed. That is the
+// boundary of this section, and it fails loudly rather than reading a null `_M_impl`.
+alignas(locale) unsigned char classic_locale_storage[sizeof(locale)] = {};
+
+}  // namespace
+
+const locale &locale::classic() {
+    return *reinterpret_cast<const locale *>(classic_locale_storage);
+}
+
+}  // namespace std
+
+// `use_facet<ctype<char>>`, defined under its mangled name.
+//
+// The obvious spelling is an explicit specialisation, and the compiler rejects it:
+// `<bits/locale_facets.tcc>` already contains an explicit *instantiation
+// declaration* for this exact specialisation, and specialising after that point is
+// ill-formed — `explicit specialization of 'use_facet<std::ctype<char>>' after
+// instantiation`. An explicit instantiation *definition* is accepted and is worse:
+// it instantiates the generic body, which reads `loc._M_impl->_M_facets` and would
+// dereference the null `_M_impl` of the storage above at the first call.
+//
+// So the definition is given the mangled name directly. The `asm` label is the whole
+// trick and there is nothing hidden in it: `_ZSt9use_facetISt5ctypeIcEERKT_RKSt6locale`
+// is what `const std::ctype<char>& std::use_facet<std::ctype<char>>(const
+// std::locale&)` mangles to, which `c++filt` will confirm and which the failing link
+// printed in full. Every caller reaches this function through that name, so binding
+// it here binds all of them.
+//
+// The name is checked rather than trusted: `scripts/qt-link.sh` fails if it is
+// wrong, because the symbol it is meant to satisfy is still undefined.
+//
+// It is at file scope and not in an unnamed namespace, which was the first attempt
+// and produced an object file with no such symbol in it: internal linkage plus `-O1`
+// is enough for the compiler to notice that nothing in *this* translation unit calls
+// it and drop it. An `asm` label renames a symbol; it does not make one survive.
+const std::ctype<char> &staros_use_facet_ctype_char(const std::locale &)
+    __asm__("_ZSt9use_facetISt5ctypeIcEERKT_RKSt6locale");
+
+// The locale argument is ignored, and that is the honest reading of a system with
+// one locale rather than a shortcut: there is no second `ctype<char>` for a
+// different `locale` to select.
+const std::ctype<char> &staros_use_facet_ctype_char(const std::locale &) {
+    return std::classic_ctype();
 }

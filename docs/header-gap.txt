@@ -76,7 +76,6 @@ scalbnl
 sinhl
 sinl
 sqrtl
-strcoll
 swprintf
 swscanf
 tanhl
@@ -92,8 +91,6 @@ vwscanf
 wcrtomb
 wcscat
 wcschr
-wcscmp
-wcscoll
 wcscpy
 wcscspn
 wcsftime
@@ -114,7 +111,6 @@ wcstoll
 wcstombs
 wcstoul
 wcstoull
-wcsxfrm
 wctob
 wctomb
 wmemchr

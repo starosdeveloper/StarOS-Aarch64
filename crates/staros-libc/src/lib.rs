@@ -476,12 +476,64 @@ mod exports {
         sys::exit(134) // 128 + SIGABRT, what a shell would report
     }
 
-    /// The stack-protector's failure handler. Programs are not built with
-    /// `-fstack-protector` here, but a library that omits this fails to link the
-    /// day somebody turns it on, with an error that names no source file.
+    /// The stack-protector's canary.
+    ///
+    /// The day somebody turned it on arrived: Qt's own build uses
+    /// `-fstack-protector-strong`, so every QtGui and QtCore object reads this
+    /// symbol at the top of a function and compares it at the bottom.
+    ///
+    /// It is a fixed value rather than a random one, and that is a real weakness
+    /// stated rather than hidden. A canary works because an attacker overflowing a
+    /// buffer cannot guess what to write back over it; a constant can be read out of
+    /// the image. Randomising it needs entropy at process start, which this system
+    /// has — `getentropy` is real — but it also needs the value in place before the
+    /// first guarded function runs, which means writing it from `_start` before any
+    /// C code is entered. That is a change to the entry path, not to this constant,
+    /// and it is worth doing when the entry path is next opened.
+    ///
+    /// What the fixed value still catches is the common case it was invented for: a
+    /// `strcpy` past the end of a local array, which overwrites the canary with
+    /// string bytes and a terminator rather than with the exact eight bytes below.
+    /// The bit pattern is chosen with that in mind — it contains a zero byte, so a
+    /// string copy cannot reproduce it, and a newline, so a line-oriented read
+    /// cannot either.
+    #[no_mangle]
+    pub static __stack_chk_guard: usize = 0x0000_0a5a_5a5a_5a5a;
+
+    /// The stack-protector's failure handler, called when the canary did not survive.
     #[no_mangle]
     pub extern "C" fn __stack_chk_fail() -> ! {
         stdio::write_bytes(b"[libc] stack smashing detected\n");
+        stdio::flush();
+        sys::exit(134)
+    }
+
+    /// `__clear_cache`: make newly written instructions visible to the fetcher.
+    ///
+    /// It stops the program, and unlike most refusals in this library that is not
+    /// because the service is missing — it is because reaching this function means
+    /// something already went wrong.
+    ///
+    /// Two facts about this system make run-time code generation impossible. The
+    /// loader gives every `PT_LOAD` segment its permissions once and EL0 has no way
+    /// to add execute to a page afterwards, so `mprotect` refuses `PROT_EXEC`. And
+    /// `SCTLR_EL1.UCI` is clear, so the cache maintenance instructions this function
+    /// would need — `dc cvau`, `ic ivau` — trap when executed at EL0.
+    ///
+    /// So a correct caller cannot exist here. The one that links is PCRE2's JIT,
+    /// which calls this after generating code into memory it will not have been
+    /// given; it is compiled into QtCore and never reached, because the allocation
+    /// fails first.
+    ///
+    /// Returning quietly was the alternative and it is the dangerous one: a caller
+    /// that believes the instruction cache was flushed proceeds to jump into code
+    /// the fetcher may not see, and what executes is whatever was at those addresses
+    /// before — arbitrary and different every run.
+    #[no_mangle]
+    pub extern "C" fn __clear_cache(_begin: *mut c_void, _end: *mut c_void) {
+        stdio::write_bytes(
+            b"[libc] __clear_cache: code was generated at run time, which cannot work here\n",
+        );
         stdio::flush();
         sys::exit(134)
     }

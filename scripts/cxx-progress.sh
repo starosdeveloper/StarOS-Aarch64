@@ -18,11 +18,32 @@
 # ## The number that matters is not the total
 #
 # The distribution's Qt is built *with* exceptions and RTTI, and this system builds
-# without both — so a fifth of the demand is `__cxa_throw`, `__gxx_personality_v0`,
-# `__dynamic_cast` and the type-info vtables, none of which a `-fno-exceptions
-# -fno-rtti` Qt references at all. They are counted apart rather than filtered out,
-# because "will disappear when the flag is set" is a prediction, and the honest
-# place for a prediction is beside the measurement rather than inside it.
+# without both — so part of the demand is `__cxa_throw`, `__gxx_personality_v0`,
+# `__dynamic_cast` and the type-info vtables. That group is counted apart rather than
+# filtered out, because "will disappear when the flag is set" is a prediction, and
+# the honest place for a prediction is beside the measurement rather than inside it.
+#
+# ## The prediction was tested, and it was half wrong
+#
+# Linking `services/qt-hello` against the Qt this tree actually cross-builds — with
+# `-fno-exceptions -fno-rtti` — named eight of this family as undefined:
+# `__cxa_throw`, `__cxa_allocate_exception`, `__cxa_begin_catch`, `__cxa_end_catch`,
+# `__cxa_rethrow`, `__cxa_current_exception_type`, `__gxx_personality_v0` and
+# `_Unwind_Resume`, plus the vtables of `__class_type_info` and
+# `__si_class_type_info`.
+#
+# The flag does not remove them, and the reason is that it was never going to: it
+# governs what *this* build's compiler emits from source, and these come out of
+# libstdc++'s headers, which contain `throw` in inline and template code regardless
+# of how the translation unit including them is compiled. All eight are now written
+# in `crates/staros-libc/cxx/runtime.cpp`, and every one of them stops the program
+# with a message rather than unwinding.
+#
+# What the flag *did* remove is the eleven still listed below. So the group is real
+# and the split within it was not visible from here — which is the argument for
+# printing the whole list under `--missing` rather than only the part outside the
+# filter. The first version of this script printed only the remainder, and the eight
+# names above never appeared in its output at all.
 #
 # Usage: cxx-progress.sh [--missing]
 set -uo pipefail
@@ -87,14 +108,23 @@ real=$((absent - exc))
 echo
 echo "  Qt leaves $demand C++ runtime symbol(s) to libstdc++"
 echo "  $present provided here, $absent absent"
-echo "  of the absent, $exc belong to exceptions and RTTI and go away with"
-echo "  -fno-exceptions -fno-rtti, which this system builds with"
+echo "  of the absent, $exc belong to exceptions and RTTI, and are absent from the"
+echo "  cross-built Qt's own link — measured, not predicted; see the note at the"
+echo "  top for the eight of this family that -fno-exceptions did *not* remove"
 echo
 echo "  $real actually to write"
 
 if [ "$MISSING" = 1 ]; then
+    # The whole list, exception machinery included. Printing only the remainder is
+    # what hid the eight names described at the top of this file: they were inside
+    # the filter, so no run of this script ever showed them, and they surfaced as
+    # link errors instead.
     echo
-    echo "  absent, without the exception and RTTI machinery:"
-    grep -vE "$EXCEPTIONS" "$WORK/absent" | sed 's/^/    /'
+    echo "  absent, all of it:"
+    if command -v c++filt >/dev/null 2>&1; then
+        c++filt <"$WORK/absent" | sed 's/^/    /'
+    else
+        sed 's/^/    /' "$WORK/absent"
+    fi
 fi
 exit 0

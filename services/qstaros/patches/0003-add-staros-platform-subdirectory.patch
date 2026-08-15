@@ -1,0 +1,22 @@
+Subject: [PATCH] platforms: build an out-of-tree plugin dropped into src/plugins/platforms
+
+The StarOS QPA plugin lives in its own repository and is symlinked in as
+src/plugins/platforms/staros. A QPA plugin needs Qt::GuiPrivate, which is
+versioned with the build and not part of the installed API, so building it
+in-tree is the arrangement every platform plugin already uses.
+
+Guarded on the directory existing, so the hunk is inert in any tree that
+does not have one.
+
+--- a/src/plugins/platforms/CMakeLists.txt
++++ b/src/plugins/platforms/CMakeLists.txt
+@@ -38,6 +38,9 @@
+ if(QT_FEATURE_linuxfb)
+     add_subdirectory(linuxfb)
+ endif()
++if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/staros/CMakeLists.txt")
++    add_subdirectory(staros)
++endif()
+ if(QT_FEATURE_vnc AND TARGET Qt::Network)
+     add_subdirectory(vnc)
+ endif()

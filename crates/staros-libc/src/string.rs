@@ -1119,6 +1119,105 @@ pub mod exports {
         // SAFETY: checked above, then forwarded.
         unsafe { strncpy(dst, src, n) }
     }
+
+    // ---- collation -------------------------------------------------------
+    //
+    // These were declared and deliberately left undefined, so that a program which
+    // actually needed locale-aware ordering would fail at the link naming the
+    // function rather than silently receive byte order. `services/qt-hello` is that
+    // program: `QCollator::compare` calls `wcscoll`, and with `-no-icu` there is no
+    // other path for it to take.
+    //
+    // So they are written, and the reasoning that kept them out is what decides what
+    // they do. Collation order is a property of the locale; this system has the C
+    // locale and no other — `crate::locale` accepts only `"C"` — and in the C locale
+    // collation order *is* code point order, by definition. That makes these
+    // complete rather than approximate: there is no second answer they are failing
+    // to give.
+    //
+    // What changes the day a second locale exists is that these need a collation
+    // table, and the check that catches it is `setlocale` refusing anything but
+    // `"C"` — the same guard `nl_langinfo` and `wctype` rest on.
+
+    /// `wcscmp`: code point order, and the primitive the other two are written in
+    /// terms of.
+    ///
+    /// # Safety
+    /// C ABI: both are NUL-terminated wide strings.
+    #[no_mangle]
+    pub unsafe extern "C" fn wcscmp(a: *const u32, b: *const u32) -> c_int {
+        let (mut a, mut b) = (a, b);
+        loop {
+            // SAFETY: the caller's contract; the loop stops at the first NUL, which
+            // is compared like any other value before it ends the walk.
+            let (x, y) = unsafe { (*a, *b) };
+            if x != y {
+                return if x < y { -1 } else { 1 };
+            }
+            if x == 0 {
+                return 0;
+            }
+            // SAFETY: neither is at its terminator, so both have another element.
+            unsafe {
+                a = a.add(1);
+                b = b.add(1);
+            }
+        }
+    }
+
+    /// `wcscoll`: collation order, which in the C locale is [`wcscmp`].
+    ///
+    /// Not a wrapper by accident — it is the same function because the locale says
+    /// so, and it is written as a call rather than a duplicate so that giving this
+    /// system a real collation table changes one body and not two.
+    ///
+    /// # Safety
+    /// As [`wcscmp`].
+    #[no_mangle]
+    pub unsafe extern "C" fn wcscoll(a: *const u32, b: *const u32) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { wcscmp(a, b) }
+    }
+
+    /// `wcsxfrm`: transform a string so that `wcscmp` on the results orders them the
+    /// way `wcscoll` orders the originals.
+    ///
+    /// In the C locale that transformation is the identity, which is what makes this
+    /// a copy. The return value is the length the result needed *excluding* the
+    /// terminator, and it is returned even when the buffer was too small — that is
+    /// how a caller learns what to allocate, and returning the copied length instead
+    /// would have it allocate the same insufficient size again.
+    ///
+    /// # Safety
+    /// C ABI: `src` is NUL-terminated; `dst` is valid for `n` wide characters.
+    #[no_mangle]
+    pub unsafe extern "C" fn wcsxfrm(dst: *mut u32, src: *const u32, n: usize) -> usize {
+        let mut length = 0usize;
+        // SAFETY: the caller's contract; the walk stops at the terminator.
+        while unsafe { *src.add(length) } != 0 {
+            length += 1;
+        }
+        if n > 0 {
+            let copy = length.min(n - 1);
+            // SAFETY: `copy` is inside both buffers, and the terminator is written
+            // at `copy`, which is at most `n - 1`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, dst, copy);
+                *dst.add(copy) = 0;
+            }
+        }
+        length
+    }
+
+    /// `strcoll`: the narrow form, and the same statement about the C locale.
+    ///
+    /// # Safety
+    /// C ABI: both are NUL-terminated.
+    #[no_mangle]
+    pub unsafe extern "C" fn strcoll(a: *const c_char, b: *const c_char) -> c_int {
+        // SAFETY: forwarded from the caller.
+        unsafe { strcmp(a, b) }
+    }
 }
 
 #[cfg(test)]
