@@ -138,6 +138,35 @@ int pthread_rwlock_clockwrlock(pthread_rwlock_t *l, int clock, const struct time
 int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void));
 int sched_yield(void);
 
+/* Cleanup handlers, as a matched pair of macros that open and close a block.
+ *
+ * On a system with thread cancellation these register a handler to run if the
+ * thread is cancelled inside the block. There is no cancellation here — a thread
+ * ends by returning or by `pthread_exit` — so the only path that ever runs the
+ * handler is the explicit `pthread_cleanup_pop(1)`, and that path is real and is
+ * what callers depend on. Qt uses the pair to call `QThreadPrivate::finish` on the
+ * way out of `QThreadPrivate::start` (`qthread_unix.cpp` lines 428 and 1009).
+ *
+ * The block is plain braces and *not* `do { ... } while (0)`, which is what glibc
+ * uses and what would be wrong here. A `do`/`while` is a loop, so a `break` or
+ * `continue` written inside the guarded region binds to it instead of to the
+ * caller's own loop — silently, with no diagnostic, changing which loop exits. Qt's
+ * `start` has exactly that shape: a `break` inside a retry loop inside the guarded
+ * region. Plain braces cannot capture either statement.
+ *
+ * What braces cost is that the two macros must be balanced within one scope, which
+ * POSIX requires anyway, and an unmatched one is now a compile error rather than
+ * something discovered later. */
+#define pthread_cleanup_push(routine, arg)                                     \
+    {                                                                          \
+        void (*__staros_cleanup_routine)(void *) = (routine);                  \
+        void *__staros_cleanup_arg = (arg);
+
+#define pthread_cleanup_pop(execute)                                           \
+        if (execute)                                                           \
+            __staros_cleanup_routine(__staros_cleanup_arg);                    \
+    }
+
 /* Live thread accounting, which no C library exposes and every debugging session
  * wants. Not POSIX; named so nobody mistakes it for it. */
 unsigned long staros_threads_live(void);

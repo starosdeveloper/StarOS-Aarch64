@@ -71,7 +71,15 @@ trap 'rm -f "$DEFINED" "$WEAK" "$DECLARED"' EXIT
 # type, so the extraction below reads the name as `void` and then reports that the
 # library fails to define it. Filtering the line is more honest than adding `void`
 # to the keyword list, which would hide the next one of these.
-grep -hvE '^[[:space:]]*typedef' "$INCLUDE"/*.h "$INCLUDE"/sys/*.h |
+#
+# `static inline` lines are dropped for the opposite reason: they are definitions,
+# not declarations. The function's body is right there in the header and every
+# translation unit that includes it gets its own copy, so there is nothing for the
+# archive to define and no symbol to look for. `sched.h`'s `__cpu_count` — the bit
+# count behind `CPU_COUNT` — was reported as a new gap on the day it was written,
+# which is this check being wrong rather than the header.
+grep -hvE '^[[:space:]]*(typedef|static[[:space:]]+inline)' \
+    "$INCLUDE"/*.h "$INCLUDE"/sys/*.h "$INCLUDE"/linux/*.h "$INCLUDE"/netinet/*.h |
     grep -oE '^[a-z_][a-zA-Z0-9_ *]*\**[[:space:]]+\**([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\(' |
     grep -oE '[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\($' |
     tr -d ' (' |

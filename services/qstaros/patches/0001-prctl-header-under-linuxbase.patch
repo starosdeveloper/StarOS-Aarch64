@@ -1,0 +1,17 @@
+Subject: [PATCH] qthread_unix: include <sys/prctl.h> whenever prctl() is called
+
+The include was guarded by Q_OS_LINUX && !QT_LINUXBASE while the call it
+serves is guarded by Q_OS_LINUX alone, so any QT_LINUXBASE build fails with
+"use of undeclared identifier 'PR_SET_NAME'".
+
+--- a/src/corelib/thread/qthread_unix.cpp
++++ b/src/corelib/thread/qthread_unix.cpp
+@@ -43,7 +43,7 @@
+ #include <sys/pstat.h>
+ #endif
+ 
+-#if defined(Q_OS_LINUX) && !defined(QT_LINUXBASE)
++#if defined(Q_OS_LINUX)
+ #include <sys/prctl.h>
+ #endif
+ 

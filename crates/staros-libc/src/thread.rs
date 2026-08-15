@@ -449,6 +449,18 @@ pub struct Sem {
     _pad: usize,
 }
 
+/// `sem_t` is 32 bytes in <semaphore.h>, and the two halves have to agree.
+///
+/// The size is the ABI, not an implementation detail: callers embed a `sem_t` in
+/// their own structures and this library writes through the pointer they hand back.
+/// A disagreement would not be caught by any test — `sem_init` would zero the right
+/// number of bytes according to *this* side, and the caller's neighbouring field
+/// would be the one that changed.
+const _: () = {
+    assert!(core::mem::size_of::<Sem>() == 32);
+    assert!(core::mem::align_of::<Sem>() == 8);
+};
+
 /// A reader/writer lock.
 ///
 /// POSIX gives readers and writers one `unlock`, so the lock has to remember which
@@ -1151,6 +1163,18 @@ pub mod exports {
     }
 
     // ---- semaphores ---------------------------------------------------------
+    //
+    // These report failure differently from everything above them, and the
+    // difference is POSIX's rather than this library's: the `pthread_*` functions
+    // return the error number, while `sem_*` return -1 and set `errno`, like an
+    // ordinary syscall wrapper. They sit in the same module and look like siblings,
+    // which is exactly why it is written down here.
+    //
+    // `sem_trywait` returned `EAGAIN` — 11, a positive number — until this was
+    // noticed. Every caller checking `== -1` read that as success and went on to use
+    // a semaphore it had not acquired. Nothing in this tree called it, which is why
+    // it survived; Qt calls `sem_timedwait`, which is what brought the whole family
+    // under review.
 
     /// # Safety
     /// C ABI: `s` points at a `sem_t`.
@@ -1221,6 +1245,44 @@ pub mod exports {
         }
     }
 
+    /// `sem_timedwait`: [`sem_wait`] with a deadline.
+    ///
+    /// It spins with a yield rather than parking, and that is the same limitation
+    /// [`pthread_mutex_timedlock`] has for the same reason: the kernel's parkers
+    /// have no notion of a deadline, so a parked thread has nothing to wake it when
+    /// the time arrives. A waiter therefore burns its timeslice until the semaphore
+    /// is posted or the deadline passes. Giving the kernel timed parking is a change
+    /// to the kernel, not to this function.
+    ///
+    /// With no clock at all the deadline can never be observed to pass and a waiting
+    /// loop would never end, so that case refuses with `EINVAL` — an answer a caller
+    /// can act on — rather than hanging.
+    ///
+    /// # Safety
+    /// As [`sem_init`]; `deadline` is null or a readable `timespec`.
+    #[no_mangle]
+    pub unsafe extern "C" fn sem_timedwait(
+        s: *mut Sem,
+        deadline: *const crate::time::Timespec,
+    ) -> c_int {
+        if deadline.is_null() {
+            return crate::fail(EINVAL, -1);
+        }
+        // SAFETY: the caller passes a readable `timespec`.
+        let want = unsafe { crate::time::join((*deadline).tv_sec, (*deadline).tv_nsec) };
+        loop {
+            // SAFETY: forwarded from the caller.
+            if unsafe { sem_trywait(s) } == 0 {
+                return 0;
+            }
+            match sys::clock_now() {
+                Some(now) if now >= want => return crate::fail(110, -1), // ETIMEDOUT
+                None => return crate::fail(EINVAL, -1),
+                _ => sys::yield_now(),
+            }
+        }
+    }
+
     /// # Safety
     /// As [`sem_init`].
     #[no_mangle]
@@ -1228,7 +1290,7 @@ pub mod exports {
         // SAFETY: forwarded from the caller.
         let count = unsafe { (*s).count.load(Ordering::Acquire) };
         if count == 0 {
-            return EAGAIN;
+            return crate::fail(EAGAIN, -1);
         }
         // SAFETY: as above.
         let taken = unsafe {
@@ -1239,7 +1301,9 @@ pub mod exports {
         if taken {
             0
         } else {
-            EAGAIN
+            // Lost the race to another thread, which is indistinguishable from
+            // having found it at zero — and `EAGAIN` is what POSIX says for both.
+            crate::fail(EAGAIN, -1)
         }
     }
 

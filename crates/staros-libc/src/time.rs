@@ -652,6 +652,45 @@ pub mod exports {
         sys::clock_now().map_or(-1, |n| (n / 1000) as i64)
     }
 
+    /// `struct tms`, in glibc's layout: four clock-tick counts.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Tms {
+        pub tms_utime: i64,
+        pub tms_stime: i64,
+        pub tms_cutime: i64,
+        pub tms_cstime: i64,
+    }
+
+    /// `times`: the same accounting [`clock`] does not have, in a different shape.
+    ///
+    /// The kernel keeps no per-process CPU time, so the split this interface exists
+    /// to report — user against system, this process against its children — cannot
+    /// be made. The four fields are therefore all zero, and that is a *true*
+    /// statement in the shape the interface allows: this program has been credited
+    /// with no measured CPU time, because nothing measured any.
+    ///
+    /// The return value carries the part that is real. `times` returns elapsed time
+    /// since an arbitrary point in the past, and elapsed time is exactly what this
+    /// system does have — so a caller timing an interval by subtracting two returns
+    /// gets a correct answer, which is what `times` is usually used for. Returning
+    /// `(clock_t)-1` instead would be reporting a failure that did not happen.
+    ///
+    /// Qt reaches it through `qtimerinfo_unix.cpp`.
+    ///
+    /// # Safety
+    /// C ABI: `out` is null or valid for one `struct tms`.
+    #[no_mangle]
+    pub unsafe extern "C" fn times(out: *mut Tms) -> i64 {
+        if !out.is_null() {
+            // SAFETY: the caller's contract.
+            unsafe { out.write(Tms::default()) };
+        }
+        // Ticks are `CLOCKS_PER_SEC` = 1_000_000 per second here, the same unit
+        // `clock` reports in, so the two agree with each other.
+        sys::clock_now().map_or(-1, |n| (n / 1000) as i64)
+    }
+
     /// # Safety
     /// C ABI.
     #[no_mangle]

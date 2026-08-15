@@ -91,15 +91,73 @@ typedef void (*__sighandler_t)(int);
 #define SA_NODEFER   0x40000000
 #define SA_RESETHAND 0x80000000
 
+/* What an `SA_SIGINFO` handler is told about a signal.
+ *
+ * Never filled in — nothing here delivers a signal, so no handler is ever called
+ * with one — and it exists anyway, for the same reason `struct rusage` does in
+ * <sys/resource.h>: a handler's *signature* mentions it, and a type that is only
+ * ever pointed at still has to be complete for the pointer types to match.
+ *
+ * The size is glibc's 128 bytes. The union is what makes that number real: the same
+ * storage means `si_pid` for a SIGCHLD and `si_addr` for a SIGSEGV, and a structure
+ * that declared only the members used here would be a different size and a different
+ * ABI. */
+typedef struct {
+    int si_signo;
+    int si_errno;
+    int si_code;
+    int __pad0;
+    union {
+        int __pad[28];
+        struct {
+            pid_t si_pid;
+            uid_t si_uid;
+            int si_status;
+            long si_utime;
+            long si_stime;
+        } __child;
+        struct {
+            void *si_addr;
+        } __fault;
+    } __fields;
+} siginfo_t;
+
+/* glibc's accessor macros, which are how these members are named in code — the
+ * union is an implementation detail of the layout, not something callers write. */
+#define si_pid    __fields.__child.si_pid
+#define si_uid    __fields.__child.si_uid
+#define si_status __fields.__child.si_status
+#define si_utime  __fields.__child.si_utime
+#define si_stime  __fields.__child.si_stime
+#define si_addr   __fields.__fault.si_addr
+
+typedef void (*__sigaction_handler_t)(int, siginfo_t *, void *);
+
 struct sigaction {
-    /* Named `sa_handler` and not a union: `SA_SIGINFO` handlers take three
-     * arguments, and a program that sets one casts it. Offering the union would
-     * mean offering `siginfo_t`, which nothing here can fill in truthfully. */
-    void *sa_handler;
+    /* A union, as glibc has it, and not the `void *` this was first written with.
+     *
+     * The two members are the two shapes a handler can have — one argument, or
+     * three under `SA_SIGINFO` — and C++ will not convert between a function pointer
+     * and `void *` at all. Qt found it in one line: `qcore_unix.cpp` line 33 writes
+     * `noaction.sa_handler = SIG_IGN`, and against a `void *` member the error is
+     * `assigning to 'void *' from '__sighandler_t' converts between void pointer and
+     * function pointer`. The union is not a convenience here; it is the only way the
+     * assignment is legal.
+     *
+     * Both members occupy the same eight bytes, so the structure's size and the
+     * offsets `crates/staros-libc/src/proc.rs` asserts are unchanged. */
+    union {
+        __sighandler_t sa_handler;
+        __sigaction_handler_t sa_sigaction;
+    } __handler;
     sigset_t sa_mask;
     int sa_flags;
     void *sa_restorer;
 };
+
+/* Written as members in every program that uses them. */
+#define sa_handler   __handler.sa_handler
+#define sa_sigaction __handler.sa_sigaction
 
 int sigemptyset(sigset_t *set);
 int sigfillset(sigset_t *set);

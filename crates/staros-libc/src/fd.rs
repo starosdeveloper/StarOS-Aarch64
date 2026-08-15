@@ -37,6 +37,15 @@ pub(crate) const MAX_FDS: usize = 32;
 /// The first descriptor handed out. 0, 1 and 2 are the standard streams.
 pub(crate) const FIRST_FD: c_int = 3;
 
+/// How many descriptors a program can have open at once, standard streams included.
+///
+/// The one number for this, so that `OPEN_MAX` in <limits.h> and
+/// `getrlimit(RLIMIT_NOFILE)` cannot answer differently. They did: `getrlimit`
+/// reported [`MAX_FDS`], which is the size of the *pool* and three short of the
+/// truth — 0, 1 and 2 exist without occupying a pool entry. A program that trusted
+/// it and opened files until it hit 32 would still have had three left.
+pub(crate) const MAX_OPEN: usize = MAX_FDS + FIRST_FD as usize;
+
 /// How many waitable objects (eventfds and pipes) may exist at once. Each costs two
 /// notifications from the start-up pool — one for each direction.
 const MAX_WAITABLES: usize = 8;

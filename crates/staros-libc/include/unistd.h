@@ -51,6 +51,21 @@ ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
 off_t lseek(int fd, off_t offset, int whence);
 int ftruncate(int fd, off_t length);
+int truncate(const char *path, off_t length);
+
+/* The large-file spellings, as real symbols rather than macros.
+ *
+ * `crates/staros-libc/src/file.rs` exports both names for each of these, so unlike
+ * the `stat` family in <sys/stat.h> there is a definition to point a declaration at
+ * and no reason to preprocess the name away. Either spelling is the same code —
+ * `off_t` here has been 64 bits since the first version of this library.
+ *
+ * Qt writes `::lseek64` with the scope operator (`qfile.cpp` line 1103), which is
+ * what makes a declaration necessary and what a `-D` on the command line could not
+ * have fixed. */
+off_t lseek64(int fd, off_t offset, int whence);
+int ftruncate64(int fd, off_t length);
+int truncate64(const char *path, off_t length);
 int fsync(int fd);
 
 int dup(int fd);
@@ -72,8 +87,22 @@ int rmdir(const char *path);
 int access(const char *path, int mode);
 int chdir(const char *path);
 char *getcwd(char *buf, size_t size);
+int fchdir(int fd);
 ssize_t readlink(const char *path, char *buf, size_t size);
 int symlink(const char *target, const char *link);
+int link(const char *from, const char *to);
+
+/* The `*at` forms, which take a directory descriptor a relative path is resolved
+ * against. They refuse for the same reasons their plain counterparts do — the
+ * filesystem is read-only — and they are declared because Qt calls them by name:
+ * `qfilesystemengine_unix.cpp` reaches `unlinkat` twice, `linkat` once and
+ * `renameat` twice, in code that has no plain-path fallback. */
+int unlinkat(int dirfd, const char *path, int flags);
+int linkat(int fromfd, const char *from, int tofd, const char *to, int flags);
+int renameat(int fromfd, const char *from, int tofd, const char *to);
+int renameat2(int fromfd, const char *from, int tofd, const char *to, unsigned int flags);
+/* Plain `rename` is in <stdio.h>, where C puts it. `AT_REMOVEDIR`, which `unlinkat`
+ * takes, is in <fcntl.h> with the other `AT_` flags. */
 
 int dup3(int old_fd, int new_fd, int flags);
 

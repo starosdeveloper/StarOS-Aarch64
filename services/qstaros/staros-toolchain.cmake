@@ -66,18 +66,60 @@ set(STAROS_COMMON_FLAGS
     # side of this tree works and why the flag looked harmless. What it would have
     # bought is covered already: `-nostdlibinc` keeps the host's headers out and
     # `-fno-builtin` stops the compiler assuming library functions it can inline.
-    "-nostdlibinc -isystem ${STAROS_SYSROOT} -fno-builtin"
+    #
+    # The sysroot is *not* here — see STAROS_SYSROOT_FLAG below. Its position on the
+    # command line differs between C and C++ and the difference is load-bearing.
+    "-nostdlibinc -fno-builtin"
     "-fno-omit-frame-pointer -fno-stack-protector -fno-pie"
     # Qt reads the operating system from compiler macros, and a bare-metal target
     # defines none — `qsystemdetection.h` stops with "Qt has not been ported to this
     # OS". See the note on CMAKE_SYSTEM_NAME above: this is the ABI statement, made
     # where the compiler can see it.
-    "-D__linux__=1 -D__unix__=1")
+    "-D__linux__=1 -D__unix__=1"
+    # And the qualifier on that claim, which Qt itself provides.
+    #
+    # `__linux__` says "this ABI is Linux's", which is true. It does *not* say "every
+    # Linux syscall is here", which is not — and Qt reads the first as the second in
+    # a handful of places. The sharpest is `qfutex_linux_p.h`: on any `Q_OS_LINUX`
+    # target Qt implements every mutex, semaphore and read-write lock as a raw
+    # `syscall(__NR_futex, ...)`, and the first sign of trouble is
+    # `fatal error: 'asm/unistd.h' file not found` — a header about syscall numbers,
+    # from a file about locking.
+    #
+    # `QT_LINUXBASE` is Qt's own name for exactly this situation: Linux ABI, reduced
+    # syscall surface. It is what the LSB builds set, and the comment beside the
+    # futex selection reads "use Linux mutexes everywhere except for LSB builds". It
+    # steers four decisions in the sources this build compiles — futexes,
+    # `pthread_setname_np`, inotify, and one FreeType include path — and in every one
+    # of them the LSB branch is the branch that is true here.
+    #
+    # What Qt falls back to is the POSIX threading this library already provides:
+    # `crates/staros-libc/src/thread.rs` has mutexes and condition variables over the
+    # kernel's `NotifySignal`/`Wait`, which is the same primitive a futex is, reached
+    # by the name this system actually uses.
+    "-DQT_LINUXBASE=1")
 string(REPLACE ";" " " STAROS_COMMON_FLAGS "${STAROS_COMMON_FLAGS}")
 
-set(CMAKE_C_FLAGS_INIT "${STAROS_COMMON_FLAGS}")
+set(STAROS_SYSROOT_FLAG "-isystem ${STAROS_SYSROOT}")
+
+# In C++, the libstdc++ directories come *before* the C sysroot, and that ordering is
+# the whole reason this is written out instead of appended.
+#
+# libstdc++'s `<cmath>` is not a self-contained header: line 55 is
+# `#include_next <math.h>`, and `#include_next` resumes the search at the entry
+# *after* the directory the current file was found in. With the sysroot listed first,
+# there is nothing after `/usr/include/c++/16` to resume into, and the message is
+#
+#     /usr/include/c++/16/cmath:55:15: fatal error: 'math.h' file not found
+#
+# about a `math.h` that exists, in a directory that is on the command line. Every
+# libstdc++ C-compatibility header — <cmath>, <cstdio>, <cstdlib>, <cstring>,
+# <cwchar> — works the same way, so this ordering is what makes any of them usable.
+#
+# The C compiler has no such wrapper layer and takes the sysroot on its own.
+set(CMAKE_C_FLAGS_INIT "${STAROS_COMMON_FLAGS} ${STAROS_SYSROOT_FLAG}")
 set(CMAKE_CXX_FLAGS_INIT
-    "${STAROS_COMMON_FLAGS} -isystem ${STAROS_CXX_INCLUDE} -isystem ${STAROS_CXX_TARGET_INCLUDE} -fno-exceptions -fno-rtti")
+    "${STAROS_COMMON_FLAGS} -isystem ${STAROS_CXX_INCLUDE} -isystem ${STAROS_CXX_TARGET_INCLUDE} ${STAROS_SYSROOT_FLAG} -fno-exceptions -fno-rtti")
 
 # Static everything. There is no dynamic loader here — `dlopen` refuses, and the
 # kernel's ELF loader gives `PT_LOAD` fixed permissions — so a plugin is linked in
@@ -94,6 +136,34 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+# And pkg-config, which walks around all four of those.
+#
+# `CMAKE_FIND_ROOT_PATH_MODE_*` constrain CMake's own `find_library` and
+# `find_path`. `pkg_check_modules` does not use either: it runs `/usr/bin/pkg-config`,
+# which reads the *host's* `/usr/lib/pkgconfig` and answers about the host's
+# packages. Qt's configure asked it about libb2, jemalloc, libsystemd and at-spi2,
+# was told yes to all four, and put `-I/usr/include` on every compile line in QtCore.
+#
+# `-nostdlibinc` does not survive that. It removes the compiler's default include
+# paths; an explicit `-I/usr/include` puts glibc's headers back, ahead of the
+# `-isystem` sysroot, and the build then compiles this system's programs against the
+# host's C library. The error arrives from a header that is not wrong — glibc's
+# `bits/floatn.h` typedefs `__float128`, aarch64 does not have it, and the message
+# names a file nobody in this tree included:
+#
+#     /usr/include/bits/floatn.h:97:9: error: __float128 is not supported on this target
+#
+# Pointing PKG_CONFIG_LIBDIR at a directory with no `.pc` files in it is how
+# pkg-config is told the target has no packages, which is true — this system has
+# exactly the libraries in `crates/` and they do not ship pkg-config metadata. The
+# executable is left findable so that a `pkg_check_modules` call still *runs* and
+# still answers, rather than erroring out about a missing tool.
+set(STAROS_EMPTY_PKGCONFIG "${CMAKE_BINARY_DIR}/staros-no-pkgconfig")
+file(MAKE_DIRECTORY "${STAROS_EMPTY_PKGCONFIG}")
+set(ENV{PKG_CONFIG_LIBDIR} "${STAROS_EMPTY_PKGCONFIG}")
+set(ENV{PKG_CONFIG_PATH} "")
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "${STAROS_ROOT}")
 
 # Linking, which is where a cross build usually goes wrong quietly.
 #

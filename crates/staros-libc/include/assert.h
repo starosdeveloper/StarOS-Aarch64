@@ -29,6 +29,27 @@ void __assert_fail(const char *expression, const char *file, unsigned int line,
 }
 #endif
 
+/* `static_assert` in C, which is this header's job and not the compiler's.
+ *
+ * C11 spells the keyword `_Static_assert` and puts the spelling everyone writes in
+ * <assert.h> as a macro. C++ has had `static_assert` as a keyword since C++11 and
+ * needs nothing here; C23 promoted it to a keyword too, and then the macro must not
+ * exist, because `#define static_assert` over a keyword is what breaks a C23
+ * translation unit.
+ *
+ * Qt found this. `qtypes.h` line 182, in its `#ifndef __cplusplus` half, opens with
+ * `static_assert(sizeof(ptrdiff_t) == sizeof(size_t), ...)` — every C file in the
+ * build reaches it through `qglobal.h`, and without the macro the compiler reads a
+ * function declaration returning implicit int and stops three errors later at a
+ * string literal where a parameter name should be. None of the three messages says
+ * "assert.h".
+ */
+#if !defined(__cplusplus) && !defined(static_assert)
+#if __STDC_VERSION__ < 202311L
+#define static_assert _Static_assert
+#endif
+#endif
+
 #endif /* _ASSERT_H */
 
 /* Deliberately outside the include guard: the standard requires `assert` to be

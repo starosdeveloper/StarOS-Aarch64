@@ -60,6 +60,7 @@ pub mod ctype;
 pub mod cxx;
 pub mod dir;
 pub mod fd;
+pub mod fenv;
 pub mod fmt;
 pub mod file;
 pub mod heap;

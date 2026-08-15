@@ -77,9 +77,6 @@ sinhl
 sinl
 sqrtl
 strcoll
-strtoll
-strtoul
-strtoull
 swprintf
 swscanf
 tanhl

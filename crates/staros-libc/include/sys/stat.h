@@ -46,10 +46,27 @@ struct stat {
     unsigned int __unused[2];
 };
 
-/* `stat64` is the same structure. Large-file support is not a variant here: this
- * target's `off_t` has been 64 bits from the start, so the two names describe one
- * layout and a program compiled either way gets the same bytes. */
-#define stat64 stat
+/* The large-file names, all of them, as macros onto the plain ones.
+ *
+ * Large-file support is not a variant here: this target's `off_t` has been 64 bits
+ * from the start, so `struct stat64` and `struct stat` describe one layout and
+ * `fstat64` and `fstat` are one function. musl does exactly this, and the reason to
+ * follow it rather than declare four more symbols is that a macro cannot drift —
+ * there is no second declaration to keep in step with the first.
+ *
+ * Qt's mkspec defines `QT_USE_XOPEN_LFS_EXTENSIONS` and then writes `::fstat64`
+ * with the scope operator, which is why the struct macro alone was not enough:
+ * `qsysinfo.cpp` lines 251 and 331 stopped at `no member named 'fstat64' in the
+ * global namespace`. The macro rewrites the name before the compiler looks it up, so
+ * `::fstat64(fd, &st)` becomes `::fstat(fd, &st)` and resolves.
+ *
+ * `crates/staros-libc/src/file.rs` also exports the `64` names as real symbols, for
+ * anything that reaches them without this header — a prebuilt object, a program that
+ * declares them itself. They are aliases of the same code. */
+#define stat64   stat
+#define fstat64  fstat
+#define lstat64  lstat
+#define fstatat64 fstatat
 
 #define st_atime st_atim_sec
 #define st_mtime st_mtim_sec
@@ -105,6 +122,7 @@ int fstatat(int dirfd, const char *path, struct stat *out, int flags);
 int mkdir(const char *path, mode_t mode);
 int mkdirat(int dirfd, const char *path, mode_t mode);
 int chmod(const char *path, mode_t mode);
+int fchmod(int fd, mode_t mode);
 
 #ifdef __cplusplus
 }

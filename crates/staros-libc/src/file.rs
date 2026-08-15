@@ -958,6 +958,26 @@ pub mod exports {
         }
     }
 
+    /// `flock`: refused with `ENOLCK`, for the same reason `fcntl`'s locking
+    /// commands are.
+    ///
+    /// A lock is a promise about what some *other* process will be prevented from
+    /// doing, and nothing here can make that promise: the filesystem is one
+    /// read-only archive, there is no lock table in the file server, and a second
+    /// process asking for the same lock would be told yes as readily as the first.
+    /// Returning 0 is the tempting answer — every caller's happy path — and it is
+    /// exactly the wrong one, because a caller that believes it holds an exclusive
+    /// lock proceeds to do the thing the lock was protecting.
+    ///
+    /// `ENOLCK` rather than `ENOSYS`: POSIX defines it as "no locks available",
+    /// which is precisely the situation, and `flock`'s callers are written to expect
+    /// it. Qt's `QLockFile` treats it as a failure to acquire and reports that
+    /// upward, which is true.
+    #[no_mangle]
+    pub extern "C" fn flock(_fd: c_int, _operation: c_int) -> c_int {
+        crate::fail(37, -1) // ENOLCK
+    }
+
     /// `ioctl`: there are no devices behind these descriptors, so every request is
     /// refused. A libc that returned 0 would tell a program its terminal request
     /// succeeded and leave it using an uninitialised `struct winsize`.
@@ -1028,7 +1048,10 @@ pub mod exports {
         utimensat(dirfd: c_int, path: *const c_char, times: *const core::ffi::c_void, flags: c_int),
         chdir(path: *const c_char),
         fchdir(fd: c_int),
-        flock(fd: c_int, operation: c_int),
+        // `flock` was here and has moved out, because `EROFS` was the wrong reason.
+        // A *shared* lock on a file opened for reading is a legal thing to want on a
+        // read-only filesystem, so "read-only filesystem" does not explain the
+        // refusal; see [`flock`] for the one that does.
         shm_open(name: *const c_char, flags: c_int, mode: u32),
         shm_unlink(name: *const c_char),
     }

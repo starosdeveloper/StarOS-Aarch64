@@ -65,8 +65,28 @@ extern "C" {
 #define F_SETLKW 7
 #define FD_CLOEXEC 1
 
+/* The lock types, and the record they describe. Nothing here grants a lock — see
+ * <sys/file.h> for why — but `F_GETLK` and friends take a pointer to one of these,
+ * and callers declare one on the stack. `qlockfile_unix.cpp` line 117 does. */
+#define F_RDLCK 0
+#define F_WRLCK 1
+#define F_UNLCK 2
+
+struct flock {
+    short l_type;
+    short l_whence;
+    off_t l_start;
+    off_t l_len;
+    pid_t l_pid;
+};
+
 int open(const char *path, int flags, ...);
 int openat(int dirfd, const char *path, int flags, ...);
+/* The large-file spelling, a real symbol in `crates/staros-libc/src/file.rs` and the
+ * same code — `off_t` is 64 bits here either way. `openat64` has no symbol and gets
+ * the macro, since there is nothing for it to do differently. */
+int open64(const char *path, int flags, ...);
+#define openat64 openat
 int fcntl(int fd, int cmd, ...);
 
 #ifdef __cplusplus

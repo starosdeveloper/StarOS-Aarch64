@@ -26,7 +26,34 @@ int atoi(const char *s);
 long strtol(const char *s, char **end, int base);
 int abs(int value);
 
+/* The environment, all of it, implemented in `crates/staros-libc/src/proc.rs`.
+ *
+ * `putenv` is the odd one and its signature is why Qt found it: it takes a
+ * *non-const* `char *` and keeps the caller's string rather than copying it, so the
+ * caller's buffer becomes part of the environment and freeing it corrupts it.
+ * `setenv` copies. Qt uses both — `qtenvironmentvariables.cpp` line 289 — and with
+ * only `getenv` declared the compiler guessed, giving two errors from one cause:
+ * `cannot initialize a variable of type 'int' with an rvalue of type 'char *'` on
+ * line 287, then `use of undeclared identifier 'putenv'` on 289. */
 char *getenv(const char *name);
+/* Refuses to answer for a setuid program. There is no setuid here, so it is
+ * `getenv` — declared because glibc has it and libraries reach for it. */
+char *secure_getenv(const char *name);
+int setenv(const char *name, const char *value, int overwrite);
+int unsetenv(const char *name);
+int putenv(char *entry);
+int clearenv(void);
+
+/* `realpath`: the absolute path with `.`, `..` and any symbolic links resolved.
+ *
+ * There are no symbolic links here, so the resolution is purely textual — which
+ * makes it complete rather than approximate: with nothing to follow, normalising the
+ * path *is* the answer. Implemented in `crates/staros-libc/src/file.rs`.
+ *
+ * `resolved` must point at `PATH_MAX` bytes (<limits.h>) or be null, in which case
+ * the result is allocated and the caller frees it. Qt passes a `PATH_MAX` buffer —
+ * `qfilesystemengine_unix.cpp` line 1966. */
+char *realpath(const char *path, char *resolved);
 
 /* The rest of C's <stdlib.h>, declared because libstdc++'s <cstdlib> imports the
  * whole of it into namespace std and will not compile without the names. Only the

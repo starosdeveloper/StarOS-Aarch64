@@ -180,6 +180,73 @@ pub(crate) fn strtol(s: &[u8], base: c_int) -> (i64, usize) {
     (value, i)
 }
 
+/// `strtoul`: the same shape as [`strtol`], accumulating unsigned.
+///
+/// Not a wrapper around `strtol`, and the reason is the range between `i64::MAX`
+/// and `u64::MAX`. Those values are representable and `strtol` saturates them all
+/// to `i64::MAX` — and they are exactly what a caller reaching for `strtoul`
+/// usually has: a 64-bit identifier, a hash, a bit mask written in hex.
+///
+/// A leading `-` is accepted and negates, as C requires. That is genuinely strange
+/// and it is the standard's: `strtoul("-1")` is `ULONG_MAX`, not an error, and a
+/// program relying on it exists somewhere.
+pub(crate) fn strtoul(s: &[u8], base: c_int) -> (u64, usize) {
+    let mut i = 0;
+    while i < s.len() && (s[i] == b' ' || (0x09..=0x0d).contains(&s[i])) {
+        i += 1;
+    }
+    let negative = match s.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let mut base = base;
+    if (base == 0 || base == 16)
+        && s.get(i) == Some(&b'0')
+        && matches!(s.get(i + 1), Some(b'x' | b'X'))
+        && s.get(i + 2).is_some_and(|c| digit(*c, 16).is_some())
+    {
+        i += 2;
+        base = 16;
+    } else if base == 0 {
+        base = if s.get(i) == Some(&b'0') { 8 } else { 10 };
+    }
+
+    let start = i;
+    let mut value: u64 = 0;
+    let mut saturated = false;
+    while let Some(d) = s.get(i).and_then(|c| digit(*c, base)) {
+        value = match value
+            .checked_mul(base as u64)
+            .and_then(|v| v.checked_add(u64::from(d)))
+        {
+            Some(v) => v,
+            None => {
+                saturated = true;
+                u64::MAX
+            }
+        };
+        i += 1;
+    }
+    if i == start {
+        return (0, 0);
+    }
+    let value = if saturated {
+        u64::MAX
+    } else if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    };
+    (value, i)
+}
+
 /// One digit in `base`, or `None`.
 fn digit(c: u8, base: c_int) -> Option<u8> {
     let v = match c {
@@ -464,6 +531,100 @@ pub mod exports {
     #[no_mangle]
     pub extern "C" fn labs(v: i64) -> i64 {
         v.wrapping_abs()
+    }
+
+    /// The `<inttypes.h>` family: the same operations over `intmax_t`, which on
+    /// this target is `long`. Separate symbols because the *type* is what a caller
+    /// named, and the day `intmax_t` is not `long` these are the four that change.
+    #[no_mangle]
+    pub extern "C" fn imaxabs(v: i64) -> i64 {
+        v.wrapping_abs()
+    }
+
+    #[no_mangle]
+    pub extern "C" fn imaxdiv(numer: i64, denom: i64) -> LdivT {
+        ldiv(numer, denom)
+    }
+
+    /// # Safety
+    /// C ABI: as [`strtol`].
+    #[no_mangle]
+    pub unsafe extern "C" fn strtoimax(
+        s: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> i64 {
+        // SAFETY: forwarded from the caller.
+        unsafe { strtol(s, end, base) }
+    }
+
+    /// The unsigned parse.
+    ///
+    /// The digits are accumulated as **unsigned**, which is the whole difference
+    /// from `strtol` and not a detail: a value between `LONG_MAX` and `ULONG_MAX`
+    /// is representable here and saturates in `strtol`. A `strtoul` that forwarded
+    /// to `strtol` would turn every such number into `LONG_MAX` — and the numbers
+    /// in that range are exactly the ones a program parses with `strtoul` on
+    /// purpose, like a 64-bit hash written in hex.
+    ///
+    /// # Safety
+    /// C ABI: `s` is a NUL-terminated string; `end`, if not null, receives the
+    /// first byte not consumed.
+    #[no_mangle]
+    pub unsafe extern "C" fn strtoul(
+        s: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> u64 {
+        // SAFETY: forwarded from the caller.
+        let bytes = unsafe { as_bytes(s) };
+        let (value, used) = super::strtoul(bytes, base);
+        if !end.is_null() {
+            // SAFETY: the caller passes a writable pointer, as the prototype says.
+            unsafe { *end = s.add(used) as *mut c_char };
+        }
+        value
+    }
+
+    /// # Safety
+    /// C ABI: as [`strtoul`].
+    #[no_mangle]
+    pub unsafe extern "C" fn strtoumax(
+        s: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> u64 {
+        // SAFETY: forwarded from the caller.
+        unsafe { strtoul(s, end, base) }
+    }
+
+    /// `strtoll` and `strtoull`, which are `strtol` and `strtoul` here: `long` and
+    /// `long long` are both 64 bits on this target. Declared and defined separately
+    /// because a caller wrote one name or the other, and a program compiled for a
+    /// system where they differ must keep meaning what it said.
+    ///
+    /// # Safety
+    /// C ABI: as [`strtol`].
+    #[no_mangle]
+    pub unsafe extern "C" fn strtoll(
+        s: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> i64 {
+        // SAFETY: forwarded from the caller.
+        unsafe { strtol(s, end, base) }
+    }
+
+    /// # Safety
+    /// C ABI: as [`strtol`].
+    #[no_mangle]
+    pub unsafe extern "C" fn strtoull(
+        s: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> u64 {
+        // SAFETY: forwarded from the caller.
+        unsafe { strtoul(s, end, base) }
     }
 
     #[no_mangle]
@@ -966,6 +1127,46 @@ mod tests {
 
     fn s(text: &str) -> &[u8] {
         text.as_bytes()
+    }
+
+    #[test]
+    fn strtoul_keeps_the_range_strtol_saturates() {
+        // The whole reason `strtoul` is not a wrapper. Every one of these is
+        // representable as `u64` and larger than `i64::MAX`, so `strtol` answers
+        // `i64::MAX` for all four and cannot tell them apart.
+        for (text, want) in [
+            ("9223372036854775808", 9_223_372_036_854_775_808u64),
+            ("18446744073709551615", u64::MAX),
+            ("0xffffffffffffffff", u64::MAX),
+            ("0xdeadbeefcafebabe", 0xdead_beef_cafe_babe),
+        ] {
+            let (value, used) = strtoul(text.as_bytes(), 0);
+            assert_eq!(value, want, "strtoul({text})");
+            assert_eq!(used, text.len(), "and consumed all of it");
+            assert_eq!(strtol(text.as_bytes(), 0).0, i64::MAX, "strtol saturates {text}");
+        }
+    }
+
+    #[test]
+    fn strtoul_negates_because_c_says_so() {
+        // `strtoul("-1")` is `ULONG_MAX`, not an error. Genuinely strange, and the
+        // standard's — a program relying on it exists somewhere, and refusing would
+        // be this library inventing a rule.
+        assert_eq!(strtoul(b"-1", 10).0, u64::MAX);
+        assert_eq!(strtoul(b"-2", 10).0, u64::MAX - 1);
+    }
+
+    #[test]
+    fn strtoul_agrees_with_strtol_where_both_fit() {
+        for text in ["0", "1", "42", "  -17", "0x1f", "017", "9223372036854775807"] {
+            let signed = strtol(text.as_bytes(), 0);
+            let unsigned = strtoul(text.as_bytes(), 0);
+            assert_eq!(unsigned.1, signed.1, "same bytes consumed for {text}");
+            assert_eq!(unsigned.0, signed.0 as u64, "same value for {text}");
+        }
+        // No digits: zero consumed, which is how a caller tells "0" from "not a
+        // number" — the same contract `strtol` has.
+        assert_eq!(strtoul(b"zzz", 10), (0, 0));
     }
 
     #[test]

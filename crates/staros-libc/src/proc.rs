@@ -527,6 +527,77 @@ pub mod exports {
         0
     }
 
+    /// The static buffer the non-reentrant lookups hand out.
+    ///
+    /// One per function, 128 bytes, which is more than the four short strings need.
+    static mut PASSWD_BUF: [c_char; 128] = [0; 128];
+    static mut PASSWD_ROW: Passwd = Passwd {
+        pw_name: core::ptr::null_mut(),
+        pw_passwd: core::ptr::null_mut(),
+        pw_uid: 0,
+        pw_gid: 0,
+        pw_gecos: core::ptr::null_mut(),
+        pw_dir: core::ptr::null_mut(),
+        pw_shell: core::ptr::null_mut(),
+    };
+
+    /// `getpwuid`: the same one row, into storage this library owns.
+    ///
+    /// The `_r` form was written first and this is deliberately built on top of it
+    /// rather than beside it, so there is one place that decides what the row says.
+    ///
+    /// It is the interface every style guide warns about — the returned pointer is
+    /// into a static buffer that the next call overwrites — and it is here because
+    /// Qt calls it: `qfilesystemengine_unix.cpp` line 827, for `QFileInfo::owner()`.
+    /// The race it is famous for cannot bite quite as hard here as it would
+    /// elsewhere, because the answer never changes: two threads racing overwrite the
+    /// buffer with identical bytes. That is an argument for why this is *tolerable*,
+    /// not for why it is *good*, and a caller that can use `getpwuid_r` should.
+    ///
+    /// # Safety
+    /// C ABI. The returned pointer is invalidated by the next call from any thread.
+    #[no_mangle]
+    pub unsafe extern "C" fn getpwuid(uid: u32) -> *mut Passwd {
+        let mut result = core::ptr::null_mut();
+        // SAFETY: the statics are this function's own storage, and `getpwuid_r`
+        // writes only inside the bounds given.
+        unsafe {
+            let row = &raw mut PASSWD_ROW;
+            let buf = (&raw mut PASSWD_BUF).cast::<c_char>();
+            if getpwuid_r(uid, row, buf, 128, &raw mut result) != 0 {
+                return core::ptr::null_mut();
+            }
+        }
+        result
+    }
+
+    static mut GROUP_BUF: [c_char; 128] = [0; 128];
+    static mut GROUP_ROW: Group = Group {
+        gr_name: core::ptr::null_mut(),
+        gr_passwd: core::ptr::null_mut(),
+        gr_gid: 0,
+        gr_mem: core::ptr::null_mut(),
+    };
+
+    /// `getgrgid`: as [`getpwuid`], for the group database. Qt calls it from the same
+    /// file, line 866, for `QFileInfo::group()`.
+    ///
+    /// # Safety
+    /// As [`getpwuid`].
+    #[no_mangle]
+    pub unsafe extern "C" fn getgrgid(gid: u32) -> *mut Group {
+        let mut result = core::ptr::null_mut();
+        // SAFETY: as `getpwuid`.
+        unsafe {
+            let row = &raw mut GROUP_ROW;
+            let buf = (&raw mut GROUP_BUF).cast::<c_char>();
+            if getgrgid_r(gid, row, buf, 128, &raw mut result) != 0 {
+                return core::ptr::null_mut();
+            }
+        }
+        result
+    }
+
     // --------------------------------------------------------------------- system
 
     /// `struct utsname`, in glibc's layout: six 65-byte fields.
@@ -740,7 +811,7 @@ pub mod exports {
         }
         let (cur, max) = match resource {
             RLIMIT_STACK => (256 * 1024, 256 * 1024),
-            RLIMIT_NOFILE => (crate::fd::MAX_FDS as u64, crate::fd::MAX_FDS as u64),
+            RLIMIT_NOFILE => (crate::fd::MAX_OPEN as u64, crate::fd::MAX_OPEN as u64),
             RLIMIT_AS => (RLIM_INFINITY, RLIM_INFINITY),
             _ => (RLIM_INFINITY, RLIM_INFINITY),
         };

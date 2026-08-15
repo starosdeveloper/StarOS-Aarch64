@@ -37,17 +37,35 @@ size_t strspn(const char *s, const char *accept);
  * table of errno values this system never sets. */
 char *strerror(int code);
 
-/* Declared and not implemented, because <cstring> imports the whole of C's
- * <string.h> into namespace std and will not compile without the names — the same
- * arrangement as <wchar.h>, and for the same reason. A call to one of these is an
- * undefined symbol naming exactly what the program wanted. */
+/* The rest of C's <string.h>. They are here first of all because <cstring> imports
+ * the whole of it into namespace std and will not compile without the names — but
+ * unlike when this note was first written, all but one now have an implementation
+ * behind them in `crates/staros-libc/src/string.rs`. */
 char *strncat(char *dst, const char *src, size_t n);
 char *strtok(char *s, const char *delim);
+/* The reentrant `strtok`, and the one worth using: the traversal state lives in the
+ * caller's pointer instead of in a static, so two callers cannot corrupt each
+ * other's walk. Implemented since the beginning and undeclared until Qt's
+ * `qsimd.cpp` line 647 asked for it — the message was
+ * `no member named 'strtok_r' in the global namespace; did you mean 'strtok'?`,
+ * followed by a second error about the argument count, which is what happens when a
+ * compiler takes a helpful guess. */
+char *strtok_r(char *s, const char *delim, char **save);
 char *strpbrk(const char *s, const char *accept);
-int strcoll(const char *a, const char *b);
 size_t strxfrm(char *dst, const char *src, size_t n);
 char *strdup(const char *s);
+char *strndup(const char *s, size_t n);
 void *memccpy(void *dst, const void *src, int c, size_t n);
+
+/* Declared with nothing behind it, deliberately and alone.
+ *
+ * `strcoll` compares two strings in the current locale's collation order. This
+ * system has the C locale and no other, where collation order *is* byte order — so a
+ * correct `strcoll` here would be `strcmp`, and writing that would be a lie the day
+ * a second locale exists. It is declared because <cstring> needs the name and left
+ * undefined so that a program which actually calls it fails at the link, naming
+ * `strcoll`, rather than silently getting C-locale ordering it did not ask for. */
+int strcoll(const char *a, const char *b);
 
 #ifdef __cplusplus
 }

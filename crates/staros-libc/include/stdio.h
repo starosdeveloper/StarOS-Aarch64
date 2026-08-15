@@ -10,6 +10,10 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+/* For `off_t`, which `fseeko` and the large-file names take. C does not put it in
+ * <stdio.h>'s own set of types, but POSIX puts these functions here, so the header
+ * that declares them has to reach for it. */
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,6 +47,12 @@ typedef struct {
 
 FILE *fopen(const char *path, const char *mode);
 FILE *freopen(const char *path, const char *mode, FILE *stream);
+/* The two functions joining streams to descriptors, both implemented in
+ * `crates/staros-libc/src/stream.rs` and neither declared until Qt asked.
+ * `qfsfileengine_unix.cpp` calls `fileno` at seven places — it is how QFile reaches
+ * `fstat`, `lseek` and `ftruncate` on a `FILE *` it was handed. */
+FILE *fdopen(int fd, const char *mode);
+int fileno(FILE *stream);
 FILE *tmpfile(void);
 char *tmpnam(char *s);
 int fclose(FILE *stream);
@@ -60,6 +70,24 @@ int fseek(FILE *stream, long offset, int whence);
 long ftell(FILE *stream);
 int fgetpos(FILE *stream, fpos_t *position);
 int fsetpos(FILE *stream, const fpos_t *position);
+
+/* `fseeko` and `ftello`, which differ from `fseek` and `ftell` in taking and
+ * returning `off_t` rather than `long`. On this target the two are the same 64-bit
+ * type, so the difference is nominal here and real everywhere the code might be
+ * read — declaring them faithfully is what keeps that true. */
+int fseeko(FILE *stream, off_t offset, int whence);
+off_t ftello(FILE *stream);
+
+/* The large-file names. `fopen64`, `fseeko64` and `ftello64` are real symbols in
+ * `crates/staros-libc/src/stream.rs`, so they are declared. `fgetpos64` and
+ * `fsetpos64` are not — `fpos_t` is one type here, there is nothing for a second
+ * pair of functions to do differently, and a macro cannot drift out of step with the
+ * functions it names. Qt reaches `::ftello64` in `qfile.cpp` line 1051. */
+FILE *fopen64(const char *path, const char *mode);
+int fseeko64(FILE *stream, off_t offset, int whence);
+off_t ftello64(FILE *stream);
+#define fgetpos64 fgetpos
+#define fsetpos64 fsetpos
 void rewind(FILE *stream);
 void setbuf(FILE *stream, char *buffer);
 int setvbuf(FILE *stream, char *buffer, int mode, size_t size);
