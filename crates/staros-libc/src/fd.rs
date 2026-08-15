@@ -61,6 +61,8 @@ pub(crate) const POLLNVAL: i16 = 0x020;
 
 /// `EFD_SEMAPHORE`: read takes one, not the whole counter.
 const EFD_SEMAPHORE: c_int = 1;
+/// `EFD_NONBLOCK`: the same bit `O_NONBLOCK` uses, which is how Linux defines it.
+const EFD_NONBLOCK: c_int = 0o4000;
 
 /// What a descriptor is.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -134,6 +136,76 @@ static mut RINGS: [[u8; PIPE_CAPACITY]; MAX_WAITABLES] = [[0; PIPE_CAPACITY]; MA
 static mut FDS: [Kind; MAX_FDS] = [Kind::Free; MAX_FDS];
 static FDS_LOCK: Spin = Spin::new();
 
+/// `O_NONBLOCK`, as `fcntl.h` numbers it.
+pub(crate) const O_NONBLOCK: c_int = 0o4000;
+
+/// `EAGAIN`: the call would have blocked and was asked not to.
+const EAGAIN: c_int = 11;
+
+/// Fail with `EAGAIN`.
+///
+/// A function rather than the expression written out three times because `errno`
+/// lives behind a thread pointer the host tests have no way to set up, so setting it
+/// is `cfg(not(test))` — and a `cfg` at each site would be three chances to get the
+/// two halves out of step.
+fn again() -> isize {
+    #[cfg(not(test))]
+    {
+        crate::fail(EAGAIN, -1)
+    }
+    #[cfg(test)]
+    {
+        let _ = EAGAIN;
+        -1
+    }
+}
+
+/// Which descriptors were asked not to block.
+///
+/// A separate array rather than a field in [`Kind`] because it is a property of the
+/// *descriptor*, not of the object behind it: two descriptors on the same pipe end
+/// can disagree about blocking, and `dup` copies the object while POSIX says the
+/// copy shares the flag. One array indexed the same way as `FDS` keeps both facts
+/// where they belong.
+///
+/// This existing at all is the fix for a real stall. `fcntl(F_SETFL, O_NONBLOCK)`
+/// used to return 0 and do nothing, so Qt's event dispatcher — which drains its
+/// wake-up pipe with `while (read(...) > 0) {}` and relies on `EAGAIN` to end the
+/// loop — blocked forever on the read that should have failed. A libc that says yes
+/// to a flag it does not implement moves the failure to a place that cannot explain
+/// it.
+static NONBLOCK: [AtomicU32; MAX_FDS] = [const { AtomicU32::new(0) }; MAX_FDS];
+
+/// Set or clear `O_NONBLOCK` on `fd`. False if `fd` names nothing.
+///
+/// The three standard descriptors accept the flag and are unaffected by it: the
+/// console never makes a writer wait and there is no console input, so there is no
+/// call on them that could have blocked. Refusing would be the other honest answer
+/// and it would break `fcntl(1, F_SETFL, ...)` in programs that are right to make it.
+pub(crate) fn set_nonblock(fd: c_int, on: bool) -> bool {
+    if fd >= 0 && fd < FIRST_FD {
+        return true;
+    }
+    let Ok(index) = usize::try_from(fd - FIRST_FD) else {
+        return false;
+    };
+    match NONBLOCK.get(index) {
+        Some(flag) if get(fd).is_some() => {
+            flag.store(u32::from(on), Ordering::Release);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether `fd` was asked not to block.
+pub(crate) fn is_nonblock(fd: c_int) -> bool {
+    usize::try_from(fd - FIRST_FD)
+        .ok()
+        .and_then(|index| NONBLOCK.get(index))
+        .is_some_and(|flag| flag.load(Ordering::Acquire) != 0)
+}
+
 /// Build the notification pool. Called from start-up, before any thread exists —
 /// see the module docs.
 pub(crate) fn init() {
@@ -157,6 +229,10 @@ fn install(kind: Kind) -> c_int {
     match fds.iter().position(|k| *k == Kind::Free) {
         Some(index) => {
             fds[index] = kind;
+            // A fresh descriptor blocks. The slot may have carried a flag from
+            // whatever held it last, and inheriting that would make a program's
+            // behaviour depend on which descriptor number it happened to be given.
+            NONBLOCK[index].store(0, Ordering::Release);
             index as c_int + FIRST_FD
         }
         None => -1,
@@ -374,6 +450,8 @@ pub(crate) fn poll_impl(fds: &mut [PollFd], deadline: Option<u64>) -> c_int {
             }
         }
 
+        #[cfg(feature = "park-trace")]
+        crate::thread::park_trace(if deadline.is_some() { "poll-timed" } else { "poll-forever" });
         let fired = sys::wait_any(&handles[..count], deadline.unwrap_or(0));
         if !fired && deadline.is_some() {
             // The deadline passed with nothing signalled. One last readiness pass
@@ -388,7 +466,12 @@ pub(crate) fn poll_impl(fds: &mut [PollFd], deadline: Option<u64>) -> c_int {
 }
 
 /// Read from a waitable descriptor. Returns bytes read, or `-1`.
-pub(crate) fn read(kind: Kind, dst: &mut [u8]) -> isize {
+///
+/// `nonblock` is the descriptor's `O_NONBLOCK`: with it set, a read that would have
+/// waited fails with `EAGAIN` instead. That is not a convenience — it is the whole
+/// contract a drain loop rests on, and a libc that blocks there stops the program
+/// with no clue as to why.
+pub(crate) fn read(kind: Kind, dst: &mut [u8], nonblock: bool) -> isize {
     match kind {
         Kind::Event { slot, semaphore } => {
             if dst.len() < 8 {
@@ -409,6 +492,11 @@ pub(crate) fn read(kind: Kind, dst: &mut [u8]) -> isize {
                     sys::notify_signal(w.writable.load(Ordering::Acquire));
                     return 8;
                 }
+                if nonblock {
+                    return again();
+                }
+                #[cfg(feature = "park-trace")]
+                crate::thread::park_trace("read-eventfd");
                 sys::wait(w.readable.load(Ordering::Acquire));
             }
         }
@@ -436,6 +524,11 @@ pub(crate) fn read(kind: Kind, dst: &mut [u8]) -> isize {
                         return 0; // the writer is gone: end of file
                     }
                 }
+                if nonblock {
+                    return again();
+                }
+                #[cfg(feature = "park-trace")]
+                crate::thread::park_trace("read-pipe");
                 sys::wait(w.readable.load(Ordering::Acquire));
             }
         }
@@ -468,7 +561,7 @@ pub(crate) fn read(kind: Kind, dst: &mut [u8]) -> isize {
 }
 
 /// Write to a waitable descriptor. Returns bytes written, or `-1`.
-pub(crate) fn write(kind: Kind, src: &[u8]) -> isize {
+pub(crate) fn write(kind: Kind, src: &[u8], nonblock: bool) -> isize {
     match kind {
         Kind::Event { slot, .. } => {
             if src.len() < 8 {
@@ -510,6 +603,14 @@ pub(crate) fn write(kind: Kind, src: &[u8]) -> isize {
                         continue;
                     }
                 }
+                if nonblock {
+                    // A partial write is a success: the caller asked not to wait and
+                    // some bytes went through. Only a write that placed nothing at
+                    // all is `EAGAIN`.
+                    return if written > 0 { written as isize } else { again() };
+                }
+                #[cfg(feature = "park-trace")]
+                crate::thread::park_trace("write-pipe");
                 sys::wait(w.writable.load(Ordering::Acquire));
             }
             written as isize
@@ -783,6 +884,9 @@ pub mod exports {
             WAITABLES[slot].used.store(0, Ordering::Release);
             return -EMFILE;
         }
+        if flags & super::EFD_NONBLOCK != 0 {
+            super::set_nonblock(fd, true);
+        }
         fd
     }
 
@@ -844,7 +948,7 @@ pub mod exports {
             return -EINVAL;
         };
         let mut buf = [0u8; 8];
-        if super::read(kind, &mut buf) != 8 {
+        if super::read(kind, &mut buf, super::is_nonblock(fd)) != 8 {
             return -EINVAL;
         }
         // SAFETY: forwarded from the caller.
@@ -857,7 +961,7 @@ pub mod exports {
         let Some(kind @ Kind::Event { .. }) = get(fd) else {
             return -EINVAL;
         };
-        if super::write(kind, &value.to_ne_bytes()) != 8 {
+        if super::write(kind, &value.to_ne_bytes(), super::is_nonblock(fd)) != 8 {
             return -EINVAL;
         }
         0
@@ -866,7 +970,7 @@ pub mod exports {
     /// # Safety
     /// C ABI: `fds` receives the read end then the write end.
     #[no_mangle]
-    pub unsafe extern "C" fn pipe2(fds: *mut c_int, _flags: c_int) -> c_int {
+    pub unsafe extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
         let Some(slot) = take_waitable() else {
             return -EMFILE;
         };
@@ -882,6 +986,13 @@ pub mod exports {
             }
             WAITABLES[slot].used.store(0, Ordering::Release);
             return -EMFILE;
+        }
+        // `O_NONBLOCK` applies to both ends. This is the form Qt creates its wake-up
+        // pipe in — `pipe2(fds, O_NONBLOCK)` when it is available — so the flag has
+        // to arrive here and not only through `fcntl`.
+        if flags & super::O_NONBLOCK != 0 {
+            super::set_nonblock(read_end, true);
+            super::set_nonblock(write_end, true);
         }
         // SAFETY: forwarded from the caller.
         unsafe {
@@ -908,7 +1019,19 @@ pub mod exports {
     #[no_mangle]
     pub extern "C" fn dup(fd: c_int) -> c_int {
         match get(fd) {
-            Some(kind) => install(kind),
+            Some(kind) => {
+                let copy = install(kind);
+                // POSIX makes `O_NONBLOCK` a property of the open file description,
+                // which `dup` shares — so the copy starts in the same mode. It does
+                // not stay shared: this table keeps the flag per descriptor, so a
+                // later `fcntl` on one copy leaves the other where it was. Written
+                // down because it is a real difference, and small enough that a
+                // second indirection to fix it would cost more than it saves.
+                if copy >= 0 && super::is_nonblock(fd) {
+                    super::set_nonblock(copy, true);
+                }
+                copy
+            }
             None => -EINVAL,
         }
     }

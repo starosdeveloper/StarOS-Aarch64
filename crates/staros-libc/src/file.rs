@@ -351,7 +351,7 @@ pub mod exports {
         let dst = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), count) };
         match crate::fd::get(fd) {
             Some(crate::fd::Kind::File { .. }) => super::read(fd, dst),
-            Some(kind) => crate::fd::read(kind, dst),
+            Some(kind) => crate::fd::read(kind, dst, crate::fd::is_nonblock(fd)),
             None => -1,
         }
     }
@@ -370,7 +370,7 @@ pub mod exports {
             // The file server is read-only, and saying so beats accepting bytes
             // that go nowhere.
             Some(crate::fd::Kind::File { .. }) | None => -1,
-            Some(kind) => crate::fd::write(kind, src),
+            Some(kind) => crate::fd::write(kind, src, crate::fd::is_nonblock(fd)),
         }
     }
 
@@ -935,12 +935,20 @@ pub mod exports {
         crate::fail(25, 0) // ENOTTY, which is what C says to set
     }
 
-    /// `fcntl`, for the two requests that have an answer here.
+    /// `fcntl`, for the requests that have an answer here.
+    ///
+    /// `F_SETFL` used to return 0 and change nothing. That is the worst of the three
+    /// possible answers: a caller that sets `O_NONBLOCK` and is told it succeeded
+    /// goes on to write a drain loop — `while (read(fd, buf, n) > 0) {}` — which
+    /// this libc then blocked in forever, several thousand frames from the `fcntl`
+    /// that caused it. Qt's event dispatcher is exactly that caller, and this is
+    /// exactly where its event loop stopped. The flag is now real; see
+    /// [`crate::fd::set_nonblock`].
     ///
     /// # Safety
     /// C ABI, variadic in the third argument.
     #[no_mangle]
-    pub unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, _args: ...) -> c_int {
+    pub unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, mut args: ...) -> c_int {
         const F_GETFD: c_int = 1;
         const F_SETFD: c_int = 2;
         const F_GETFL: c_int = 3;
@@ -948,9 +956,28 @@ pub mod exports {
         match cmd {
             // No close-on-exec flag, because there is no exec.
             F_GETFD => 0,
-            F_SETFD | F_SETFL => 0,
-            // O_RDONLY: everything here is.
-            F_GETFL => 0,
+            F_SETFD => 0,
+            // O_RDONLY — everything here is — plus whatever blocking mode this
+            // descriptor is actually in.
+            F_GETFL => {
+                if crate::fd::is_nonblock(fd) {
+                    crate::fd::O_NONBLOCK
+                } else {
+                    0
+                }
+            }
+            // Only `O_NONBLOCK` is answerable. The access mode cannot be changed
+            // after the fact and `O_APPEND` has no meaning on a read-only
+            // filesystem, so both are ignored here exactly as POSIX allows.
+            F_SETFL => {
+                // SAFETY: C ABI — `F_SETFL` is defined to take one `int`.
+                let flags = unsafe { args.next_arg::<c_int>() };
+                if crate::fd::set_nonblock(fd, flags & crate::fd::O_NONBLOCK != 0) {
+                    0
+                } else {
+                    crate::fail(9, -1) // EBADF
+                }
+            }
             _ => {
                 let _ = fd;
                 crate::fail(22, -1) // EINVAL

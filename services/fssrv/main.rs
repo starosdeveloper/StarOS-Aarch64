@@ -85,7 +85,13 @@ const MAX_OPEN: usize = 8;
 /// A rubbish message must not become an infinite loop, and neither must a client
 /// that never says goodbye: `Recv` returns immediately whenever a sender is
 /// queued, so an unbounded server spins as fast as the endpoint can feed it.
-const MAX_REQUESTS: u32 = 512;
+/// 2048, raised from 512 the day a real application became a client: Qt reads a
+/// typeface whole, the reads arrive through a 4 KiB bounce buffer, and four faces of
+/// one family are already several hundred round trips before a window is painted. A
+/// bound that a legitimate client crosses is not a safety net — it is a server that
+/// stops answering mid-conversation, and the symptom lands on the *client*, blocked
+/// for ever on a reply from a server that has already printed its tally and exited.
+const MAX_REQUESTS: u32 = 2048;
 /// How many malformed messages to answer before concluding the client is broken.
 const MAX_REJECTED: u32 = 8;
 

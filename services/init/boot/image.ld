@@ -31,6 +31,24 @@ SECTIONS
         KEEP(*(.text.start))   /* _start must be at offset 0 (== e_entry) */
         *(.text .text.*)
         *(.rodata .rodata.*)
+
+        /* Read-only sections a library brings with a name of its own.
+         *
+         * A section this script does not mention is an *orphan*, and lld places
+         * orphans by attribute rather than leaving them out: a read-only,
+         * non-executable orphan goes ahead of `.text` and becomes a `PT_LOAD` of
+         * its own, after which `.text` no longer starts on a page boundary and the
+         * kernel's `map_segment` refuses the image. Naming them here puts them
+         * inside this segment, where they cost nothing.
+         *
+         * `.qtmimedatabase` is Qt's compiled-in MIME table, read by
+         * `QMimeDatabase`. Unlike `.gcc_except_table` below it cannot be discarded
+         * — it is data the program reads.
+         *
+         * When a new library adds another, the failure is loud now: `qt-link.sh`
+         * checks every `PT_LOAD`'s alignment and names the section it found. */
+        *(.qtmimedatabase)
+        *(.gnu.linkonce.r.*)
     }
 
     /* Page-align onto a fresh frame so the loader can map the writable segment
@@ -107,10 +125,31 @@ SECTIONS
         *(COMMON)
     }
 
+    /* Unwinding metadata, all of it, and `.gcc_except_table` is the one that was
+     * missed.
+     *
+     * `.eh_frame` describes how to walk the stack; `.gcc_except_table` is the
+     * language-specific data beside it, saying which handler covers which range of
+     * an unwind. Neither means anything here — this system builds `-fno-exceptions`
+     * and `crates/staros-libc/cxx/runtime.cpp` stops the program at `__cxa_throw`
+     * rather than unwinding — but the compiler still emits the tables for code it
+     * inlines out of libstdc++'s headers.
+     *
+     * Leaving `.gcc_except_table` unnamed did not merely waste space. An unassigned
+     * section is an *orphan*, and lld places orphans by attribute: read-only,
+     * non-executable, so it went ahead of `.text` and became a `PT_LOAD` of its
+     * own — 148 KiB of it in the Qt program. `.text` then began at `0x80024930`,
+     * partway through that segment's last page, and the kernel's `map_segment`
+     * requires a page-aligned `vaddr` and refuses anything else. The whole image
+     * failed to load, and the only symptom was the Qt program never appearing.
+     *
+     * Every other program here has exactly two segments and never produced an
+     * orphan large enough to need one, which is why the gap survived this long. */
     /DISCARD/ : {
         *(.comment)
         *(.note*)
         *(.eh_frame*)
+        *(.gcc_except_table*)
         *(.ARM.exidx*)
     }
 }

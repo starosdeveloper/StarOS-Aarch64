@@ -262,9 +262,83 @@ pub(crate) fn current() -> *mut Thread {
     unsafe { tp.cast::<usize>().add(1).read() as *mut Thread }
 }
 
+/// Print the call chain leading here, as raw return addresses.
+///
+/// Temporary, and switched on only by `STAROS_PARK_TRACE`. A park that never returns
+/// is indistinguishable from every other park from the outside — the kernel can say
+/// a task is blocked and even on which endpoint, but a notification wait has no
+/// endpoint and no name. These addresses do: `llvm-addr2line` against the unstripped
+/// executable turns them into the Qt frames that asked to sleep.
+///
+/// Walks the frame chain by hand rather than using a library, because there is no
+/// unwinder here — exceptions abort, and `.eh_frame` is discarded from the image. The
+/// AArch64 ABI puts the caller's frame pointer at `[x29]` and its return address at
+/// `[x29, #8]`, which is enough for any function that keeps a frame. A leaf that does
+/// not simply does not appear.
+#[cfg(feature = "park-trace")]
+pub(crate) fn park_trace(site: &str) {
+    struct Buf {
+        bytes: [u8; 192],
+        len: usize,
+    }
+    impl Buf {
+        fn put(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                if self.len < self.bytes.len() {
+                    self.bytes[self.len] = b;
+                    self.len += 1;
+                }
+            }
+        }
+    }
+    let mut buf = Buf { bytes: [0; 192], len: 0 };
+    buf.put(b"[park] ");
+    buf.put(site.as_bytes());
+
+    let mut fp: usize;
+    // SAFETY: reading the frame pointer register has no effect.
+    unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack)) };
+    for _ in 0..6 {
+        // A frame pointer that is null, misaligned or below the last one has left
+        // the chain. Following it would read whatever happens to be there and print
+        // an address that means nothing.
+        if fp == 0 || fp & 7 != 0 {
+            break;
+        }
+        // SAFETY: `fp` points at a frame record while the chain holds; the checks
+        // above reject the values that say it no longer does.
+        let (next, lr) =
+            unsafe { ((fp as *const usize).read(), (fp as *const usize).add(1).read()) };
+        let mut hex = [0u8; 19];
+        hex[0] = b' ';
+        hex[1] = b'0';
+        hex[2] = b'x';
+        for i in 0..16 {
+            let nibble = ((lr >> (60 - i * 4)) & 0xf) as u8;
+            hex[3 + i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        }
+        buf.put(&hex);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    buf.put(b"\n");
+    sys::debug_write(&buf.bytes[..buf.len]);
+}
+
 impl Thread {
     /// Sleep until somebody unparks us.
     fn park(&self) {
+        sys::wait(self.parker);
+    }
+
+    /// As [`park`], with a note on the console saying who asked. See [`park_trace`].
+    fn park_at(&self, site: &str) {
+        #[cfg(feature = "park-trace")]
+        park_trace(site);
+        #[cfg(not(feature = "park-trace"))]
+        let _ = site;
         sys::wait(self.parker);
     }
 
@@ -414,7 +488,7 @@ impl Mutex {
                 return;
             }
             // SAFETY: `me` is this thread's own block.
-            unsafe { (*me).park() };
+            unsafe { (*me).park_at("mutex") };
         }
     }
 
@@ -498,7 +572,7 @@ impl RwLock {
             self.queue.push(me);
             if self.writer.load(Ordering::Acquire) != 0 {
                 // SAFETY: our own block.
-                unsafe { (*me).park() };
+                unsafe { (*me).park_at("rwlock-read") };
             }
         }
     }
@@ -566,7 +640,7 @@ impl RwLock {
                 || self.readers.load(Ordering::Acquire) != 0
             {
                 // SAFETY: our own block.
-                unsafe { (*me).park() };
+                unsafe { (*me).park_at("rwlock-write") };
             }
         }
     }
@@ -714,7 +788,7 @@ pub mod exports {
             // Re-check after registering: the thread may have finished in the
             // window, in which case nobody will ever unpark us.
             while (*target).finished.load(Ordering::Acquire) == 0 {
-                (*me).park();
+                (*me).park_at("join");
             }
             if !retval.is_null() {
                 *retval = (*target).retval.load(Ordering::Acquire);
@@ -976,7 +1050,7 @@ pub mod exports {
         unsafe {
             (*c).queue.push(me);
             (*m).unlock();
-            (*me).park();
+            (*me).park_at("cond");
             (*m).lock();
         }
         0
@@ -1239,7 +1313,7 @@ pub mod exports {
             unsafe {
                 (*s).queue.push(me);
                 if (*s).count.load(Ordering::Acquire) == 0 {
-                    (*me).park();
+                    (*me).park_at("sem");
                 }
             }
         }

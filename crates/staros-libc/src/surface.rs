@@ -152,7 +152,7 @@ pub mod exports {
         let bytes = unsafe {
             core::slice::from_raw_parts(msg.cast::<u8>(), size_of::<StarosMessage>())
         };
-        if crate::fd::write(kind, bytes) == size_of::<StarosMessage>() as isize {
+        if crate::fd::write(kind, bytes, false) == size_of::<StarosMessage>() as isize {
             0
         } else {
             -EMSGSIZE
@@ -182,7 +182,7 @@ pub mod exports {
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(msg.cast::<u8>(), size_of::<StarosMessage>())
         };
-        if crate::fd::read(kind, bytes) == size_of::<StarosMessage>() as isize {
+        if crate::fd::read(kind, bytes, false) == size_of::<StarosMessage>() as isize {
             0
         } else {
             -EMSGSIZE

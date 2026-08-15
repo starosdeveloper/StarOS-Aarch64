@@ -132,25 +132,34 @@ unnoticed after being written. The devices cost nothing when nothing uses them.
 To press a key on that keyboard, run `./scripts/input-check.sh`: a headless
 `cargo krun` has no way to deliver one, so the driver arms its queue and waits.
 
-Abridged `cargo krun` output — everything below is from one run, with only the
-device-tree detail lines and the font self-test elided:
+`cargo krun` output — everything below is from one run, unabridged:
 
 ```
 STAR OS microkernel v0.2.0 — entered at EL1, running at EL1
 device tree at 0x48200000 (1048576 bytes): linux,dummy-virt
+  ram: 0x40000000..0x50000000 (256 MiB)
   ram total: 256 MiB
   reserved regions: 0
+  cpus: 1 (booted on cpu 0)
+  intc: GICv2, dist 0x8000000, cpu 0x8010000
+  psci: present, method hvc
+  console: pl011 at 0x9000000 (+0x1000) — this console, found not assumed
 exception vectors installed (VBAR_EL1)
 privileged access never (PAN): not implemented on this CPU
 MMU enabled: true (kernel in TTBR1 at 0xffff000000000000; RAM 0x40000000..0x50000000 Normal in the linear map; 44-bit PA per ID_AA64MMFR0_EL1)
-memory: 256 MiB RAM, 126 MiB usable, heap 1280 KiB @ 0x401d8000, 124 MiB of frames @ 0x40318000
+memory: 256 MiB RAM, 125 MiB usable, heap 1276 KiB @ 0x48300000, 123 MiB of frames @ 0x4843f000
 kernel heap: Vec of 8 squares (last 64) sums to 204 — global allocator live
 dynamic tables: 64 objects (old max 8), 64 caps in one task (old max 4), 64 notifications (old max 4) — all grew past the old fixed limits
 framebuffer: ramfb 640x480 online (mirroring the console to the screen)
+[selftest] single-thread font render (before SMP / tasks):
+  ABCDEFGHIJKLMNOPQRSTUVWXYZ
+  abcdefghijklmnopqrstuvwxyz 0123456789
+  !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+[selftest] SINGLE THREAD TEST PASSED
 syscall Yield -> 0; syscall 0xdead -> -6
 clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
 interrupt controller: GICv2 online
-clock: one tick interval (6250000 counter ticks) measured 101797 us against an expected 100000 us (agrees with the tick interval)
+clock: one tick interval (6250000 counter ticks) measured 100342 us against an expected 100000 us (agrees with the tick interval)
 smp: 1 core(s) online (PSCI v1.1)
 smp: 1 cores x 20000 locked increments = 20000 (expected 20000) — no increments lost
 smp: single core — no inter-processor interrupt to send
@@ -174,10 +183,9 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [hello-c] mmap: 12305 bytes mapped and returned, 16384 retained by the kernel
 [hello-c] calendar: 2025-08-13 00:00:00 UTC (Wed)
 [hello-c] heap: 103 allocations, 368 bytes live at the end
-[hello-cpp] a namespace-scope constructor ran before main
-[hello-cpp] a C++ program in EL0: vector, string, thread, and a static with a destructor
+[fssrv] the files are mine: 20 of them, served over IPC to processes that hold no archive
 [stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand
-[fault] task 19 killed: EL0 fault at 0x7fffaffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
+[fault] task 23 killed: EL0 fault at 0x7fffaffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
 [fault]   backtrace (2 frames, x29 chain): 0x8000080c 0x80000804
 [child] hello - I was created at runtime, not by the kernel
 [loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
@@ -186,64 +194,85 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [inputsrv] virtio-input driver up in EL0: queue armed, waiting for the device
 [devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
 [devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
-[fbclient] asked the screen its size (640x480 xRGB8888), then had two 64x64 surfaces composited - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096
 [fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
-[hello-c] clock: 407402608 ns across a 20 ms nanosleep
-[child] hello - I was created at runtime, not by the kernel
+[hello-c] clock: 82998192 ns across a 20 ms nanosleep
+[hello-cpp] a namespace-scope constructor ran before main
+[hello-cpp] a C++ program in EL0: vector, string, thread, and a static with a destructor
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 #server drove the UART, then revoked it for everyone
+[qt-hello] starting
 [child] hello - I was created at runtime, not by the kernel
 [client] read from shared memory: shared-memory works: written by the server, read by the client
 [client] read the marker from the SECOND page of a 2-page shared buffer
+[dyingclient] a 32x32 window on screen, the server watching me, and now I crash
+[fault] task 7 killed: EL0 fault at 0x0 (ec 0x24) — isolated, kernel continues
+[fault]   backtrace (2 frames, x29 chain): 0x80000cf0 0x80000cec
+[displaysrv] a client died; its windows are off the screen
 [hello-cpp] backing store: 1200 KiB for a whole 640x480 screen, filled and read back from C++
 [hello-cpp] a 1920x1080 backing store: 8100 KiB, contiguous, mapped whole
 [hello-cpp] a static local was constructed on first use
 [hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads
 [hello-cpp] the static local's destructor ran at exit, holding 2 entries
-[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
 [fsclient] read 'greeting.txt' through fssrv in 2 chunks: hello from the initramfs
 [fsclient] 25 of 25 bytes in 2 reads, the second one from offset 6
 [client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block
+[child] hello - I was created at runtime, not by the kernel
 [client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
 [cap] task 0 denied MapMemory(handle 0): no such capability
 [client] kernel refused a syscall pointer into an unmapped page - it walks our tables, not a range
+[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
+[fbclient] asked the screen its size (640x480 xRGB8888), then had two 64x64 surfaces composited - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096
 [hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: hello from the initramfs
 [fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length
 [fsclient] asked for all 13648 bytes of 'init.elf' into a 4096-byte buffer and got 4096, with 9552 left
 [fsclient] the archive is at 0x900000000 in fssrv; touching it here must fault
-[fault] task 12 killed: EL0 fault at 0x900000000 (ec 0x24) — isolated, kernel continues
+[fault] task 14 killed: EL0 fault at 0x900000000 (ec 0x24) — isolated, kernel continues
 [fault]   backtrace (3 frames, x29 chain): 0x80000014 0x800016c8 0x80000004
 [fssrv] served 12 requests, 4121 bytes of file data, and refused 4 - the archive never left this address space
 [hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell
 [memtest] MapAnon(0) refused - a zero-page request is an error, not a page
 [memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back
 [ipc-storm] receiver drained every message from 3 concurrent senders, sequence sum exact - no message lost or duplicated
+[qt-hello] QGuiApplication constructed, platform=staros
+[qt-hello] window shown
+[qt-hello] entering the event loop
+[memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
 [hello-c] listed 'docs': 1 file, 1 directory, over a flat archive
 [hello-c] sendfile: from the initramfs
-[hello-c] process 14: uname StarOS 0.2.0, stack limit 256 KiB, backtrace 3 frames
-[memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
+[hello-c] process 16: uname StarOS 0.2.0, stack limit 256 KiB, backtrace 3 frames
+[qt-hello] painted 320x240, text in 'IBM Plex Mono' 115 px wide, 20 px tall
+[qt-hello] event loop tick 1
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
-[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 20990848 ns
-[hello-c] endpoint in poll: a message from another process woke the loop in 1072240 ns
+[qt-hello] event loop tick 2
+[qt-hello] quitting
+[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 21575872 ns
+[qt-hello] exec returned 0
+[fssrv] served 231 requests, 688420 bytes of file data, and refused 11 - the archive never left this address space
+[hello-c] endpoint in poll: a message from another process woke the loop in 12593168 ns
 [hello-c] shared buffers: 16 KiB of surface, mapped at 0x500001000 and 0x500005000
-[displaysrv] composited client surfaces onto a screen no client can touch
-[dyingclient] a 32x32 window on screen, the server watching me, and now I crash
 [displaysrv] a client died; its windows are off the screen
-[displaysrv] 4 surface(s) live, 9 commit(s), 24656 pixel(s) composited, 8 refused, 1 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus
+[displaysrv] composited client surfaces onto a screen no client can touch
+[displaysrv] 4 surface(s) live, 10 commit(s), 255056 pixel(s) composited, 8 refused, 2 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus
 [hello-c] window: a 48x48 surface on a 640x480 screen, double buffered, from C through staros.h
 [hello-c] font: read 133796 bytes of IBM Plex Mono through fssrv, checksum 6016661948058288260
+[hello-c] ctype: fourteen classifications the header had promised and nobody had written
+[hello-c] stdlib: qsort, bsearch, rand, strdup and the special functions this sysroot had only promised
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 239 requests, 275941 bytes of file data, and refused 11 - the archive never left this address space
-clock: the demo took 7256 ms on the monotonic clock, during which core 0 took 67 tick(s)
-sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 7 clock wake-up(s), worst overshoot 5790 us
-scheduler: all tasks finished after 67 timer ticks; task table grew to 36 (old fixed max 8)
-task teardown: reaped 32 dead-task kernel stacks (1024 KiB returned to the heap)
-user stacks: 41 page(s) mapped on demand (164 KiB), 1 mapped up front per task, limit 256 KiB
-preemption: timer ticks per core — cpu0=67
+clock: the demo took 3870 ms on the monotonic clock, during which core 0 took 45 tick(s)
+sleep: 5 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 8 clock wake-up(s), worst overshoot 58397 us
+scheduler: all tasks finished after 45 timer ticks; task table grew to 38 (old fixed max 8)
+task teardown: reaped 34 dead-task kernel stacks (1088 KiB returned to the heap)
+user stacks: 50 page(s) mapped on demand (200 KiB), 1 mapped up front per task, limit 256 KiB
+preemption: timer ticks per core — cpu0=45
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x40337000 (exited client's root was 0x40328000)
+frame reclaim: post-teardown alloc 0x4844f000 (exited client's root was 0x48440000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
   (4 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
+    task 2 (pid 2): blocked (waiting for a message)
+    task 6 (pid 6): blocked (waiting for a message), recv on ep22
+    task 8 (pid 8): blocked (waiting for a message)
+    task 11 (pid 11): blocked (waiting for a message)
 shutting down (PSCI SYSTEM_OFF)
 ```
 

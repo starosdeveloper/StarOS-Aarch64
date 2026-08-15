@@ -395,6 +395,10 @@ if [ -n "$INITRAMFS" ]; then
     # rotation reversed in the wrong half corrupts the tree into a null dereference.
     forbid "[hello-cpp] FAIL"
     forbid "C++ RUNTIME BROKEN"
+    # No screen on this machine, and the kernel says so instead of starting a Qt
+    # program that would find no display server. The Qt assertions live with the
+    # `ramfb` config, which is the only one that has a framebuffer to composite onto.
+    req "no Qt program started: this machine has no framebuffer"
     # An EL0 fault now reports where it happened, not just that it did.
     req "[fault]   backtrace ("
 else
@@ -438,7 +442,12 @@ req "no increments lost"
 # never-freed pixel buffer was accounted for (every frame still returns). The
 # pixels themselves are proven separately, live, by the QMP screendump path; here
 # we only need the cheap serial gate so a broken fw_cfg driver fails CI.
-run ramfb-el2-smp4 90 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M -device ramfb
+# With the initramfs, unlike every other framebuffer boot before it. A Qt program
+# needs both halves at once — a screen to composite onto *and* a filesystem to read
+# its typeface from — and until this config carried an archive there was no machine
+# in the matrix where the whole stack could run. The font assertion below is the one
+# that could not exist without it.
+run ramfb-el2-smp4 90 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M -device ramfb ${INITRAMFS:+-initrd "$INITRAMFS"}
 req "framebuffer: ramfb 640x480 online"
 # The screen leaves the kernel: a process is handed the pixels, and a second
 # process with nothing but two endpoint capabilities gets its surface onto a
@@ -461,7 +470,13 @@ req "[displaysrv] composited client surfaces onto a screen no client can touch"
 # made-up surface id, a destroyed one, a surface claiming more pixels than its
 # buffer holds, one with no buffer at all, and damage past the bottom edge. The
 # third of those is what keeps a lying client from making the *server* fault.
-req "[displaysrv] 4 surface(s) live, 9 commit(s), 24656 pixel(s) composited, 8 refused, 1 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus"
+# Ten commits and 255056 pixels, up from nine and 24656: the tenth is `qt-hello`'s,
+# and the 230400 new pixels are three passes over its 320x240 window — 76800 each for
+# the raise on show, the commit that carried the painted frame, and the repaint of
+# what the window uncovered when it closed. The difference between "Qt started" and
+# "Qt drew" is in that number, and it stays exact for the same reason the rest of the
+# tally does: a compositor repainting whole surfaces per commit would overshoot it.
+req "[displaysrv] 4 surface(s) live, 10 commit(s), 255056 pixel(s) composited, 8 refused, 1 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus"
 # A fourth client opened a window, asked the server to watch it, and crashed. The
 # kernel signals the notification it delegated, the server takes its windows off
 # the screen, and the count says it happened. Whether the *pixels* went back is
@@ -480,6 +495,28 @@ forbid "SURFACE WRONG"
 # The single-core font self-test runs before SMP/tasks, so it must appear on a
 # machine with a framebuffer — and proves the line-atomic DebugWrite path is wired.
 req "[selftest] SINGLE THREAD TEST PASSED"
+
+# Qt, from the top of the stack down: the platform plugin was found without a loader
+# (it is linked in and registered by `Q_IMPORT_PLUGIN`, because `dlopen` refuses
+# here), a window reached the compositor, and the raster engine painted into a buffer
+# the display server reads. `platform=staros` rather than merely "a platform": Qt
+# falling back to `offscreen` would run the same event loop and paint into memory
+# nobody ever sees, printing much the same lines on the way.
+req "[qt-hello] QGuiApplication constructed, platform=staros"
+# The font is named because `drawText` against an empty database draws nothing and
+# says nothing. `IBM Plex Mono` is the family in the initramfs, resolved by the
+# plugin's own database and read whole over IPC from `fssrv` — so this line fails if
+# the database goes back to searching the *build host's* directories, which is what
+# the stock one did.
+req "[qt-hello] painted 320x240, text in 'IBM Plex Mono'"
+# The loop ran, and it ended by itself. `exec returned 0` is the assertion that
+# matters most: this program painted nothing and never returned for a whole day,
+# because `fcntl(F_SETFL, O_NONBLOCK)` returned success and changed nothing, and Qt's
+# dispatcher then blocked for ever draining a wake-up pipe that could not report
+# `EAGAIN`. Both lines are needed — a loop that starts and a loop that finishes are
+# different claims, and only the first one was ever true before.
+req "[qt-hello] event loop tick 1"
+req "[qt-hello] exec returned 0"
 
 run smmu-el2-smp4 120 -- -M virt,gic-version=3,virtualization=on,iommu=smmuv3 -cpu max -smp 4 -m 2G -device edu
 req "iommu: SMMUv3 at"

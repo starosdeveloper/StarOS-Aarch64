@@ -150,8 +150,15 @@ const SYS_ENDPOINT_PENDING: usize = 31;
 
 /// Input arrives from the driver here, and leaves for the focused client on
 /// `EV_BASE + client`.
-const EP_INPUT: u64 = 9;
-const EV_BASE: u64 = 10;
+///
+/// Derived from [`MAX_CLIENTS`] rather than written as 9 and 10, which is what they
+/// were. The client pairs occupy handles 1 through `MAX_CLIENTS * 2`, so both of
+/// these move the moment that number changes — and when they were literals, raising
+/// the client ceiling silently pointed the input endpoint at a client's reply
+/// channel. The symptom would have been keystrokes delivered as replies to display
+/// requests, in a server that had compiled and started normally.
+const EP_INPUT: u64 = (MAX_CLIENTS * 2 + 1) as u64;
+const EV_BASE: u64 = EP_INPUT + 1;
 
 /// The most client pairs this server will look for in its capability table.
 ///
@@ -167,7 +174,13 @@ const EV_BASE: u64 = 10;
 /// them. A shell and an application is two clients before anything else opens a
 /// window, so a server needing a rebuild to accept a third is one that will be
 /// rebuilt at the worst moment.
-const MAX_CLIENTS: usize = 4;
+/// Six, raised from four when the first Qt program needed a slot.
+///
+/// Four was already taken by this tree's own demonstrations — the framebuffer
+/// client, the C program, the client that crashes on purpose, and the one that
+/// receives input — so a real application had nowhere to connect. That is exactly
+/// the failure the paragraph above predicted, arriving on schedule.
+const MAX_CLIENTS: usize = 6;
 fn request_handle(client: usize) -> u64 {
     (client * 2 + 1) as u64
 }
@@ -226,10 +239,16 @@ const BACKGROUND: u32 = 0x0010_2030;
 /// tallies, and ending on a message rather than a commit count is what makes it a
 /// server loop instead of a script.
 ///
-/// Two, not "however many endpoints there are": the extra pairs exist so a third
-/// and fourth client *can* connect, and waiting for goodbyes from clients that were
-/// never started would be a server that never stops.
-const CLIENTS_EXPECTED: u32 = 2;
+/// Three, not "however many endpoints there are": the extra pairs exist so further
+/// clients *can* connect, and waiting for goodbyes from clients that were never
+/// started would be a server that never stops. The three that do say goodbye are
+/// `fbclient`, `hello-c` and `qt-hello` — the last of which only started saying it
+/// the day its event loop stopped hanging, and that is what this number had to be
+/// raised for. At two, the server counted `fbclient` and `qt-hello`, printed its
+/// tally and left, and `hello-c` then found no display server on a machine that had
+/// one a moment earlier. The symptom was a *C* program losing its window; the cause
+/// was a *Qt* program finally finishing.
+const CLIENTS_EXPECTED: u32 = 3;
 
 /// A message, laid out exactly as `staros_ipc::Message`: tag, `MESSAGE_WORDS`
 /// words, then the capability handle. Four words, not six — getting that wrong

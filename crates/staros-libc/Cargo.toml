@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "The C library for EL0 programs: the layers of the G5 contract that need no threads"
 
+[features]
+# Print the call chain at every blocking park. Off by default: it writes to the
+# console from inside the locking primitives, which changes the timing of the very
+# thing it is measuring. Turn it on to find out *who* is asleep when a program stops
+# making progress, then turn it off again.
+park-trace = []
+
 [dependencies]
 staros-abi = { path = "../abi" }
 

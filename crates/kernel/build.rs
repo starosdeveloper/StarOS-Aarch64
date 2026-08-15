@@ -113,6 +113,42 @@ fn main() {
     let libc = build_libc(&manifest_dir, &out_dir, &rustc, &abi_rlib);
     build_hello_c(&manifest_dir, &out_dir, &image_ld, &objcopy, &libc);
     build_hello_cpp(&manifest_dir, &out_dir, &image_ld, &objcopy, &libc);
+    take_qt_hello(&manifest_dir, &out_dir);
+}
+
+/// Pick up `services/qt-hello` if it has been linked, and say so if it has not.
+///
+/// This one is *taken* rather than built, and the difference is deliberate. Qt is
+/// not in this repository: it is a separate tree, built once by hand into a
+/// directory whose path is a property of whoever built it. Linking it here would
+/// make `cargo kbuild` fail on any machine that has not built Qt — which is every
+/// machine, the first time — and the failure would be about a missing archive
+/// rather than about anything the kernel did.
+///
+/// So `scripts/qt-link.sh` produces the image and this function embeds whatever it
+/// finds. That is the same arrangement `build_hello_cpp` uses for a host with no
+/// C++ compiler, and the same rule applies to it: absence is a *fact about the
+/// machine*, reported once and clearly. It is not the answer to a program that
+/// failed to build — `scripts/qt-link.sh` exits nonzero and names the symbol when
+/// that happens, and this function never sees it.
+fn take_qt_hello(manifest_dir: &str, out_dir: &str) {
+    let linked = Path::new(manifest_dir).join("../../target/qt-hello/qt-hello.elf");
+    println!("cargo:rerun-if-changed={}", linked.display());
+
+    let absent = Path::new(out_dir).join("qt-hello.absent");
+    if !linked.exists() {
+        std::fs::write(&absent, []).expect("failed to write the placeholder image");
+        println!("cargo:rustc-env=STAROS_QT_HELLO_IMAGE={}", absent.display());
+        return;
+    }
+
+    // Copied into `OUT_DIR` rather than embedded from where it lies. `include_bytes!`
+    // takes a path, and a path outside the build directory is a dependency cargo
+    // cannot see: the image would be baked in once and never refreshed when
+    // `qt-link.sh` ran again. The `rerun-if-changed` above is the other half of that.
+    let image = Path::new(out_dir).join("qt-hello.elf");
+    std::fs::copy(&linked, &image).expect("failed to copy the Qt program into OUT_DIR");
+    println!("cargo:rustc-env=STAROS_QT_HELLO_IMAGE={}", image.display());
 }
 
 /// The C++ standard library's headers on this host, as (`include`, `include/<triple>`).
@@ -305,8 +341,19 @@ fn build_libc(manifest_dir: &str, out_dir: &str, rustc: &str, abi_rlib: &Path) -
     // module the list forgot.)
     println!("cargo:rerun-if-changed={}", canonical(&src_dir).display());
 
+    // `rustc` directly means cargo's feature flags do not reach this crate, so the
+    // park trace is switched on by the environment instead. It is a diagnostic that
+    // prints from inside the locking primitives, so it must be possible to turn on
+    // for one run without editing anything and off again afterwards.
+    println!("cargo:rerun-if-env-changed=STAROS_PARK_TRACE");
+    let park_trace = env::var_os("STAROS_PARK_TRACE").is_some();
+
     let lib = Path::new(out_dir).join("libstaros_libc.a");
-    let status = Command::new(rustc)
+    let mut command = Command::new(rustc);
+    if park_trace {
+        command.args(["--cfg", "feature=\"park-trace\""]);
+    }
+    let status = command
         .args(["--edition", "2021"])
         .args(["--target", "aarch64-unknown-none"])
         .args(["--crate-name", "staros_libc"])

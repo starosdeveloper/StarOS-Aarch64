@@ -85,7 +85,13 @@ int eventfd(int initial, int flags);
 int eventfd_read(int fd, unsigned long *value);
 int eventfd_write(int fd, unsigned long value);
 int pipe(int fds[2]);
+int pipe2(int fds[2], int flags);
 ssize_t write(int fd, const void *buf, size_t count);
+int fcntl(int fd, int cmd, ...);
+#define F_GETFL 3
+#define F_SETFL 4
+#define O_NONBLOCK 04000
+#define EAGAIN 11
 
 /* The one header in this program that is not hand-written here. Everything else is
  * declared inline on purpose — a C program that links against this library must not
@@ -1357,6 +1363,43 @@ static void check_poll(void)
 
     check(pthread_join(worker_id, 0) == 0, "join the io worker");
     check(pipe_message_ok, "the worker read exactly what the pipe was given");
+
+    /* `O_NONBLOCK`, which is the flag an event loop's *drain* rests on.
+     *
+     * Every event dispatcher on this shape — Qt's included — empties its wake-up
+     * pipe with `while (read(fd, buf, n) > 0) {}` and ends the loop on the `EAGAIN`
+     * that comes when the pipe runs dry. A libc where `fcntl(F_SETFL)` returns 0 and
+     * changes nothing turns that loop into a permanent block, thousands of frames
+     * from the call that caused it. It did: Qt's first event loop here never
+     * completed a pass, and this is the check that would have said why in one line.
+     *
+     * The read must fail, and it must fail *this* way: a read that returned 0 would
+     * be end-of-file, which tells the loop the pipe is closed rather than empty. */
+    int drain[2];
+    check(pipe(drain) == 0, "a pipe to drain");
+    check(fcntl(drain[0], F_SETFL, O_NONBLOCK) == 0, "set O_NONBLOCK on the read end");
+    check((fcntl(drain[0], F_GETFL) & O_NONBLOCK) != 0, "and the flag reads back");
+    char sink[16];
+    errno = 0;
+    check(read(drain[0], sink, sizeof sink) == -1, "an empty non-blocking pipe refuses the read");
+    check(errno == EAGAIN, "with EAGAIN, not end of file");
+    check(write(drain[1], "wake", 4) == 4, "write to the drain pipe");
+    check(read(drain[0], sink, sizeof sink) == 4, "and the non-blocking read takes what is there");
+    errno = 0;
+    check(read(drain[0], sink, sizeof sink) == -1, "the drain ends on the next read");
+    check(errno == EAGAIN, "again with EAGAIN, which is what ends the loop");
+    close(drain[0]);
+    close(drain[1]);
+
+    /* `pipe2` carries the same flag at creation, which is the form Qt uses when it
+     * has it. A flag honoured through `fcntl` and dropped by `pipe2` is the same
+     * hang with a different entry point. */
+    check(pipe2(drain, O_NONBLOCK) == 0, "pipe2 with O_NONBLOCK");
+    errno = 0;
+    check(read(drain[0], sink, sizeof sink) == -1 && errno == EAGAIN,
+          "and both ends came out non-blocking");
+    close(drain[0]);
+    close(drain[1]);
 
     close(event_fd);
     close(pipe_fds[0]);

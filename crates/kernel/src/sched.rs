@@ -1017,6 +1017,52 @@ pub fn live_spaces() -> usize {
     sched.tasks.iter().filter(|t| t.space.is_some()).count()
 }
 
+/// Every still-live task, as `(index, pid, state, until_ns)`, for the shutdown report.
+///
+/// The count alone said "six tasks are still holding memory" and left it there,
+/// which is fine while every one of them is a server blocked in `Recv` on purpose.
+/// It stopped being fine the first time a *program* failed to finish: a Qt program
+/// stalled somewhere inside its event loop, and the difference between waiting for a
+/// message that will not come and sleeping on a deadline that will arrive is the
+/// whole diagnosis — and the scheduler is the only thing that knows which.
+///
+/// The state is rendered as one word rather than returned as [`State`], because
+/// `State` is private to this module and widening it for a report would be the wrong
+/// trade.
+///
+/// The table is a `Vec` and grows, so the caller supplies the buffer and gets back
+/// how much of it was filled. A caller whose buffer is too small sees a count equal
+/// to its length, which is the honest way to say "there may be more" — and is why
+/// the shutdown report sizes its array well above the tasks a boot creates.
+///
+/// `until_ns` is the sleep deadline, or zero for any other state. It is here because
+/// a task that is `Sleeping` past a deadline the clock has already passed is a
+/// different defect from one that is sleeping normally, and the word alone cannot
+/// tell them apart.
+#[must_use]
+pub fn live_task_report(out: &mut [(usize, u64, &'static str, u64)]) -> usize {
+    let sched = SCHED.lock();
+    let mut n = 0;
+    for (i, t) in sched.tasks.iter().enumerate() {
+        if n == out.len() {
+            break;
+        }
+        if t.space.is_none() {
+            continue;
+        }
+        let (state, until_ns) = match t.state {
+            State::Ready => ("ready", 0),
+            State::Running => ("running", 0),
+            State::Blocked => ("blocked (waiting for a message)", 0),
+            State::Sleeping { until_ns } => ("sleeping (a deadline will wake it)", until_ns),
+            State::Dead => ("dead", 0),
+        };
+        out[n] = (i, t.pid, state, until_ns);
+        n += 1;
+    }
+    n
+}
+
 /// Park the current task in `parked` and switch away, resuming here when it is
 /// made `Ready` again and next scheduled. The caller must already have arranged
 /// for something to wake it — a wait queue for [`State::Blocked`], the clock for

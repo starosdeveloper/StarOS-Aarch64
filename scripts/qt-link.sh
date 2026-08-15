@@ -100,9 +100,19 @@ libs=(
 )
 
 echo "linking qt-hello"
+# `-z separate-loadable-segments` is not tidiness. Without it lld packs segments
+# that share a page: this program has three `PT_LOAD`s — read-only, read+execute,
+# read+write — and the second landed at `0x80024930`, inside the first one's last
+# page. The kernel's `map_segment` requires a page-aligned `vaddr` and refuses
+# anything else, so the whole image failed to load with no message beyond "building
+# its address space failed".
+#
+# Every other program in this tree has two segments that happen to fall on page
+# boundaries anyway, which is why nothing had ever hit this. It costs at most two
+# pages of padding.
 ld.lld -m aarch64linux -static \
     "-T$root/services/init/boot/image.ld" \
-    -z max-page-size=4096 -z norelro \
+    -z max-page-size=4096 -z norelro -z separate-loadable-segments \
     --gc-sections \
     -o "$out/qt-hello.debug.elf" \
     "${libs[@]}" 2>"$out/link.log"
@@ -117,6 +127,43 @@ if [ $status -ne 0 ]; then
     echo
     echo "  $(grep -c 'undefined symbol' "$out/link.log") reference(s), $(grep -oE 'undefined symbol: .*' "$out/link.log" | sort -u | wc -l) distinct"
     echo "  full log: $out/link.log"
+    exit 1
+fi
+
+# Every loadable segment must start on a page boundary, and this is checked here
+# rather than discovered at boot.
+#
+# The kernel's `map_segment` refuses a `vaddr` that is not a multiple of 4096, and
+# the whole image then fails to load — which the kernel reports as one line about an
+# address space, naming no section and no address. That is a long way from the cause.
+#
+# The cause is orphan placement: a section `services/init/boot/image.ld` does not
+# mention gets placed by lld according to its attributes, and a read-only one lands
+# ahead of `.text` as a segment of its own. The section list below is what turns
+# "the Qt program never appeared" into a name.
+bad=0
+while read -r vaddr; do
+    [ -z "$vaddr" ] && continue
+    if [ $((vaddr % 4096)) -ne 0 ]; then
+        bad=1
+        printf 'PT_LOAD at 0x%x is not page-aligned\n' "$vaddr"
+    fi
+done <<EOF
+$(readelf -lW "$out/qt-hello.debug.elf" 2>/dev/null |
+    awk '$1 == "LOAD" { print strtonum($3) }')
+EOF
+
+if [ "$bad" = 1 ]; then
+    echo
+    echo "  The kernel's ELF loader requires page-aligned segments and will refuse"
+    echo "  this image. It is caused by an orphan section — one that image.ld does"
+    echo "  not name — being given a PT_LOAD of its own. Sections by segment:"
+    echo
+    readelf -lW "$out/qt-hello.debug.elf" 2>/dev/null |
+        sed -n '/Section to Segment/,$p' | head -8 | cut -c1-200 | sed 's/^/    /'
+    echo
+    echo "  Add the offending section to the .text output section in"
+    echo "  services/init/boot/image.ld, or to /DISCARD/ if nothing reads it."
     exit 1
 fi
 

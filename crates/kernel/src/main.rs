@@ -69,6 +69,15 @@ static HELLO_C_IMAGE: &[u8] = include_bytes!(env!("STAROS_HELLO_C_IMAGE"));
 /// no C++ compiler or standard headers.
 static HELLO_CPP_IMAGE: &[u8] = include_bytes!(env!("STAROS_HELLO_CPP_IMAGE"));
 
+/// A program written with **Qt**: `QGuiApplication`, a `QRasterWindow` painted with
+/// `QPainter`, and an event loop. Empty unless `scripts/qt-link.sh` has been run,
+/// because Qt is built outside this repository — see `take_qt_hello` in `build.rs`.
+///
+/// It is about twelve megabytes, which is most of this kernel image. There is no
+/// dynamic loader here, so a static QtCore and QtGui with the raster paint engine,
+/// FreeType and HarfBuzz are all inside it.
+static QT_HELLO_IMAGE: &[u8] = include_bytes!(env!("STAROS_QT_HELLO_IMAGE"));
+
 mod cap;
 mod console;
 mod elf;
@@ -1277,6 +1286,16 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     let ep_fb3_reply = obj::create(obj::Object::Endpoint { id: 16 }).expect("ep_fb3_reply object");
     let ep_fb4 = obj::create(obj::Object::Endpoint { id: 17 }).expect("ep_fb4 object");
     let ep_fb4_reply = obj::create(obj::Object::Endpoint { id: 18 }).expect("ep_fb4_reply object");
+    // And two more, because four was not enough on the day it mattered. The four
+    // above are taken by this tree's own demonstrations — the framebuffer client,
+    // the C program, the client that crashes on purpose, and the one that receives
+    // input — so the first real application, `services/qt-hello`, arrived to find
+    // every slot occupied. The paragraph above predicted exactly that; the fix is
+    // the same two lines it would have been then.
+    let ep_fb5 = obj::create(obj::Object::Endpoint { id: 23 }).expect("ep_fb5 object");
+    let ep_fb5_reply = obj::create(obj::Object::Endpoint { id: 24 }).expect("ep_fb5_reply object");
+    let ep_fb6 = obj::create(obj::Object::Endpoint { id: 25 }).expect("ep_fb6 object");
+    let ep_fb6_reply = obj::create(obj::Object::Endpoint { id: 26 }).expect("ep_fb6_reply object");
     // Input events, per display client. The driver publishes to one endpoint and the
     // *display server* decides who hears it, which is where that decision belongs: it
     // is the only process that knows which window is in front. A driver routing input
@@ -1286,14 +1305,27 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // A separate endpoint per client rather than the reply one they already hold: a
     // client doing a request and waiting for its answer would otherwise find an event
     // in its hand instead, and every call site would have to loop.
-    let ep_ev: [obj::ObjectRef; 4] = [
+    //
+    // One per client pair, so this array's length and the number of pairs above are
+    // the same number in two places — `displaysrv` computes `EV_BASE` from its own
+    // `MAX_CLIENTS`, and a mismatch here would point it at the wrong endpoint
+    // rather than at nothing.
+    let ep_ev: [obj::ObjectRef; 6] = [
         obj::create(obj::Object::Endpoint { id: 19 }).expect("ep_ev1 object"),
         obj::create(obj::Object::Endpoint { id: 20 }).expect("ep_ev2 object"),
         obj::create(obj::Object::Endpoint { id: 21 }).expect("ep_ev3 object"),
         obj::create(obj::Object::Endpoint { id: 22 }).expect("ep_ev4 object"),
+        obj::create(obj::Object::Endpoint { id: 27 }).expect("ep_ev5 object"),
+        obj::create(obj::Object::Endpoint { id: 28 }).expect("ep_ev6 object"),
     ];
     let ep_fs2 = obj::create(obj::Object::Endpoint { id: 10 }).expect("ep_fs2 object");
     let ep_fs2_reply = obj::create(obj::Object::Endpoint { id: 11 }).expect("ep_fs2_reply object");
+    // A third file-server pair, for the Qt program. Qt reads the filesystem before
+    // it draws anything: `QFreeTypeFontDatabase` looks for font files, and a Qt with
+    // no fonts renders every string as nothing at all — which looks like a broken
+    // paint path rather than a missing service.
+    let ep_fs3 = obj::create(obj::Object::Endpoint { id: 29 }).expect("ep_fs3 object");
+    let ep_fs3_reply = obj::create(obj::Object::Endpoint { id: 30 }).expect("ep_fs3_reply object");
 
     // The *only* device policy the kernel still holds: the authority to mint. It
     // pre-mints no UART objects at all now — the device manager (id 7) reads the
@@ -1407,9 +1439,17 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb3_reply, send: true, recv: false });
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb4, send: false, recv: true });
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb4_reply, send: true, recv: false });
-        // Handle 9: input arriving from the driver. Handles 10..13: input leaving,
-        // one per client. The server is the hinge, because it is the only process
-        // that knows which window is in front.
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb5, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb5_reply, send: true, recv: false });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb6, send: false, recv: true });
+        cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_fb6_reply, send: true, recv: false });
+        // Handle 13: input arriving from the driver. Handles 14..19: input leaving,
+        // one per client. The numbers follow the six pairs above and are computed
+        // on the server's side from its own `MAX_CLIENTS`, so this comment is the
+        // only place they are written down as literals — the code is not.
+        //
+        // The server is the hinge, because it is the only process that knows which
+        // window is in front.
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_events, send: false, recv: true });
         for ev in ep_ev {
             cap::install(&mut caps, cap::Cap::Endpoint { obj: ev, send: true, recv: false });
@@ -1528,6 +1568,69 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
             );
             (server, client)
         })
+    };
+
+    // The Qt program, and the first client here that is an *application* rather than
+    // a demonstration of one mechanism.
+    //
+    // It holds exactly what `services/qstaros` expects, in the order the plugin
+    // documents as the ABI: the file server's pair at handles 1 and 2, the display
+    // server's fifth pair at 3 and 4, and its input channel at 5. That order is the
+    // whole interface between this file and the plugin — there is no negotiation and
+    // nothing to ask, which is why both sides write it down.
+    //
+    // The fifth pair, not one of the first four: those are taken by the framebuffer
+    // client, the C program, the client that crashes on purpose and the one that
+    // receives input. Four was the ceiling until this program needed a slot.
+    let qt = if QT_HELLO_IMAGE.is_empty() {
+        let _ = writeln!(
+            console,
+            "no Qt program in this image: run scripts/qt-link.sh (Qt is built outside this tree)"
+        );
+        None
+    } else if display.is_none() {
+        // Only where there is a screen, for the reason `dying_client` gives: a
+        // display client on a machine with no framebuffer blocks in `Recv` for ever,
+        // and a task still holding an address space at shutdown moves the
+        // frame-reclaim verdict.
+        let _ = writeln!(console, "no Qt program started: this machine has no framebuffer");
+        None
+    } else {
+        let built = file_pair(QT_HELLO_IMAGE, 23, 24, ep_fs3, ep_fs3_reply).map(
+            |(server, mut client)| {
+                cap::install(
+                    &mut client.1,
+                    cap::Cap::Endpoint { obj: ep_fb5, send: true, recv: false },
+                );
+                cap::install(
+                    &mut client.1,
+                    cap::Cap::Endpoint { obj: ep_fb5_reply, send: false, recv: true },
+                );
+                cap::install(
+                    &mut client.1,
+                    cap::Cap::Endpoint { obj: ep_ev[4], send: false, recv: true },
+                );
+                (server, client)
+            },
+        );
+        if built.is_none() {
+            // Said out loud, because the first attempt at this was silent and that
+            // was the whole bug: `file_pair` returns `None` when an address space or
+            // a set of capabilities cannot be built, the program simply never
+            // appeared in the log, and nothing distinguished "not started" from
+            // "started and printed nothing".
+            //
+            // The likely cause is size. This image is about twelve megabytes and
+            // every other program here is under half of one, so it is the first
+            // thing to ask the frame pool for that much at once.
+            let _ = writeln!(
+                console,
+                "the Qt program could not be loaded: {} KiB of image, and building its \
+                 address space failed",
+                QT_HELLO_IMAGE.len() / 1024
+            );
+        }
+        built
     };
 
     // The C++ program. It holds **no capabilities at all**: everything it does —
@@ -1690,6 +1793,13 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     if let Some(((fs_space, fs_caps), (c_space, c_caps))) = c_files {
         sched::spawn_user(user_task_entry, fs_space, fs_caps);
         sched::spawn_user(user_task_entry, c_space, c_caps);
+    }
+    // Its file server first, then the program — the same ordering argument as every
+    // other pair here: the server should already be blocked in `Recv` when the first
+    // request arrives, so what runs is the wake path rather than the spawn order.
+    if let Some(((fs_space, fs_caps), (qt_space, qt_caps))) = qt {
+        sched::spawn_user(user_task_entry, fs_space, fs_caps);
+        sched::spawn_user(user_task_entry, qt_space, qt_caps);
     }
     if let Some(cpp_space) = cpp {
         sched::spawn_user(
@@ -1858,6 +1968,39 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
             "  ({still_held} task(s) still alive and holding their address space — \
              send a newline to let the UART driver exit and the pool returns whole)"
         );
+        // Which ones, and *why* each is still here. A count says "six", and six is
+        // the right answer while all six are servers parked in `Recv` on purpose;
+        // it is the wrong answer the moment a program is among them, and the count
+        // cannot tell the two apart. `blocked` means it is waiting for a message
+        // that may never come; `sleeping` means the clock owes it a wake-up. That
+        // distinction is the whole difference between a deadlock and a timer.
+        //
+        // 32 slots: the boot creates well under a dozen tasks and the buffer is on
+        // the stack of a function that is about to power the machine off, so the
+        // cost of being generous here is nothing and the cost of truncating is a
+        // report that hides the task one is looking for.
+        let mut report = [(0usize, 0u64, "", 0u64); 32];
+        let n = sched::live_task_report(&mut report);
+        let now = sched::clock_now();
+        for &(idx, pid, state, until_ns) in &report[..n] {
+            if until_ns != 0 {
+                // A deadline already in the past on a task that is still sleeping
+                // is not "waiting" — it is a wake-up that was missed, which is a
+                // defect in `wake_expired`, not in whatever asked to sleep.
+                let overdue = if until_ns <= now { " — DEADLINE ALREADY PASSED" } else { "" };
+                let _ = writeln!(
+                    console,
+                    "    task {idx} (pid {pid}): {state}, until {} ms, now {} ms{overdue}",
+                    until_ns / 1_000_000,
+                    now / 1_000_000,
+                );
+            } else if let Some((ep, is_send)) = ipc::waiting_on(idx) {
+                let dir = if is_send { "send to" } else { "recv on" };
+                let _ = writeln!(console, "    task {idx} (pid {pid}): {state}, {dir} ep{ep}");
+            } else {
+                let _ = writeln!(console, "    task {idx} (pid {pid}): {state}");
+            }
+        }
     }
 
     // The demo is over, so put the machine down rather than spinning forever.

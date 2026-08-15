@@ -47,7 +47,7 @@ use crate::sync::SpinLock;
 /// objects in `main`, which is exactly the kind of seam that bites: giving the
 /// display endpoint id 4 put its traffic into [`STORM_EP`], and the display server
 /// spent its life rejecting storm messages it had no business seeing.
-const NUM_ENDPOINTS: usize = 23;
+const NUM_ENDPOINTS: usize = 31;
 
 /// The endpoint the IPC contention test uses (see [`storm_stats`]).
 ///
@@ -383,6 +383,28 @@ pub fn bind_notify(ep: usize, notif: Option<usize>) -> bool {
 #[must_use]
 pub fn pending(ep: usize) -> usize {
     IPC.lock().get(ep).map_or(0, |e| e.len)
+}
+
+/// Where task `task` is waiting: `(endpoint, is_send)`, or `None` if it is not on
+/// any endpoint's wait queue.
+///
+/// The scheduler can say a task is `Blocked`; it cannot say *what for*, because the
+/// wait queues live here. The difference matters the first time a program stalls
+/// rather than a server: a client parked on its own reply endpoint is waiting for an
+/// answer that a server owes it, and a client parked on its event endpoint is
+/// waiting for input that will never come — the same word, two different defects.
+#[must_use]
+pub fn waiting_on(task: usize) -> Option<(usize, bool)> {
+    let ipc = IPC.lock();
+    for (ep, e) in ipc.iter().enumerate() {
+        if e.recv_waiters[..e.n_recv].contains(&task) {
+            return Some((ep, false));
+        }
+        if e.send_waiters[..e.n_send].iter().any(|&(t, _)| t == task) {
+            return Some((ep, true));
+        }
+    }
+    None
 }
 
 /// Emit a short kernel diagnostic (used to make the blocking-send path visible).

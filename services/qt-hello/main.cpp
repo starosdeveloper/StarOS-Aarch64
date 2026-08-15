@@ -18,6 +18,8 @@
 // failure mode this comment exists to make recognisable.
 
 #include <QtGui/QGuiApplication>
+#include <QtGui/QFontInfo>
+#include <QtGui/QFontMetrics>
 #include <QtGui/QPainter>
 #include <QtGui/QRasterWindow>
 #include <QtCore/QTimer>
@@ -74,7 +76,19 @@ protected:
         painter.drawText(QRect(8, area.height() / 3 + 8, area.width() - 16, 40),
                          Qt::AlignLeft, QStringLiteral("Qt on StarOS"));
 
-        std::printf("[qt-hello] painted %dx%d\n", area.width(), area.height());
+        // The text is the one thing on this window that a pixel check cannot claim on
+        // its own: bars and a diagonal are drawn by the raster engine with no font
+        // involved, and a `drawText` against an empty database silently draws
+        // nothing. So say what font was actually resolved and how wide it made the
+        // string. A family that is not the one in the initramfs, or a width of zero,
+        // is a font database that found nothing — which is what this system did
+        // until the plugin stopped looking in the host's directories.
+        const QFontMetrics metrics(painter.font());
+        const QString label = QStringLiteral("Qt on StarOS");
+        std::printf("[qt-hello] painted %dx%d, text in '%s' %d px wide, %d px tall\n",
+                    area.width(), area.height(),
+                    QFontInfo(painter.font()).family().toLocal8Bit().constData(),
+                    metrics.horizontalAdvance(label), metrics.height());
         std::fflush(stdout);
     }
 };
@@ -94,16 +108,44 @@ int main(int argc, char **argv)
     std::printf("[qt-hello] window shown\n");
     std::fflush(stdout);
 
+    // Three markers rather than one, because "nothing was painted" has three
+    // different causes and they are indistinguishable from the outside: the event
+    // loop never started, it started and delivered nothing, or it delivered the
+    // expose and the paint produced no output. Each line below rules one out.
+    //
+    // A zero-millisecond timer is not a delay — it is a request to be called back on
+    // the first pass of the loop, so its line appearing proves the dispatcher is
+    // running at all.
+    // A repeating timer rather than a single shot, because "the loop ran once" and
+    // "the loop is running" are different claims and only the second one is
+    // interesting. Each tick that prints is a pass through the blocking wait and
+    // back, so a counter that stops tells us the wait is where it stopped.
+    auto *heartbeat = new QTimer(&app);
+    int ticks = 0;
+    QObject::connect(heartbeat, &QTimer::timeout, &app, [&ticks] {
+        ++ticks;
+        std::printf("[qt-hello] event loop tick %d\n", ticks);
+        std::fflush(stdout);
+    });
+    heartbeat->start(100);
+
     // Ends by itself. This runs under `cargo krun`, which has no keyboard operator
     // and no patience: a program that waited for a close event would hold the whole
     // smoke run open until QEMU's own timeout, and the log would say nothing about
     // why. Quitting on a timer means the exit code is a result.
-    QTimer::singleShot(3000, &app, [] {
+    //
+    // 400 ms, not 3000: the first attempt used three seconds and the whole machine
+    // powered off before it elapsed — every other program in the boot had finished,
+    // and this one was still counting. The number has to be shorter than the demo,
+    // not shorter than a person's patience.
+    QTimer::singleShot(400, &app, [] {
         std::printf("[qt-hello] quitting\n");
         std::fflush(stdout);
         QGuiApplication::quit();
     });
 
+    std::printf("[qt-hello] entering the event loop\n");
+    std::fflush(stdout);
     const int code = app.exec();
     std::printf("[qt-hello] exec returned %d\n", code);
     std::fflush(stdout);
