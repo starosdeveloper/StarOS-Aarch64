@@ -113,8 +113,19 @@ struct Slot {
 static OBJECTS: SpinLock<Vec<Slot>> = SpinLock::new(Vec::new());
 
 /// Create a new object, returning a reference to it, or `None` if the heap is
-/// exhausted.
+/// exhausted — or, for an endpoint, if its id names no slot in the IPC table.
 pub fn create(object: Object) -> Option<ObjectRef> {
+    // An endpoint object carries an id into a fixed table in `ipc`, and an id past
+    // the end of that table makes an object that is perfectly well formed and that
+    // no send or receive can ever use. Refusing here puts the failure on the line
+    // that wrote the number; the alternative — which happened — is a server that
+    // starts, announces itself, and then reports `receive failed` with no id in
+    // sight. See `ipc::NUM_ENDPOINTS` for the incident.
+    if let Object::Endpoint { id } = object {
+        if !crate::ipc::endpoint_exists(id) {
+            return None;
+        }
+    }
     let mut slots = OBJECTS.lock();
     // Prefer a revoked slot. Reusing it *keeps its generation*, which is what
     // stops a new object from silently answering to a stale reference minted for

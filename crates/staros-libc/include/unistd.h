@@ -22,6 +22,33 @@
 extern "C" {
 #endif
 
+/* The POSIX options this system implements, and only those.
+ *
+ * These are not decoration. A program tests them at *compile* time to decide which
+ * of two code paths to take, and an option left undefined is read as "this system
+ * cannot do that" — which is a claim, and here it was a false one. Qt's
+ * `QThread::start` is the case that found it:
+ *
+ *     #if defined(_POSIX_THREAD_ATTR_STACKSIZE) && (_POSIX_THREAD_ATTR_STACKSIZE-0 > 0)
+ *         int code = pthread_attr_setstacksize(&attr, d->stackSize);
+ *     #else
+ *         int code = ENOSYS; // stack size not supported, automatically fail
+ *     #endif
+ *
+ * The function is right here in this header and implemented in
+ * `crates/staros-libc/src/thread.rs`, and Qt compiled the branch that says it does
+ * not exist — then printed `Thread stack size error (Function not implemented)` at
+ * run time about a function that works.
+ *
+ * `_POSIX_THREADS` and `_POSIX_TIMERS` are the same statement about the two other
+ * things this library really has. Nothing else is claimed: an option added here
+ * without the calls behind it moves a link error into a run-time surprise, which is
+ * the whole failure this header's opening paragraph is about.
+ */
+#define _POSIX_THREADS               200809L
+#define _POSIX_THREAD_ATTR_STACKSIZE 200809L
+#define _POSIX_TIMERS                200809L
+
 typedef long ssize_t;
 typedef long off_t;
 typedef int pid_t;
@@ -131,6 +158,25 @@ pid_t getppid(void);
 uid_t getuid(void);
 uid_t geteuid(void);
 gid_t getgid(void);
+
+/* The names `sysconf` answers, with the values Linux gives them.
+ *
+ * The numbers are not free choices: a program compiled against the host's headers
+ * and linked against this library — which is every third-party source tree here —
+ * passes the host's number, so any other value would answer the wrong question.
+ * Everything not listed is refused with `EINVAL` rather than guessed at; see
+ * `crates/staros-libc/src/proc.rs`.
+ *
+ * `_SC_PAGE_SIZE` is the same name spelled the other way. Both spellings are in use
+ * in the wild — `qtdeclarative`'s bundled masm asks for `_SC_PAGESIZE`, and its
+ * absence here was a compile error a long way from anything about page sizes. */
+#define _SC_ARG_MAX          0
+#define _SC_CLK_TCK          2
+#define _SC_OPEN_MAX         4
+#define _SC_PAGESIZE         30
+#define _SC_PAGE_SIZE        _SC_PAGESIZE
+#define _SC_NPROCESSORS_CONF 83
+#define _SC_NPROCESSORS_ONLN 84
 
 long sysconf(int name);
 int getpagesize(void);

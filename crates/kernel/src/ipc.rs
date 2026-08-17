@@ -47,7 +47,29 @@ use crate::sync::SpinLock;
 /// objects in `main`, which is exactly the kind of seam that bites: giving the
 /// display endpoint id 4 put its traffic into [`STORM_EP`], and the display server
 /// spent its life rejecting storm messages it had no business seeing.
-const NUM_ENDPOINTS: usize = 31;
+/// Thirty-three, and the number moves whenever `main` mints another pair.
+///
+/// It was thirty-one when the QML program was given a file server of its own, whose
+/// pair is ids 31 and 32. Nothing refused the ids: `obj::create` made the objects,
+/// the capabilities were installed, the server started, printed the line about the
+/// archive being its own — and then `Recv` returned `InvalidArgument` on an endpoint
+/// that had no slot in this table. The console said `[fssrv] receive failed`, which
+/// names neither the endpoint nor the id nor this constant.
+///
+/// [`endpoint_exists`] is what closes that gap, and this comment is why it exists.
+const NUM_ENDPOINTS: usize = 33;
+
+/// Whether `id` names a slot in this table.
+///
+/// The ids are a shared numbering between this file and `main`, and the seam is
+/// exactly where a mismatch is invisible: an endpoint object with an id past the end
+/// is a perfectly good object that no send or receive can ever use. `obj::create`
+/// asks this before making one, so the failure lands on the line in `main` that
+/// wrote the number.
+#[must_use]
+pub const fn endpoint_exists(id: usize) -> bool {
+    id < NUM_ENDPOINTS
+}
 
 /// The endpoint the IPC contention test uses (see [`storm_stats`]).
 ///

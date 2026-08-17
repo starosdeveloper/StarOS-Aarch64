@@ -117,9 +117,40 @@ set(STAROS_SYSROOT_FLAG "-isystem ${STAROS_SYSROOT}")
 # <cwchar> — works the same way, so this ordering is what makes any of them usable.
 #
 # The C compiler has no such wrapper layer and takes the sysroot on its own.
+#
+# `-fno-exceptions` stays and `-fno-rtti` is gone, and the asymmetry is not an
+# oversight. They were chosen together as one months-saving decision — no unwinder,
+# no `.eh_frame`, no `__cxa_throw`, no `dynamic_cast` — and only half of that
+# decision survived contact with Qt Quick.
+#
+# Exceptions are still genuinely absent: nothing in the Qt this system builds throws,
+# `crates/staros-libc/cxx/runtime.cpp` ends the program at `__cxa_throw`, and an
+# unwinder is a large thing to build for a path nothing takes.
+#
+# RTTI turned out to be load-bearing, and in the one place that could not be worked
+# around. `QSGSoftwareRenderableNodeUpdater::visit(QSGGeometryNode *)` — the
+# software scene graph's dispatch, the thing that decides what a node *is* before it
+# is drawn — is five chained `dynamic_cast`s ending in
+#
+#     } else {
+#         // We dont know, so skip
+#         return false;
+#     }
+#
+# With `-fno-rtti` every one of those casts is a compile error, and with them patched
+# out every node in every scene takes the last branch: a QML program that runs, paints
+# nothing, and reports no error at all. There is no enum to switch on instead — the
+# public node classes are distinguished by their type and by nothing else.
+#
+# So `__dynamic_cast` and the `__do_dyncast` family are implemented in
+# `crates/staros-libc/cxx/runtime.cpp`, and every C++ translation unit for this target
+# is compiled with RTTI. That includes qtbase, which has to be rebuilt for it: a
+# `-fno-rtti` build emits no `typeinfo` for its polymorphic classes at all (thirteen
+# `_ZTI` symbols in the whole of libQt6Core.a), and a vtable whose type-information
+# slot is null is one that `__dynamic_cast` cannot say anything true about.
 set(CMAKE_C_FLAGS_INIT "${STAROS_COMMON_FLAGS} ${STAROS_SYSROOT_FLAG}")
 set(CMAKE_CXX_FLAGS_INIT
-    "${STAROS_COMMON_FLAGS} -isystem ${STAROS_CXX_INCLUDE} -isystem ${STAROS_CXX_TARGET_INCLUDE} ${STAROS_SYSROOT_FLAG} -fno-exceptions -fno-rtti")
+    "${STAROS_COMMON_FLAGS} -isystem ${STAROS_CXX_INCLUDE} -isystem ${STAROS_CXX_TARGET_INCLUDE} ${STAROS_SYSROOT_FLAG} -fno-exceptions -frtti")
 
 # Static everything. There is no dynamic loader here — `dlopen` refuses, and the
 # kernel's ELF loader gives `PT_LOAD` fixed permissions — so a plugin is linked in

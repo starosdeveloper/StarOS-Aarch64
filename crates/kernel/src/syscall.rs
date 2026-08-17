@@ -296,9 +296,27 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         Some(Syscall::SpawnThread) => {
             /// A thread's stack is fixed-size (no demand growth outside the address
             /// space's own stack region), so the ceiling is what a thread may claim
-            /// up front rather than what it may ever use. 64 pages is 256 KiB — the
-            /// same limit the main stack grows to.
-            const MAX_THREAD_STACK_PAGES: u64 = 64;
+            /// up front rather than what it may ever use.
+            ///
+            /// 2048 pages is 8 MiB, and the number is Qt's rather than a round one.
+            /// `QQmlThreadPrivate` — the thread QML parses and compiles on — asks for
+            /// exactly 8 MiB, with the reason in its constructor:
+            ///
+            ///     // This size is aligned with the recursion depth limits in the
+            ///     // parser/codegen. In case of absurd content we want to hit the
+            ///     // recursion checks instead of running out of stack.
+            ///
+            /// A ceiling below that does not make the thread smaller, it makes the
+            /// request fail — and Qt then runs the parser on the default stack with
+            /// recursion checks calibrated for a stack sixteen times larger, which is
+            /// the arrangement that constructor exists to avoid.
+            ///
+            /// The cost is real here in a way it is not for the main stack: these
+            /// pages are mapped at once, so a thread that asks for the ceiling gets
+            /// eight megabytes whether it uses them or not. Which is why the *default*
+            /// in `crates/staros-libc` stays at sixteen pages: this is what a thread
+            /// may ask for, not what one gets by default.
+            const MAX_THREAD_STACK_PAGES: u64 = 2048;
             let pages = req.args[1];
             if pages == 0 || pages > MAX_THREAD_STACK_PAGES {
                 return KError::InvalidArgument.as_raw();
@@ -360,7 +378,20 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             // and starve every other task before the allocator can say no. Large
             // enough that a C heap grows in useful bites: 4 MiB per call turns the
             // 4096 syscalls that 16 MiB used to cost into eight.
-            const MAX_ANON_PAGES: u64 = 1024;
+            //
+            // Raised to 16 MiB, because a ceiling on a request that *cannot be
+            // split* is not a pacing device, it is a hard limit on what any single
+            // object may be. `mmap` in this system's C library is one `MapAnon`
+            // call: the pages have to be one contiguous run, and issuing four calls
+            // and hoping they land next to each other is not an implementation.
+            //
+            // What asked: QML's JavaScript engine reserves its interpreter stack in
+            // one piece — `s_maxJSStackSize + 256 KiB + guard pages`, which is
+            // 4 MiB and a little, or 1090 pages against a ceiling of 1024. The
+            // failure was six frames deep in `WTF::OSAllocator::reserveAndCommit`,
+            // which answers a failed `mmap` by writing to `0xbbadbeef` — so the
+            // console said `EL0 fault at 0xbbadbeef` and nothing about pages.
+            const MAX_ANON_PAGES: u64 = 4096;
             let pages = req.args[0];
             if pages == 0 || pages > MAX_ANON_PAGES {
                 return KError::InvalidArgument.as_raw();

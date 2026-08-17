@@ -803,6 +803,20 @@ static void check_dirs(void)
     check((st.st_mode & S_IFMT) == S_IFDIR, "stat reports a directory");
     check(stat("no-such-file", &st) != 0, "stat of a missing file fails");
 
+    /* The same file by the three spellings a toolkit produces. There is one
+     * filesystem here and its root is the archive, so an absolute path can only
+     * mean what the relative one means — and a library that turns every path into a
+     * URL and back hands over the absolute form. Qt does exactly that, and the
+     * failure it caused was a QML scene the same program had just read by its
+     * relative name reported as "No such file or directory". */
+    struct stat absolute;
+    check(stat("/greeting.txt", &absolute) == 0 && absolute.st_size == 25,
+          "an absolute path names the same file, at the same size");
+    check(stat("./greeting.txt", &absolute) == 0 && absolute.st_size == 25,
+          "and so does a leading ./");
+    check(stat("//greeting.txt", &absolute) == 0 && absolute.st_size == 25,
+          "and so do repeated slashes");
+
     int fd = open("greeting.txt", 0, 0);
     check(fd >= 0, "open for fstat");
     check(fstat(fd, &st) == 0 && st.st_size == 25, "fstat agrees with stat");
@@ -964,11 +978,19 @@ static void check_process(void)
     check(random_at != 0, "getauxval provides AT_RANDOM bytes");
     check(getauxval(AT_RANDOM) == random_at, "…at a stable address");
 
-    /* Limits the kernel actually enforces: the stack really does stop at 256 KiB,
-     * which is the number the fault line in this very log reports. */
+    /* Limits the kernel actually enforces: the stack really does stop where this
+     * says, which is the number the fault line in this very log reports.
+     *
+     * One megabyte, raised from a quarter of one when QML's JavaScript engine turned
+     * out to size its own recursion limit from this value and subtract a 128 KiB
+     * safety margin before evaluating anything. The number lives in
+     * `arch_aarch64::addrspace::USER_STACK_MAX_PAGES`, is copied into
+     * `crates/staros-libc/src/thread.rs` because a C library cannot include the
+     * kernel's crates, and is asserted here — three places, and this is the one that
+     * fails loudly when they disagree. */
     struct rlimit rl;
     check(getrlimit(RLIMIT_STACK, &rl) == 0, "getrlimit");
-    check(rl.rlim_cur == 256 * 1024, "the stack limit is the one the kernel enforces");
+    check(rl.rlim_cur == 1024 * 1024, "the stack limit is the one the kernel enforces");
     check(getrlimit(RLIMIT_NOFILE, &rl) == 0, "getrlimit for descriptors");
     check(rl.rlim_cur >= 16, "the descriptor limit is the table's real size");
     struct rlimit bigger = { 8 * 1024 * 1024, 8 * 1024 * 1024 };
@@ -1090,8 +1112,15 @@ static void check_process(void)
     check(depth >= 2, "backtrace walked at least this frame and its caller");
     check(frames[0] != 0, "…and recorded a return address");
 
+    /* The limit as `getrlimit` reports it, not as a literal beside it. It was a
+     * literal 256, and when the kernel's limit went to a megabyte the line kept
+     * saying 256 KiB while the check above compared against the real number — so
+     * the log and the assertion disagreed and only the assertion knew. */
+    struct rlimit stack_limit;
+    unsigned long stack_kib =
+        getrlimit(RLIMIT_STACK, &stack_limit) == 0 ? (unsigned long)(stack_limit.rlim_cur / 1024) : 0;
     printf("[hello-c] process %d: uname %s %s, stack limit %lu KiB, backtrace %d frames\n",
-           pid, u.sysname, u.release, (unsigned long)(256), depth);
+           pid, u.sysname, u.release, stack_kib, depth);
 }
 
 /* Layer 5: threads, locks and thread-local storage.

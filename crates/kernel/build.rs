@@ -113,32 +113,41 @@ fn main() {
     let libc = build_libc(&manifest_dir, &out_dir, &rustc, &abi_rlib);
     build_hello_c(&manifest_dir, &out_dir, &image_ld, &objcopy, &libc);
     build_hello_cpp(&manifest_dir, &out_dir, &image_ld, &objcopy, &libc);
-    take_qt_hello(&manifest_dir, &out_dir);
+    // The two programs built outside this tree, against Qt. `qt-hello` is QtGui and a
+    // `QPainter`; `shell` is the same plus QtQml and QtQuick, and it is the larger of
+    // the two by about a factor of two.
+    take_linked(&manifest_dir, &out_dir, "qt-hello", "STAROS_QT_HELLO_IMAGE");
+    take_linked(&manifest_dir, &out_dir, "shell", "STAROS_SHELL_IMAGE");
 }
 
-/// Pick up `services/qt-hello` if it has been linked, and say so if it has not.
+/// Pick up a program `scripts/qt-link.sh` has linked, and say so if it has not.
 ///
-/// This one is *taken* rather than built, and the difference is deliberate. Qt is
+/// These ones are *taken* rather than built, and the difference is deliberate. Qt is
 /// not in this repository: it is a separate tree, built once by hand into a
 /// directory whose path is a property of whoever built it. Linking it here would
 /// make `cargo kbuild` fail on any machine that has not built Qt — which is every
 /// machine, the first time — and the failure would be about a missing archive
 /// rather than about anything the kernel did.
 ///
-/// So `scripts/qt-link.sh` produces the image and this function embeds whatever it
+/// So `scripts/qt-link.sh` produces the images and this function embeds whatever it
 /// finds. That is the same arrangement `build_hello_cpp` uses for a host with no
 /// C++ compiler, and the same rule applies to it: absence is a *fact about the
 /// machine*, reported once and clearly. It is not the answer to a program that
 /// failed to build — `scripts/qt-link.sh` exits nonzero and names the symbol when
 /// that happens, and this function never sees it.
-fn take_qt_hello(manifest_dir: &str, out_dir: &str) {
-    let linked = Path::new(manifest_dir).join("../../target/qt-hello/qt-hello.elf");
+///
+/// `name` is both the directory under `target/` and the stem of the image inside it,
+/// which is what the link script writes; `env` is the variable `main.rs` reads with
+/// `include_bytes!(env!(...))`.
+fn take_linked(manifest_dir: &str, out_dir: &str, name: &str, env: &str) {
+    let linked =
+        Path::new(manifest_dir).join(format!("../../target/{name}/{name}.elf"));
     println!("cargo:rerun-if-changed={}", linked.display());
 
-    let absent = Path::new(out_dir).join("qt-hello.absent");
     if !linked.exists() {
+        let absent = Path::new(out_dir).join(format!("{name}.absent"));
         std::fs::write(&absent, []).expect("failed to write the placeholder image");
-        println!("cargo:rustc-env=STAROS_QT_HELLO_IMAGE={}", absent.display());
+        println!("cargo:rustc-env={env}={}", absent.display());
         return;
     }
 
@@ -146,9 +155,9 @@ fn take_qt_hello(manifest_dir: &str, out_dir: &str) {
     // takes a path, and a path outside the build directory is a dependency cargo
     // cannot see: the image would be baked in once and never refreshed when
     // `qt-link.sh` ran again. The `rerun-if-changed` above is the other half of that.
-    let image = Path::new(out_dir).join("qt-hello.elf");
+    let image = Path::new(out_dir).join(format!("{name}.elf"));
     std::fs::copy(&linked, &image).expect("failed to copy the Qt program into OUT_DIR");
-    println!("cargo:rustc-env=STAROS_QT_HELLO_IMAGE={}", image.display());
+    println!("cargo:rustc-env={env}={}", image.display());
 }
 
 /// The C++ standard library's headers on this host, as (`include`, `include/<triple>`).
@@ -215,18 +224,26 @@ fn build_hello_cpp(
         return;
     };
 
-    // `-fno-exceptions -fno-rtti` is the roadmap's decision for the whole C++ side
-    // (Qt supports it as `QT_NO_EXCEPTIONS`): it keeps the unwinder, `.eh_frame`
-    // and `__cxa_throw` out of the system entirely. `-nostdlibinc` drops the host's
-    // C headers so the ones in `crates/staros-libc/include` are the only ones in
-    // play — a C++ program compiled against glibc's headers and linked against this
-    // libc would disagree about structure layouts and fail at run time.
+    // `-fno-exceptions` is the roadmap's decision for the whole C++ side (Qt supports
+    // it as `QT_NO_EXCEPTIONS`): it keeps the unwinder, `.eh_frame` and `__cxa_throw`
+    // out of the system entirely. `-nostdlibinc` drops the host's C headers so the
+    // ones in `crates/staros-libc/include` are the only ones in play — a C++ program
+    // compiled against glibc's headers and linked against this libc would disagree
+    // about structure layouts and fail at run time.
+    //
+    // `-fno-rtti` used to be here beside it and is not any more. The reason is in
+    // `services/qstaros/staros-toolchain.cmake`, which had to make the same change
+    // for the same cause: Qt Quick's software renderer decides what a scene-graph
+    // node *is* with a chain of `dynamic_cast`s and draws nothing at all without
+    // them. `__dynamic_cast` is implemented in `runtime.cpp` — and it has to be
+    // compiled with RTTI itself, because it reads `typeid` off the type-information
+    // objects it walks.
     let mut objects = Vec::new();
     for (name, file) in [("hello-cpp.o", &src), ("cxx-runtime.o", &runtime)] {
         let object = Path::new(out_dir).join(name);
         let status = Command::new(&clangxx)
             .args(["--target=aarch64-unknown-none", "-nostdlibinc", "-std=c++17"])
-            .args(["-fno-exceptions", "-fno-rtti", "-fno-omit-frame-pointer"])
+            .args(["-fno-exceptions", "-frtti", "-fno-omit-frame-pointer"])
             .args(["-fno-stack-protector", "-fno-pie", "-O1", "-g", "-c"])
             .arg("-isystem")
             .arg(&cxx_include)

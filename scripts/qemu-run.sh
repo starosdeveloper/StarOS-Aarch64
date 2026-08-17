@@ -77,9 +77,19 @@ if command -v cpio >/dev/null 2>&1 && [ -n "$init_elf" ]; then
         # also the only way anyone reading the archive can tell where it came from.
         font_members="$(cd "$irdir" && ls fonts/* 2>/dev/null || true)"
     fi
+    # The QML scene `services/shell` opens. Read at run time and not compiled in, so
+    # editing it changes what is on the screen at the next `cargo krun` without
+    # relinking twenty-five megabytes of Qt.
+    scene="$here/../services/shell/Main.qml"
+    scene_member=""
+    if [ -f "$scene" ]; then
+        mkdir -p "$irdir/qml"
+        cp "$scene" "$irdir/qml/Main.qml"
+        scene_member="qml/Main.qml"
+    fi
     initrd="${elf}.initrd.cpio"
     ( cd "$irdir" && printf '%s\n' greeting.txt version init.elf \
-        docs/readme.txt docs/deep/note.txt $font_members |
+        docs/readme.txt docs/deep/note.txt $scene_member $font_members |
         cpio -o -H newc --reproducible 2>/dev/null ) >"$initrd"
 fi
 

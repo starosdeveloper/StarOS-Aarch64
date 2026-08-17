@@ -89,6 +89,18 @@ if command -v cpio >/dev/null 2>&1; then
         MEMBERS="$MEMBERS fonts/IBMPlexMono-Regular.ttf"
         HAVE_FONT=1
     fi
+    # The QML scene, which `services/shell` opens by this exact path. It is read at
+    # run time rather than compiled in, so an archive without it is a QML program
+    # that starts, finds nothing to show and says so — which is a case worth having
+    # the assertions distinguish from a QML program that drew nothing.
+    SCENE="$ROOT/services/shell/Main.qml"
+    HAVE_SCENE=""
+    if [ -f "$SCENE" ]; then
+        mkdir -p "$IRDIR/qml"
+        cp "$SCENE" "$IRDIR/qml/Main.qml"
+        MEMBERS="$MEMBERS qml/Main.qml"
+        HAVE_SCENE=1
+    fi
     HAVE_PROGRAM=""
     if [ -n "$INIT_ELF" ] && [ -f "$INIT_ELF" ]; then
         cp "$INIT_ELF" "$IRDIR/init.elf"
@@ -351,7 +363,10 @@ if [ -n "$INITRAMFS" ]; then
     # asserted — `uname` naming this system and the stack limit being the one the
     # kernel actually enforces (the same 256 KiB the guard-page line above reports).
     req "[hello-c] process "
-    req "uname StarOS 0.2.0, stack limit 256 KiB"
+    # A megabyte, and the number is the kernel's `USER_STACK_MAX_PAGES` reported
+    # through `getrlimit` rather than a literal in either place. It was 256 KiB until
+    # QML's JavaScript engine turned out to size its own recursion limit from it.
+    req "uname StarOS 0.2.0, stack limit 1024 KiB"
     req "[hello-c] threads: 4 workers x 250 increments = 1000"
     # The event-loop layer: a thread blocked in poll until another thread wrote to
     # an eventfd, a pipe carried bytes between them, and a timeout was waited out
@@ -399,6 +414,7 @@ if [ -n "$INITRAMFS" ]; then
     # program that would find no display server. The Qt assertions live with the
     # `ramfb` config, which is the only one that has a framebuffer to composite onto.
     req "no Qt program started: this machine has no framebuffer"
+    req "no QML program started: this machine has no framebuffer"
     # An EL0 fault now reports where it happened, not just that it did.
     req "[fault]   backtrace ("
 else
@@ -470,13 +486,21 @@ req "[displaysrv] composited client surfaces onto a screen no client can touch"
 # made-up surface id, a destroyed one, a surface claiming more pixels than its
 # buffer holds, one with no buffer at all, and damage past the bottom edge. The
 # third of those is what keeps a lying client from making the *server* fault.
-# Ten commits and 255056 pixels, up from nine and 24656: the tenth is `qt-hello`'s,
-# and the 230400 new pixels are three passes over its 320x240 window — 76800 each for
-# the raise on show, the commit that carried the painted frame, and the repaint of
-# what the window uncovered when it closed. The difference between "Qt started" and
-# "Qt drew" is in that number, and it stays exact for the same reason the rest of the
-# tally does: a compositor repainting whole surfaces per commit would overshoot it.
-req "[displaysrv] 4 surface(s) live, 10 commit(s), 255056 pixel(s) composited, 8 refused, 1 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus"
+# The commit and pixel counts are no longer in this line, and that is a change worth
+# stating rather than hiding. They were exact — ten commits, 255056 pixels — and the
+# exactness was the assertion: a compositor repainting whole surfaces per commit
+# would overshoot it. Then `services/shell` arrived with a QML scene that *animates*,
+# and the number of frames it manages in its second of life is a property of the
+# scheduler under TCG. It was 61 in one run and 53 in the next, both correct.
+#
+# So the tally is split. Everything still deterministic is asserted verbatim here:
+# how many surfaces outlive the demo, how many refusals were provoked, how many
+# clients were reaped, and that no key was routed or dropped on a machine with
+# nobody typing. The frames themselves are asserted by `services/shell`'s own line
+# further down, as a lower bound, and by `scripts/qml-check.sh`, which looks at the
+# pixels.
+req "[displaysrv] 4 surface(s) live,"
+req "8 refused, 2 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus"
 # A fourth client opened a window, asked the server to watch it, and crashed. The
 # kernel signals the notification it delegated, the server takes its windows off
 # the screen, and the count says it happened. Whether the *pixels* went back is
@@ -517,6 +541,31 @@ req "[qt-hello] painted 320x240, text in 'IBM Plex Mono'"
 # different claims, and only the first one was ever true before.
 req "[qt-hello] event loop tick 1"
 req "[qt-hello] exec returned 0"
+
+# QML, which is the layer above all of that. Four claims, and each fails on its own:
+#
+# The scene is *read off the filesystem*, so this line is the file server answering
+# for a file that is not a font — and its size is exact, which a truncated read is
+# not.
+req "[shell] scene 'qml/Main.qml' is"
+# Threads and a contended mutex, before the engine is involved. This is where a QML
+# program stopped for a whole session: `QThread::wait` never returned, because
+# `QThreadPrivate::cleanup` runs from a `thread_local` destructor and this library
+# put those on the process's `atexit` list instead of the thread's. Both halves are
+# asserted — a thread that runs but never joins prints "DID NOT FINISH" here and
+# passes every other line in this file.
+req "[shell] threads: a QThread with an 8 MiB stack ran and joined, and took a QMutex the main thread was holding: yes"
+# The engine parsed and instantiated it. `Main_QMLTYPE_0` is the type QML generates
+# for the file, so this line distinguishes "the component loaded" from "a QQuickView
+# exists"; the size is the root item's, resolved by QML rather than by the window.
+req "[shell] scene loaded, root is a Main_QMLTYPE_0 of 320x240"
+# The render loop is a loop. The count itself is not asserted — see the note on the
+# display server's tally above — but a scene graph that rendered once and stopped
+# prints a single digit here, and one that never rendered prints nothing at all.
+req "frame(s) in"
+# And it ended by itself, which is the same claim `exec returned 0` makes for
+# `qt-hello` and the one that took the longest to earn.
+req "[shell] exec returned 0"
 
 run smmu-el2-smp4 120 -- -M virt,gic-version=3,virtualization=on,iommu=smmuv3 -cpu max -smp 4 -m 2G -device edu
 req "iommu: SMMUv3 at"

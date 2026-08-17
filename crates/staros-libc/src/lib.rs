@@ -194,6 +194,12 @@ fn exit_process(status: c_int) -> ! {
     // Destructors first, while the console and the file server are still usable —
     // a static object's destructor that wants to log has nowhere to log after the
     // flush below.
+    //
+    // This thread's before the process's, which is the order C++ gives: `main` is a
+    // thread like any other and its `thread_local` objects are destroyed when it
+    // ends, before objects with static storage duration.
+    // SAFETY: on the way out, once, on the thread that is ending.
+    unsafe { thread::run_current_thread_exit() };
     cxx::run_atexit();
     stdio::flush();
     file::shutdown();

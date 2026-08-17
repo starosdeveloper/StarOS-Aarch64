@@ -1,0 +1,47 @@
+Subject: [PATCH] qmutex: unlockInternal(void*) must honour QT_LINUXBASE too
+
+The third of these, and the same shape as 0001 and 0002: a place where
+Q_OS_LINUX is used to mean "glibc on a Linux kernel" while the build is
+Q_OS_LINUX with QT_LINUXBASE, which is not that.
+
+QBasicMutex::unlockInternal(void *) opens with
+
+      #if defined(Q_OS_FREEBSD) || defined(Q_OS_LINUX) || defined(Q_OS_WIN)
+          // these platforms always have futex and have never called this function
+          // from inline code
+          Q_UNREACHABLE();
+      #endif
+
+so on a Q_OS_LINUX build the whole body is dead code and the compiler
+removes it. The function keeps its symbol and gets a size of zero, which
+means the symbol lands on whatever the linker places next — here, on
+QFreeList<QMutexPrivate>::~QFreeList().
+
+Patch 0002 made FutexAlwaysAvailable false for QT_LINUXBASE, because
+qfutex_p.h excludes QT_LINUXBASE from the futex backend. That makes the
+inline QMutex::unlock() take its non-futex branch, which calls exactly
+this function. So the call happens, control arrives at the destructor of
+an unrelated class with a QMutex* in x0, and it walks that as a free
+list: `sem_destroy` on stack garbage, then `operator delete[]`, then
+free() on a pointer of 0x137.
+
+The visible failure is an EL0 data abort at 0x117 with a backtrace whose
+top frame is a destructor nothing called. There is nothing in it about
+mutexes, futexes or this assumption; two symbols share one address and
+`nm` shows both.
+
+The condition and the one in qfutex_p.h describe the same decision and
+must be the same, which is word for word what 0002 said about
+FutexAlwaysAvailable.
+
+--- a/src/corelib/thread/qmutex.cpp
++++ b/src/corelib/thread/qmutex.cpp
+@@ -843,7 +843,7 @@ void QBasicMutex::unlockInternal(void *copy) noexcept
+     Q_ASSERT(copy); //we must be locked
+     Q_ASSERT(copy != dummyLocked()); // testAndSetRelease(dummyLocked(), 0) failed
+
+-#  if defined(Q_OS_FREEBSD) || defined(Q_OS_LINUX) || defined(Q_OS_WIN)
++#  if defined(Q_OS_FREEBSD) || (defined(Q_OS_LINUX) && !defined(QT_LINUXBASE)) || defined(Q_OS_WIN)
+     // these platforms always have futex and have never called this function
+     // from inline code
+     Q_UNREACHABLE();

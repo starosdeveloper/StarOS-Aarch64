@@ -27,7 +27,7 @@ for p in "$STAROS"/services/qstaros/patches/*.patch; do patch -p1 < "$p"; done
 ln -sfn "$STAROS/services/qstaros" "$QT_SRC/src/plugins/platforms/staros"
 
 # 3. configure and build
-mkdir -p ~/qt-src/build-qtbase && cd ~/qt-src/build-qtbase
+mkdir -p ~/qt-src/build-qtbase-rtti && cd ~/qt-src/build-qtbase-rtti
 "$QT_SRC/configure" \
     -qt-host-path /usr -platform linux-clang -qpa staros \
     -static -release \
@@ -63,6 +63,58 @@ what makes the static plugin path the only path, which it already was.
 `-no-opengl` because there is no GPU driver. The software rasteriser is what
 draws, and QtQuick has a software backend that uses it.
 
+`-no-feature-qml-jit`, for qtdeclarative, is the same shape of statement about
+the kernel rather than about Qt. V4's just-in-time compiler writes machine code
+into memory and jumps to it; `mprotect` here refuses `PROT_EXEC` with `EPERM`,
+deliberately, because the ELF loader gives each `PT_LOAD` its permissions once
+and nothing can add execute afterwards. The bytecode interpreter is not a
+fallback — it is the only thing that can run.
+
+### RTTI, and why the build directories say `-rtti`
+
+The first build of both trees was `-fno-exceptions -fno-rtti`. Half of that
+survived.
+
+`QSGSoftwareRenderableNodeUpdater::visit(QSGGeometryNode *)` — the software
+scene graph's dispatch, which decides what a node is before drawing it — is
+five chained `dynamic_cast`s ending in `// We dont know, so skip`. There is no
+type enum beside it. Without RTTI every node in every scene takes the last
+branch, and a QML program runs, paints an empty window, and reports nothing
+wrong.
+
+So `services/qstaros/staros-toolchain.cmake` compiles with `-frtti`, both trees
+were reconfigured and rebuilt for it into `build-qtbase-rtti` and
+`build-qtdeclarative-rtti`, and `__dynamic_cast` is implemented in
+`crates/staros-libc/cxx/runtime.cpp` — the one algorithm in that file rather
+than a hook. `services/hello-cpp` exercises it over all three of the ABI's
+type-information shapes before any of Qt is involved.
+
+Exceptions are still genuinely absent, and that half of the decision stands.
+
+## Qt Quick as well
+
+qtdeclarative is a second tree, configured against the *installed* qtbase
+rather than its build directory:
+
+```sh
+cd ~/qt-src/build-qtbase-rtti && ninja install    # into ~/qt-src/qt-staros
+mkdir -p ~/qt-src/build-qtdeclarative-rtti && cd ~/qt-src/build-qtdeclarative-rtti
+~/qt-src/qt-staros/bin/qt-configure-module \
+    ~/qt-src/qtdeclarative-everywhere-src-6.11.1 -no-feature-qml-jit \
+    -- -DQT_BUILD_TESTS=OFF -DQT_BUILD_EXAMPLES=OFF
+ninja lib/libQt6Quick.a lib/libQt6Qml.a lib/libQt6QmlModels.a \
+      lib/libQt6QmlWorkerScript.a lib/libQt6QmlMeta.a \
+      qml/QtQuick/libqtquick2plugin.a qml/QtQml/libqmlplugin.a \
+      qml/QtQml/Models/libmodelsplugin.a qml/QtQml/WorkerScript/libworkerscriptplugin.a
+```
+
+Named targets rather than a bare `ninja`, and that is a decision. A full build
+includes `qmldom`, `qmlls` and `qmlformat` — developer tooling that would never
+run on this system — and `qmldom` is the one part of qtdeclarative that uses
+`typeid` on types with no vtable, which does not compile here. Building what
+the program links is both faster and the truthful description of what this
+system has.
+
 ### Configure's warning about the platform plugin
 
 The summary prints:
@@ -78,10 +130,17 @@ it, which is what a program actually needs.
 
 ## Linking a program against it
 
-`scripts/qt-link.sh` builds `services/qt-hello` and is meant to be read as much
-as run: the link line in it is the whole argument about how a Qt program is put
-together with no dynamic loader — every archive named, in dependency order,
-with the C++ runtime and the C library last.
+`scripts/qt-link.sh` builds `services/qt-hello` and `services/shell`, and is
+meant to be read as much as run: the link lines in it are the whole argument
+about how a Qt program is put together with no dynamic loader — every archive
+named, in dependency order, with the C++ runtime and the C library last.
+
+For the QML program there is a second half to that argument. A QML module in a
+static build registers its types from a plugin class, and nothing references
+that class unless `Q_IMPORT_QML_PLUGIN` does. Miss one and the link still
+succeeds — the macro is what creates the reference — and the program dies at run
+time with `module "QtQuick" is not installed`, which reads like a missing
+directory on disk.
 
 ```sh
 cd "$STAROS" && ./scripts/qt-link.sh

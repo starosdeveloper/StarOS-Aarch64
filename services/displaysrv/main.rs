@@ -239,16 +239,22 @@ const BACKGROUND: u32 = 0x0010_2030;
 /// tallies, and ending on a message rather than a commit count is what makes it a
 /// server loop instead of a script.
 ///
-/// Three, not "however many endpoints there are": the extra pairs exist so further
+/// Four, not "however many endpoints there are": the extra pairs exist so further
 /// clients *can* connect, and waiting for goodbyes from clients that were never
-/// started would be a server that never stops. The three that do say goodbye are
-/// `fbclient`, `hello-c` and `qt-hello` — the last of which only started saying it
-/// the day its event loop stopped hanging, and that is what this number had to be
-/// raised for. At two, the server counted `fbclient` and `qt-hello`, printed its
-/// tally and left, and `hello-c` then found no display server on a machine that had
-/// one a moment earlier. The symptom was a *C* program losing its window; the cause
-/// was a *Qt* program finally finishing.
-const CLIENTS_EXPECTED: u32 = 3;
+/// started would be a server that never stops. The four that do say goodbye are
+/// `fbclient`, `hello-c`, `qt-hello` and `shell` — the third of which only started
+/// saying it the day its event loop stopped hanging, and that is what this number
+/// had to be raised for once already. At two, the server counted `fbclient` and
+/// `qt-hello`, printed its tally and left, and `hello-c` then found no display
+/// server on a machine that had one a moment earlier. The symptom was a *C* program
+/// losing its window; the cause was a *Qt* program finally finishing.
+///
+/// Which is the failure to expect from this number in general, and it is not
+/// symmetric: too low and a client that was still drawing loses the server
+/// underneath it; too high and the server waits for a goodbye that never comes,
+/// holding the whole machine open until QEMU's timeout. The second is the louder of
+/// the two and the first is the one that has actually happened.
+const CLIENTS_EXPECTED: u32 = 4;
 
 /// A message, laid out exactly as `staros_ipc::Message`: tag, `MESSAGE_WORDS`
 /// words, then the capability handle. Four words, not six — getting that wrong

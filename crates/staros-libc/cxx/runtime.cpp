@@ -13,11 +13,17 @@
 // more; the same loop applies, and every addition is a decision recorded in
 // docs/LIBC-CONTRACT.md rather than a stub returning zero.
 //
-// Built with `-fno-exceptions -fno-rtti`, which is what the roadmap chose for the
-// whole C++ side (Qt supports it as `QT_NO_EXCEPTIONS`). That choice is what keeps
-// an unwinder, `.eh_frame` and `__cxa_throw` out of this file: a program that
-// would have thrown calls one of the `__throw_*` helpers below, which report and
-// stop instead of unwinding into a caller that has no idea how to unwind.
+// Built with `-fno-exceptions`, which is what the roadmap chose for the whole C++
+// side (Qt supports it as `QT_NO_EXCEPTIONS`). That choice is what keeps an
+// unwinder, `.eh_frame` and `__cxa_throw` out of this file: a program that would
+// have thrown calls one of the `__throw_*` helpers below, which report and stop
+// instead of unwinding into a caller that has no idea how to unwind.
+//
+// It was `-fno-exceptions -fno-rtti` until Qt Quick, and the second half did not
+// survive: the software scene graph identifies every node it draws with a chain of
+// `dynamic_cast`s and has no other way to. So `__dynamic_cast` is implemented here,
+// near the bottom of this file, and every C++ translation unit for this target is
+// compiled with RTTI. Exceptions are still genuinely absent.
 
 #include <chrono>
 #include <condition_variable>
@@ -727,21 +733,13 @@ char *__cxa_demangle(const char *, char *, size_t *, int *status) {
     return nullptr;
 }
 
-// Destructors for `thread_local` objects.
-//
-// Registered in the same list as `__cxa_atexit`, which means they run at *process*
-// exit rather than when the thread ends. For the main thread — where almost every
-// `thread_local` in a Qt program lives — those are the same moment. For a worker
-// thread it is late, and the object's memory stays until then.
-//
-// Late is a real difference and it is written down instead of hidden. Doing it
-// properly needs a per-thread list run from the thread's own exit path, which is a
-// change to `crates/staros-libc/src/thread.rs` and worth making the day something
-// puts a non-trivial `thread_local` in a worker.
-int __cxa_thread_atexit(void (*destructor)(void *), void *object, void *dso) {
-    extern int __cxa_atexit(void (*)(void *), void *, void *);
-    return __cxa_atexit(destructor, object, dso);
-}
+// `__cxa_thread_atexit` used to be here, forwarding every `thread_local`
+// destructor to the process-wide `__cxa_atexit` list — which ran them at process
+// exit rather than at thread exit. It is now in `crates/staros-libc/src/thread.rs`,
+// with a per-thread list, because the list belongs to the thread layer and because
+// the shortcut was not merely late: `QThreadPrivate::cleanup` runs from such a
+// destructor and is what wakes `QThread::wait`, so a QML program stopped waiting
+// for a thread that had already returned. The comment there records it.
 
 }  // extern "C"
 
@@ -1238,11 +1236,14 @@ bool _Sp_make_shared_tag::_S_eq(const type_info &) noexcept { return false; }
 //   * The destructors are real. They do nothing, which is correct — these objects
 //     are static and own nothing — and defining them is the entire reason this
 //     section exists.
-//   * The comparison functions stop the program. They are only called during a
-//     `catch` match or a `dynamic_cast`, neither of which can happen: a throw ends
-//     the program before any handler is looked for, and `-fno-rtti` removes
-//     `dynamic_cast` at the point of use. Reaching one means an assumption in this
-//     paragraph is wrong, which is worth a message rather than a wrong answer.
+//   * The comparison functions stop the program. `__do_catch` is only called during
+//     a handler match, which cannot happen: a throw ends the program before any
+//     handler is looked for. `__do_dyncast`, `__do_upcast` and `__do_find_public_src`
+//     are libstdc++'s *internal* walkers, called by libstdc++'s own `__dynamic_cast`
+//     — and the `__dynamic_cast` on this system is the one in the section below,
+//     which walks the same structures directly and calls none of them. Reaching any
+//     of these means an assumption here is wrong, which is worth a message rather
+//     than a wrong answer.
 //
 // Answering `false` instead — "no, this handler does not match" — was the
 // alternative, and it is worse in the one case it would arise: a `catch` that
@@ -1269,7 +1270,7 @@ bool type_info::__do_catch(const type_info *, void **, unsigned) const {
 }
 
 bool type_info::__do_upcast(const __cxxabiv1::__class_type_info *, void **) const {
-    fail("type_info::__do_upcast: dynamic_cast in a build without RTTI");
+    fail("type_info::__do_upcast: libstdc++'s own dynamic-cast walker, which this build does not use");
 }
 
 }  // namespace std
@@ -1280,7 +1281,7 @@ __class_type_info::~__class_type_info() {}
 __si_class_type_info::~__si_class_type_info() {}
 
 bool __class_type_info::__do_upcast(const __class_type_info *, void **) const {
-    fail("__do_upcast: dynamic_cast in a build without RTTI");
+    fail("__do_upcast: libstdc++'s own dynamic-cast walker, which this build does not use");
 }
 
 bool __class_type_info::__do_catch(const std::type_info *, void **, unsigned) const {
@@ -1289,36 +1290,335 @@ bool __class_type_info::__do_catch(const std::type_info *, void **, unsigned) co
 
 bool __class_type_info::__do_upcast(const __class_type_info *, const void *,
                                     __upcast_result &) const {
-    fail("__do_upcast: dynamic_cast in a build without RTTI");
+    fail("__do_upcast: libstdc++'s own dynamic-cast walker, which this build does not use");
 }
 
 bool __class_type_info::__do_dyncast(std::ptrdiff_t, __sub_kind,
                                      const __class_type_info *, const void *,
                                      const __class_type_info *, const void *,
                                      __dyncast_result &) const {
-    fail("__do_dyncast: dynamic_cast in a build without RTTI");
+    fail("__do_dyncast: libstdc++'s own dynamic-cast walker, which this build does not use");
 }
 
 __class_type_info::__sub_kind __class_type_info::__do_find_public_src(
     std::ptrdiff_t, const void *, const __class_type_info *, const void *) const {
-    fail("__do_find_public_src: dynamic_cast in a build without RTTI");
+    fail("__do_find_public_src: libstdc++'s own dynamic-cast walker, which this build does not use");
 }
 
 bool __si_class_type_info::__do_upcast(const __class_type_info *, const void *,
                                        __upcast_result &) const {
-    fail("__do_upcast: dynamic_cast in a build without RTTI");
+    fail("__do_upcast: libstdc++'s own dynamic-cast walker, which this build does not use");
 }
 
 bool __si_class_type_info::__do_dyncast(std::ptrdiff_t, __sub_kind,
                                         const __class_type_info *, const void *,
                                         const __class_type_info *, const void *,
                                         __dyncast_result &) const {
-    fail("__do_dyncast: dynamic_cast in a build without RTTI");
+    fail("__do_dyncast: libstdc++'s own dynamic-cast walker, which this build does not use");
 }
 
 __class_type_info::__sub_kind __si_class_type_info::__do_find_public_src(
     std::ptrdiff_t, const void *, const __class_type_info *, const void *) const {
-    fail("__do_find_public_src: dynamic_cast in a build without RTTI");
+    fail("__do_find_public_src: libstdc++'s own dynamic-cast walker, which this build does not use");
+}
+
+// The third kind, for a class with several bases or a virtual one. Its vtable is
+// needed for the same reason as the other two, and additionally because the walker
+// below asks `typeid(*type) == typeid(__vmi_class_type_info)` — a comparison that
+// needs this class's own type information to exist.
+__vmi_class_type_info::~__vmi_class_type_info() {}
+
+bool __vmi_class_type_info::__do_upcast(const __class_type_info *, const void *,
+                                        __upcast_result &) const {
+    fail("__do_upcast: libstdc++'s own dynamic-cast walker, which this build does not use");
+}
+
+bool __vmi_class_type_info::__do_dyncast(std::ptrdiff_t, __sub_kind,
+                                         const __class_type_info *, const void *,
+                                         const __class_type_info *, const void *,
+                                         __dyncast_result &) const {
+    fail("__do_dyncast: libstdc++'s own dynamic-cast walker, which this build does not use");
+}
+
+__class_type_info::__sub_kind __vmi_class_type_info::__do_find_public_src(
+    std::ptrdiff_t, const void *, const __class_type_info *, const void *) const {
+    fail("__do_find_public_src: libstdc++'s own dynamic-cast walker, which this build does not use");
+}
+
+// Type information for pointers and for functions.
+//
+// These arrived with RTTI and not before, and the reason is worth a line: with
+// `-fno-rtti` a `typeid` for a pointer type is never emitted, so nothing referenced
+// their vtables. With RTTI on, Qt Quick's property system emits type information for
+// pointer-to-QObject types as a matter of course, and the linker then wants the
+// vtable of the class those objects are instances of.
+//
+// `__is_pointer_p` and `__is_function_p` are the honest overrides — these classes
+// exist precisely to answer those two questions with `true`, and the base class's
+// `false` would be wrong. The catch helpers stop the program for the same reason as
+// every other one above: they are reached only while matching a handler, and a throw
+// here ends the program before any handler is looked for.
+__pbase_type_info::~__pbase_type_info() {}
+__pointer_type_info::~__pointer_type_info() {}
+__function_type_info::~__function_type_info() {}
+
+bool __pointer_type_info::__is_pointer_p() const { return true; }
+bool __function_type_info::__is_function_p() const { return true; }
+
+bool __pbase_type_info::__do_catch(const std::type_info *, void **, unsigned) const {
+    fail("__pbase_type_info::__do_catch: matching a handler without an unwinder");
+}
+
+bool __pointer_type_info::__pointer_catch(const __pbase_type_info *, void **,
+                                          unsigned) const {
+    fail("__pointer_type_info::__pointer_catch: matching a handler without an unwinder");
+}
+
+}  // namespace __cxxabiv1
+
+// ---------------------------------------------------------------------------
+// `dynamic_cast`
+// ---------------------------------------------------------------------------
+//
+// This is the one piece of the C++ runtime here that implements an algorithm rather
+// than filling in a hook, and it exists because Qt Quick cannot draw without it.
+//
+// `QSGSoftwareRenderableNodeUpdater::visit(QSGGeometryNode *)` — the software scene
+// graph's dispatch, which decides what a node is before drawing it — is five chained
+// `dynamic_cast`s over the public node classes, ending in `// We dont know, so skip`.
+// There is no type enum to switch on instead. A build without `dynamic_cast` renders
+// every QML scene as an empty window and reports nothing wrong, which is the worst
+// shape a failure can have.
+//
+// What the compiler emits at a `dynamic_cast<D *>(p)` is a call to
+// `__cxxabiv1::__dynamic_cast`, and everything it needs is reachable from `p`:
+//
+//   * the object's vtable pointer is the first word of any polymorphic object;
+//   * `vtable[-1]` is that object's `std::type_info`;
+//   * `vtable[-2]` is the offset from this subobject back to the complete object.
+//
+// From the complete object's type information the class graph is walkable, because
+// the ABI gives each class one of exactly three type-information shapes:
+// `__class_type_info` (no bases), `__si_class_type_info` (one public non-virtual
+// base at offset zero) and `__vmi_class_type_info` (an array of bases, each with an
+// offset and access flags).
+//
+// libstdc++ walks that graph through six virtual functions on those classes, with a
+// result structure threaded through them. This does not implement those — they are
+// the `fail()` stubs above — and walks the same structures directly instead. The
+// reason is honesty about what is here: the libstdc++ algorithm is one long
+// mutually-recursive function set tuned to answer several questions in one pass, and
+// reproducing it from memory would produce something that looks right and is subtly
+// wrong on the cases that matter. What is below is the rule from the standard,
+// [expr.dynamic.cast]/8, written out as it reads.
+//
+// The `src2dst` hint the compiler passes — "the source is a unique public
+// non-virtual base of the destination at this offset", or one of three sentinels
+// meaning it could not say — is deliberately ignored. It is an optimisation: it lets
+// an implementation answer without walking. Ignoring it costs a walk over a class
+// graph with a handful of nodes, and it removes a whole class of bug where the fast
+// path and the slow path disagree.
+
+namespace {
+
+// Where a subobject is, and whether some path to it was public all the way.
+struct Subobject {
+    const void *ptr;
+    bool public_path;
+};
+
+// Everything here is bounded. Thirty-two distinct subobjects of one type inside one
+// object is far past anything a real hierarchy does — Qt's deepest is single figures
+// — and the alternative to a limit is an allocation on a path that must work when
+// the heap does not.
+constexpr unsigned MAX_SUBOBJECTS = 32;
+
+class SubobjectSet {
+   public:
+    void add(const void *ptr, bool public_path) {
+        for (unsigned i = 0; i < count_; ++i) {
+            if (items_[i].ptr == ptr) {
+                // The same subobject reached a second time: a virtual base, which is
+                // shared, or a repeated base that happens to land here. It is one
+                // subobject either way, and it is a *public* base of the whole if any
+                // path to it is public — which is what the standard means by "public
+                // base class subobject".
+                items_[i].public_path = items_[i].public_path || public_path;
+                return;
+            }
+        }
+        if (count_ == MAX_SUBOBJECTS) {
+            overflowed_ = true;
+            return;
+        }
+        items_[count_++] = Subobject{ptr, public_path};
+    }
+
+    unsigned count() const { return count_; }
+    const Subobject &operator[](unsigned i) const { return items_[i]; }
+    bool overflowed() const { return overflowed_; }
+
+   private:
+    Subobject items_[MAX_SUBOBJECTS] = {};
+    unsigned count_ = 0;
+    bool overflowed_ = false;
+};
+
+// Where a base subobject sits, given the address of the subobject that derives from
+// it.
+//
+// A non-virtual base is at a constant offset, fixed at compile time. A virtual base
+// is not — the whole point of virtual inheritance is that the distance depends on
+// what the complete object turned out to be — so its offset is stored in the vtable,
+// and `__offset()` is where in the vtable to look: a byte displacement from the vptr,
+// negative, into the vcall/vbase region above the address point.
+const void *base_address(const void *ptr, const __cxxabiv1::__base_class_type_info &base) {
+    if (!base.__is_virtual_p()) {
+        return static_cast<const char *>(ptr) + base.__offset();
+    }
+    const char *vtable = *reinterpret_cast<const char *const *>(ptr);
+    const std::ptrdiff_t offset =
+        *reinterpret_cast<const std::ptrdiff_t *>(vtable + base.__offset());
+    return static_cast<const char *>(ptr) + offset;
+}
+
+// Every subobject of type `wanted` inside the object of type `type` at `ptr`.
+//
+// The dispatch on which of the three shapes `type` has is by `typeid` and not by
+// `dynamic_cast`, which would be circular. `typeid` on a polymorphic lvalue is a load
+// of `vtable[-1]` and a comparison — it calls nothing, and in particular it does not
+// call this.
+void collect(const __cxxabiv1::__class_type_info *type, const void *ptr, bool public_path,
+             const std::type_info &wanted, SubobjectSet &out) {
+    using __cxxabiv1::__base_class_type_info;
+    using __cxxabiv1::__si_class_type_info;
+    using __cxxabiv1::__vmi_class_type_info;
+
+    if (*static_cast<const std::type_info *>(type) == wanted) {
+        out.add(ptr, public_path);
+    }
+
+    const std::type_info &shape = typeid(*type);
+    if (shape == typeid(__si_class_type_info)) {
+        // One base, public, non-virtual, at offset zero. That is not an assumption
+        // about this hierarchy — it is the definition of this type-information shape,
+        // and the compiler emits `__vmi_class_type_info` for anything else.
+        const auto *si = static_cast<const __si_class_type_info *>(type);
+        collect(si->__base_type, ptr, public_path, wanted, out);
+        return;
+    }
+    if (shape == typeid(__vmi_class_type_info)) {
+        const auto *vmi = static_cast<const __vmi_class_type_info *>(type);
+        for (unsigned i = 0; i < vmi->__base_count; ++i) {
+            const __base_class_type_info &base = vmi->__base_info[i];
+            collect(base.__base_type, base_address(ptr, base),
+                    public_path && base.__is_public_p(), wanted, out);
+        }
+        return;
+    }
+    // `__class_type_info` proper: no bases, nothing further to walk.
+}
+
+// Is `target` one of the subobjects in `found`, reached publicly?
+bool found_public(const SubobjectSet &found, const void *target) {
+    for (unsigned i = 0; i < found.count(); ++i) {
+        if (found[i].ptr == target) {
+            return found[i].public_path;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+namespace __cxxabiv1 {
+
+extern "C" void *__dynamic_cast(const void *src_ptr, const __class_type_info *src_type,
+                                const __class_type_info *dst_type, std::ptrdiff_t src2dst) {
+    // The hint. See the section comment: deliberately unused.
+    (void)src2dst;
+
+    // The compiler emits a null check before the call, so this is the second one.
+    // It stays because the first one is the *compiler's* invariant, not this
+    // function's, and a runtime entry point that reads through a null pointer
+    // because its caller promised not to pass one is a bad trade.
+    if (src_ptr == nullptr || src_type == nullptr || dst_type == nullptr) {
+        return nullptr;
+    }
+
+    // The complete object, from the vtable of the subobject we were handed.
+    const void *const *vtable = *reinterpret_cast<const void *const *const *>(src_ptr);
+    const std::ptrdiff_t offset_to_top = reinterpret_cast<std::ptrdiff_t>(vtable[-2]);
+    const auto *whole_type =
+        static_cast<const __class_type_info *>(static_cast<const std::type_info *>(vtable[-1]));
+    const void *whole_ptr = static_cast<const char *>(src_ptr) + offset_to_top;
+
+    if (whole_type == nullptr) {
+        // A vtable with no type information in it, which means some translation unit
+        // in this program was compiled without RTTI. That is not a cast that failed,
+        // it is a build that cannot answer, and the two must not look alike.
+        fail("__dynamic_cast: this object's vtable carries no type information — "
+             "some translation unit was compiled with -fno-rtti");
+    }
+
+    // Every subobject of the destination type inside the complete object.
+    SubobjectSet destinations;
+    collect(whole_type, whole_ptr, true, *dst_type, destinations);
+    if (destinations.overflowed()) {
+        fail("__dynamic_cast: more than 32 subobjects of one type in one object");
+    }
+    if (destinations.count() == 0) {
+        return nullptr;
+    }
+
+    // [expr.dynamic.cast]/8, first rule: if the source points at a public base
+    // subobject of exactly one destination-typed object, that object is the answer.
+    // This is the rule that covers the ordinary downcast and every cross-cast.
+    const void *answer = nullptr;
+    unsigned matches = 0;
+    for (unsigned i = 0; i < destinations.count(); ++i) {
+        SubobjectSet sources;
+        collect(dst_type, destinations[i].ptr, true, *src_type, sources);
+        if (sources.overflowed()) {
+            fail("__dynamic_cast: more than 32 subobjects of one type in one object");
+        }
+        if (found_public(sources, src_ptr)) {
+            ++matches;
+            answer = destinations[i].ptr;
+        }
+    }
+    if (matches == 1) {
+        return const_cast<void *>(answer);
+    }
+    if (matches > 1) {
+        // Ambiguous by the first rule. The second rule below cannot rescue it — it
+        // asks about the same object from the other end — so this is a null result,
+        // which is what an ambiguous `dynamic_cast` is defined to give.
+        return nullptr;
+    }
+
+    // Second rule: if the source points at a public base subobject of the *complete*
+    // object, and the complete object has exactly one public destination-typed base,
+    // that is the answer. This is the upcast-then-downcast case, where the source and
+    // the destination are siblings under the most-derived type.
+    SubobjectSet sources_in_whole;
+    collect(whole_type, whole_ptr, true, *src_type, sources_in_whole);
+    if (sources_in_whole.overflowed()) {
+        fail("__dynamic_cast: more than 32 subobjects of one type in one object");
+    }
+    if (!found_public(sources_in_whole, src_ptr)) {
+        return nullptr;
+    }
+
+    answer = nullptr;
+    matches = 0;
+    for (unsigned i = 0; i < destinations.count(); ++i) {
+        if (destinations[i].public_path) {
+            ++matches;
+            answer = destinations[i].ptr;
+        }
+    }
+    return matches == 1 ? const_cast<void *>(answer) : nullptr;
 }
 
 }  // namespace __cxxabiv1

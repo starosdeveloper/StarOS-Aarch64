@@ -78,6 +78,16 @@ static HELLO_CPP_IMAGE: &[u8] = include_bytes!(env!("STAROS_HELLO_CPP_IMAGE"));
 /// FreeType and HarfBuzz are all inside it.
 static QT_HELLO_IMAGE: &[u8] = include_bytes!(env!("STAROS_QT_HELLO_IMAGE"));
 
+/// A program written in **QML**: a `QQuickView` over a scene read off the
+/// filesystem, rendered by Qt Quick's software adaptation. Empty on the same terms
+/// as the one above, and for the same reason.
+///
+/// Larger again — a JavaScript engine, a declarative type system and a scene graph
+/// on top of everything `qt-hello` already carries. There is no JIT in it: this
+/// kernel refuses `PROT_EXEC` on a page it did not load as code, so qtdeclarative is
+/// configured with the bytecode interpreter alone.
+static SHELL_IMAGE: &[u8] = include_bytes!(env!("STAROS_SHELL_IMAGE"));
+
 mod cap;
 mod console;
 mod elf;
@@ -1326,6 +1336,10 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // paint path rather than a missing service.
     let ep_fs3 = obj::create(obj::Object::Endpoint { id: 29 }).expect("ep_fs3 object");
     let ep_fs3_reply = obj::create(obj::Object::Endpoint { id: 30 }).expect("ep_fs3_reply object");
+    // A fourth, for the QML program. It reads more than the one above, not less: the
+    // same font family, and the scene description on top of it.
+    let ep_fs4 = obj::create(obj::Object::Endpoint { id: 31 }).expect("ep_fs4 object");
+    let ep_fs4_reply = obj::create(obj::Object::Endpoint { id: 32 }).expect("ep_fs4_reply object");
 
     // The *only* device policy the kernel still holds: the authority to mint. It
     // pre-mints no UART objects at all now — the device manager (id 7) reads the
@@ -1633,6 +1647,51 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         built
     };
 
+    // The QML program. Everything the paragraph above says applies unchanged; only
+    // the pairs differ — the file server's fourth, the display server's sixth, and
+    // the sixth input channel.
+    //
+    // Two Qt programs at once is not a demonstration of concurrency, it is what
+    // makes the display server's compositing claim mean anything: with one client
+    // "composited" and "copied" are the same operation.
+    let shell = if SHELL_IMAGE.is_empty() {
+        let _ = writeln!(
+            console,
+            "no QML program in this image: run scripts/qt-link.sh (Qt is built outside this tree)"
+        );
+        None
+    } else if display.is_none() {
+        let _ = writeln!(console, "no QML program started: this machine has no framebuffer");
+        None
+    } else {
+        let built = file_pair(SHELL_IMAGE, 25, 26, ep_fs4, ep_fs4_reply).map(
+            |(server, mut client)| {
+                cap::install(
+                    &mut client.1,
+                    cap::Cap::Endpoint { obj: ep_fb6, send: true, recv: false },
+                );
+                cap::install(
+                    &mut client.1,
+                    cap::Cap::Endpoint { obj: ep_fb6_reply, send: false, recv: true },
+                );
+                cap::install(
+                    &mut client.1,
+                    cap::Cap::Endpoint { obj: ep_ev[5], send: false, recv: true },
+                );
+                (server, client)
+            },
+        );
+        if built.is_none() {
+            let _ = writeln!(
+                console,
+                "the QML program could not be loaded: {} KiB of image, and building its \
+                 address space failed",
+                SHELL_IMAGE.len() / 1024
+            );
+        }
+        built
+    };
+
     // The C++ program. It holds **no capabilities at all**: everything it does —
     // the console, the heap, threads, notifications — needs none, which is worth
     // seeing in one place. If the build host had no C++ compiler its image is
@@ -1800,6 +1859,10 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     if let Some(((fs_space, fs_caps), (qt_space, qt_caps))) = qt {
         sched::spawn_user(user_task_entry, fs_space, fs_caps);
         sched::spawn_user(user_task_entry, qt_space, qt_caps);
+    }
+    if let Some(((fs_space, fs_caps), (shell_space, shell_caps))) = shell {
+        sched::spawn_user(user_task_entry, fs_space, fs_caps);
+        sched::spawn_user(user_task_entry, shell_space, shell_caps);
     }
     if let Some(cpp_space) = cpp {
         sched::spawn_user(
@@ -2134,9 +2197,17 @@ fn check_dynamic_tables(console: &mut Pl011) {
 
     // Objects. Keep the references: resolving the *last* one is what shows the
     // table grew, rather than wrapping or quietly dropping the excess.
+    //
+    // `Device` and not `Endpoint`, and the difference is the point of the check
+    // rather than an incidental one. An endpoint object names a slot in a fixed
+    // table, so sixty-four of them is sixty-four *endpoints* and not sixty-four
+    // objects — `obj::create` refuses the ones past the end, and this check would
+    // then be measuring `ipc::NUM_ENDPOINTS` while claiming to measure the object
+    // table. It did, for exactly one run. A device object names a physical address
+    // and has no such table behind it, so counting them counts what this says.
     let mut refs = Vec::new();
     for i in 0..N {
-        let Some(r) = obj::create(obj::Object::Endpoint { id: i }) else {
+        let Some(r) = obj::create(obj::Object::Device { phys: (i as u64 + 1) << 12 }) else {
             let _ = writeln!(console, "dynamic tables: object {i} FAILED — table did not grow");
             return;
         };

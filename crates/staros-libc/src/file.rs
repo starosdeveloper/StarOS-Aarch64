@@ -119,7 +119,39 @@ fn request(tag: u64, words: [u64; 3], with_buffer: bool) -> Option<Message> {
 }
 
 /// Copy a path into the shared buffer, refusing one that would not fit.
+/// Strip what an absolute path means on a system with one filesystem.
+///
+/// The file server serves the initramfs, and CPIO stores its members without a
+/// leading slash: the archive's own name for the scene is `qml/Main.qml`. A program
+/// that opens `/qml/Main.qml` means the same file — there is nowhere else it could
+/// mean — so the two spellings have to reach the same member.
+///
+/// This is not tidiness, it is what makes the filesystem usable from a toolkit. Qt
+/// turns every path into a URL and every relative URL into an absolute one against
+/// the working directory, which is `/` here: `QUrl::fromLocalFile("qml/Main.qml")`
+/// becomes `file:///qml/Main.qml` and the open then failed with "No such file or
+/// directory" for a file the same program had just read by its relative name.
+///
+/// `./` goes too, and repeated slashes with it. What is deliberately *not* here is
+/// `..`: this is a name transformation and not a path resolver, and a system with
+/// one flat archive has no directory to go up from. A path containing `..` is passed
+/// through and the server refuses it, which is the truthful outcome.
+fn normalise(path: &[u8]) -> &[u8] {
+    let mut at = 0;
+    loop {
+        if path[at..].starts_with(b"/") {
+            at += 1;
+        } else if path[at..].starts_with(b"./") {
+            at += 2;
+        } else {
+            break;
+        }
+    }
+    &path[at..]
+}
+
 fn put_path(path: &[u8]) -> Option<usize> {
+    let path = normalise(path);
     if path.is_empty() || path.len() > MAX_PATH {
         return None;
     }

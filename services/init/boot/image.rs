@@ -1479,16 +1479,24 @@ extern "C" fn _start() -> ! {
 }
 
 /// How many pages the stack grower walks down. Comfortably inside the kernel's
-/// `USER_STACK_MAX_PAGES` (64) so the walk itself always succeeds — the overrun
+/// `USER_STACK_MAX_PAGES` (256) so the walk itself always succeeds — the overrun
 /// that follows is what tests the limit.
 pub const STACK_WALK_PAGES: u32 = 40;
 
 /// How far below the initial stack pointer the deliberate overrun reaches: past
-/// the 64-page growth limit, into the guard region the kernel never fills.
+/// the 256-page growth limit, into the guard region the kernel never fills.
+///
+/// This number and `arch_aarch64::addrspace::USER_STACK_MAX_PAGES` move together,
+/// and the day they stopped agreeing the smoke matrix said so in every one of its
+/// seven machines at once: the limit went from 64 pages to 256 for QML's JavaScript
+/// engine, the overrun at 80 pages landed *inside* the new limit, and the kernel
+/// grew the stack instead of refusing. `stack guard: growth limit reached` simply
+/// stopped appearing — a check that had been proving something and now proved that
+/// the stack grows, which it already says on the line above.
 ///
 /// A single `movz ..., lsl #16` builds it, so it must be a whole multiple of
 /// 65536 — checked here rather than discovered as a wrong address at runtime.
-pub const STACK_OVERRUN_BYTES: u32 = 80 * 4096;
+pub const STACK_OVERRUN_BYTES: u32 = 288 * 4096;
 const _: () = assert!(STACK_OVERRUN_BYTES.is_multiple_of(1 << 16));
 const _: () = assert!((STACK_OVERRUN_BYTES >> 16) <= 0xffff);
 

@@ -109,7 +109,25 @@ pub const USER_STACK_PAGES: u64 = 1;
 /// How far the stack may grow downward, in pages. Beyond this a fault is a fault:
 /// the region below [`USER_STACK_LIMIT`] is a guard the kernel never fills, so
 /// runaway recursion dies instead of quietly eating the frame pool.
-pub const USER_STACK_MAX_PAGES: u64 = 64; // 256 KiB
+///
+/// A megabyte, raised from a quarter of one, and the reason is a program rather than
+/// a preference. QML's JavaScript engine sizes its own recursion limit from what the
+/// C library reports for this region and then subtracts a 128 KiB safety margin
+/// before it will evaluate anything — so at 256 KiB the engine had 128 KiB to work
+/// in, which is not enough to build a scene. This costs nothing on a process that
+/// does not use it: pages arrive on the fault, [`USER_STACK_PAGES`] of them exist at
+/// start-up, and the rest of the region is address space rather than memory.
+///
+/// It is still a limit and still load-bearing. `services/init`'s stack grower walks
+/// past it on purpose and dies at the guard, which is the check that this number
+/// means something. Raising it moves where that happens; removing it would let
+/// runaway recursion eat the frame pool instead.
+///
+/// `crates/staros-libc/src/thread.rs` carries a copy of this value — a C library
+/// cannot include the kernel's crates, and `getrlimit(RLIMIT_STACK)` and
+/// `pthread_attr_getstack` both have to answer with it. The two are named on each
+/// other's side so the seam is greppable.
+pub const USER_STACK_MAX_PAGES: u64 = 256; // 1 MiB
 
 /// The lowest address the stack may ever reach. Below it lies the guard region.
 pub const USER_STACK_LIMIT: u64 = USER_STACK_TOP - USER_STACK_MAX_PAGES * PAGE_4K;

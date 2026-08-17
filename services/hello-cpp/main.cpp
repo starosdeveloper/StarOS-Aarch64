@@ -22,7 +22,7 @@
 #include <vector>
 
 // The header a platform plugin is handed. It has been compiled as C since it was
-// written, and a QPA plugin is C++ — under `-fno-exceptions -fno-rtti -std=c++17`,
+// written, and a QPA plugin is C++ — under `-fno-exceptions -frtti -std=c++17`,
 // which is exactly how this file is built. A header that only ever met one of the
 // two compilers is a header that half works, and the half that fails is the one
 // nobody has tried.
@@ -147,6 +147,80 @@ private:
     int height_;
     unsigned int cap_;
     unsigned int *pixels_ = nullptr;
+};
+
+// ---- the class shapes `dynamic_cast` has to walk --------------------------
+//
+// `__dynamic_cast` in `crates/staros-libc/cxx/runtime.cpp` is the one algorithm in
+// the C++ runtime rather than a hook, and it is here because Qt Quick's software
+// renderer cannot identify a scene-graph node without it. An algorithm that is only
+// exercised through twenty-five megabytes of Qt is an algorithm nobody can debug, so
+// the shapes it walks are laid out below at a size that fits on a screen.
+//
+// The ABI gives every class exactly one of three type-information shapes, and the
+// walk dispatches on which:
+//
+//   `__class_type_info`      no bases at all
+//   `__si_class_type_info`   one public non-virtual base at offset zero
+//   `__vmi_class_type_info`  anything else — several bases, or a virtual one
+//
+// `Node` is the first, `Geometry` and `Rect` the second, `RectListener` and
+// `Diamond` the third. That is not a survey of C++: it is the exact set of shapes
+// `QSGGeometryNode`, `QQuickItemPrivate` and their relatives have.
+
+struct Node {
+    virtual ~Node() = default;
+    virtual const char *kind() const { return "node"; }
+};
+
+struct Geometry : Node {
+    const char *kind() const override { return "geometry"; }
+};
+
+struct Rect : Geometry {
+    const char *kind() const override { return "rect"; }
+    int width = 320;
+};
+
+/// A second polymorphic base, unrelated to the first. Its own data member is what
+/// puts it at a nonzero offset inside anything that derives from both.
+struct Listener {
+    virtual ~Listener() = default;
+    virtual void changed() { notified++; }
+    int notified = 0;
+};
+
+/// Two bases: this is the shape of `QQuickItemPrivate`, and the cast from one base
+/// to the other is exactly what `QQuickItemChangeListener::baseDeleted` does.
+struct RectListener : Rect, Listener {
+    const char *kind() const override { return "rect-listener"; }
+};
+
+/// The diamond. `Shared` is one subobject reached by two paths, and its offset from
+/// either side is not a compile-time constant — it is read out of the vtable, which
+/// is the only part of the walk that cannot be done with arithmetic alone.
+struct Shared {
+    virtual ~Shared() = default;
+    int token = 0x5ea5;
+};
+struct Left : virtual Shared {
+    int left_mark = 1;
+};
+struct Right : virtual Shared {
+    int right_mark = 2;
+};
+struct Diamond : Left, Right {
+    int leaf_mark = 3;
+};
+
+/// A public base and a private one. A `dynamic_cast` from the public side to the
+/// private side must fail: `Listener` is a base of `Sealed` but not a *public* base,
+/// and a cast that found it anyway would hand out access the type system refused.
+struct Marker {
+    virtual ~Marker() = default;
+};
+struct Sealed : Marker, private Listener {
+    int sealed_mark = 4;
 };
 
 }  // namespace
@@ -373,6 +447,63 @@ int main() {
             std::printf("[hello-cpp] a 1920x1080 backing store was refused: "
                         "8 MB of contiguous frames were not there\n");
         }
+    }
+
+    // ---- dynamic_cast -----------------------------------------------------
+    //
+    // Nine checks, and each one is a different way for the walk in
+    // `__dynamic_cast` to be wrong. The two that matter most are the cross-cast —
+    // where a correct answer is a *different address* from the one passed in — and
+    // the private base, where the correct answer is null and the tempting one is a
+    // valid pointer.
+    {
+        RectListener both;
+        Node *as_node = &both;
+
+        check(dynamic_cast<Rect *>(as_node) == static_cast<Rect *>(&both),
+              "a downcast through two single-inheritance links");
+        check(dynamic_cast<RectListener *>(as_node) == &both,
+              "a downcast to the complete type");
+
+        Listener *as_listener = dynamic_cast<Listener *>(as_node);
+        check(as_listener == static_cast<Listener *>(&both),
+              "a cross-cast from one base to a sibling base");
+        // The sibling base sits after the first one, so its address differs. An
+        // implementation that returned its argument unchanged would pass the check
+        // above by accident on a hierarchy where the offset happened to be zero.
+        check(static_cast<const void *>(as_listener) != static_cast<const void *>(as_node),
+              "and the cross-cast moved the pointer, as it must");
+        check(dynamic_cast<void *>(as_listener) == static_cast<void *>(&both),
+              "a cast to void* finds the start of the complete object");
+
+        Geometry plain;
+        check(dynamic_cast<Rect *>(static_cast<Node *>(&plain)) == nullptr,
+              "a downcast to a type the object is not");
+
+        Diamond diamond;
+        Shared *shared = &diamond;
+        check(dynamic_cast<Diamond *>(shared) == &diamond,
+              "a downcast from a virtual base to the complete object");
+        check(dynamic_cast<Left *>(shared) == static_cast<Left *>(&diamond),
+              "a downcast from a virtual base to one side of a diamond");
+
+        Sealed sealed;
+        check(dynamic_cast<Listener *>(static_cast<Marker *>(&sealed)) == nullptr,
+              "a private base is not a public base and must not be found");
+
+        // Said out loud, because eight of the nine checks above are silent when they
+        // pass and a program that prints nothing is indistinguishable from one whose
+        // checks were compiled away. The two numbers are the distances a correct
+        // walk had to find: one from a compile-time constant, one out of a vtable.
+        const auto listener_offset =
+            static_cast<const char *>(static_cast<const void *>(as_listener)) -
+            static_cast<const char *>(static_cast<const void *>(&both));
+        const auto shared_offset =
+            static_cast<const char *>(static_cast<const void *>(shared)) -
+            static_cast<const char *>(static_cast<const void *>(&diamond));
+        std::printf("[hello-cpp] dynamic_cast: sibling base at +%td, virtual base at +%td, "
+                    "9 checks over all three type-info shapes\n",
+                    listener_offset, shared_offset);
     }
 
     // ---- the static local -------------------------------------------------

@@ -60,6 +60,16 @@ const MAX_KEYS: usize = 32;
 /// way to give them back — see the note on `pthread_join`.
 const STACK_PAGES: u64 = 16;
 
+/// The most a thread may ask for, which is `MAX_THREAD_STACK_PAGES` in the kernel's
+/// `SpawnThread`. Another copy of a kernel constant, for the reason given at
+/// [`MAIN_STACK_SIZE`].
+///
+/// 8 MiB, which is Qt's number: `QQmlThreadPrivate` asks for exactly that because
+/// QML's parser and code generator have recursion limits calibrated to it. This is
+/// the ceiling a caller may ask for, not what a thread gets — [`STACK_PAGES`] is the
+/// default, and these pages are mapped eagerly.
+const MAX_THREAD_STACK_PAGES: u64 = 2048;
+
 /// Bytes of TCB in front of the TLS block, fixed by the AArch64 ABI.
 const TCB_SIZE: usize = 16;
 
@@ -104,7 +114,56 @@ pub struct Thread {
     /// What to run, for a thread that has not started yet.
     start: Option<extern "C" fn(*mut c_void) -> *mut c_void>,
     arg: *mut c_void,
+    /// This thread's stack, as `[top - size, top)`. Written once by the thread
+    /// itself before it runs anything else, read by [`pthread_attr_getstack`].
+    ///
+    /// Atomic because a thread may ask about another thread's stack, and the answer
+    /// is written by that other thread. Zero means "not yet recorded", which is a
+    /// distinguishable answer rather than a wrong one.
+    stack_top: AtomicUsize,
+    stack_size: AtomicUsize,
+    /// Destructors for this thread's `thread_local` objects, most recent last.
+    ///
+    /// Plain fields rather than atomics: only the owning thread ever touches them —
+    /// it registers them as its `thread_local`s are constructed and runs them on its
+    /// way out. Nothing else has any business in this list.
+    tls_dtors: [TlsDtor; MAX_TLS_DTORS],
+    tls_dtor_count: usize,
 }
+
+/// One `thread_local` destructor and the object it belongs to.
+#[derive(Clone, Copy)]
+struct TlsDtor {
+    function: Option<unsafe extern "C" fn(*mut c_void)>,
+    object: *mut c_void,
+}
+
+/// How many `thread_local` objects one thread may have.
+///
+/// Fixed, for the same reason the process-wide `__cxa_atexit` table is fixed
+/// (`crates/staros-libc/src/cxx.rs`): registration happens *while* those objects are
+/// being constructed, and an allocation here would run the allocator from inside a
+/// constructor that may be the allocator's own.
+///
+/// Thirty-two. Qt's per-thread state is a handful of objects — `QThreadData`, the
+/// event dispatcher's, the current-thread pointer — and a program that wants more
+/// gets a refusal from `__cxa_thread_atexit` rather than a destructor that silently
+/// never runs.
+const MAX_TLS_DTORS: usize = 32;
+
+/// Where the kernel puts the main thread's stack, and how far it lets it grow.
+///
+/// These are `arch_aarch64::addrspace::USER_STACK_TOP` and `USER_STACK_MAX_PAGES`,
+/// and they are written here rather than imported because this library does not
+/// depend on the kernel's crates — the ABI is what the two share. A copy of a
+/// constant is a seam, so it is named on both sides: change one and the other is a
+/// grep away.
+///
+/// The main thread's stack is not mapped up front. One page exists at start-up and
+/// the rest arrive on the fault, up to the limit; the *region* is the whole extent,
+/// which is what a caller asking where its stack is wants to know.
+const MAIN_STACK_TOP: usize = 0x8_0000_0000;
+pub(crate) const MAIN_STACK_SIZE: usize = 256 * 4096;
 
 /// The parker pool, created before the first thread so every thread's copy of the
 /// capability table names the same notifications.
@@ -144,7 +203,11 @@ pub(crate) fn init() {
     // instruction).
     if let Some(main_thread) = new_thread_block() {
         // SAFETY: the block was just built for this thread.
-        unsafe { install(main_thread) };
+        unsafe {
+            (*main_thread).stack_top.store(MAIN_STACK_TOP, Ordering::Release);
+            (*main_thread).stack_size.store(MAIN_STACK_SIZE, Ordering::Release);
+            install(main_thread);
+        }
     }
 }
 
@@ -215,6 +278,10 @@ fn new_thread_block() -> Option<*mut Thread> {
             keys: [ptr::null_mut(); MAX_KEYS],
             start: None,
             arg: ptr::null_mut(),
+            stack_top: AtomicUsize::new(0),
+            stack_size: AtomicUsize::new(0),
+            tls_dtors: [TlsDtor { function: None, object: ptr::null_mut() }; MAX_TLS_DTORS],
+            tls_dtor_count: 0,
         });
         // The TCB's second word points back here; that is what `pthread_self` reads.
         block.cast::<usize>().add(1).write(thread as usize);
@@ -249,6 +316,112 @@ fn thread_pointer() -> *mut u8 {
     }
     #[cfg(not(target_arch = "aarch64"))]
     ptr::null_mut()
+}
+
+/// Run everything this thread has to run before it stops existing.
+///
+/// Two lists, in the order the standards give them: the destructors of the thread's
+/// `thread_local` objects first, then the destructors registered with
+/// `pthread_key_create` for whichever keys this thread set a value on. C++ specifies
+/// the first ordering; POSIX specifies the second, including the re-scan (a
+/// destructor may set the key again, and the value must be destroyed too).
+///
+/// This used not to happen at all, and the shape of that failure is worth keeping:
+/// `__cxa_thread_atexit` put every `thread_local` destructor on the *process*
+/// `atexit` list, and `pthread_key_create` accepted destructors and never ran them.
+/// Both were written down as known limitations. Then a QML program stopped in
+/// `QThread::wait`, because `QThreadPrivate::cleanup` — which is what calls
+/// `wakeAll()` on the condition `wait` is sleeping on — runs from the destructor of
+/// a `thread_local`. A destructor that runs at process exit instead of at thread
+/// exit is not late here. It is never, because the process was waiting for it.
+///
+/// # Safety
+/// Called on the thread that is ending, once, before anything else observes it as
+/// finished.
+unsafe fn run_thread_exit(thread: *mut Thread) {
+    if thread.is_null() {
+        return;
+    }
+    // Most recent first, and the count is cleared as we go: a destructor that
+    // constructs another `thread_local` registers it, and running that one too is
+    // what the loop's re-read of the count achieves.
+    loop {
+        // SAFETY: our own block, and only this thread touches these fields.
+        let entry = unsafe {
+            let count = (*thread).tls_dtor_count;
+            if count == 0 {
+                break;
+            }
+            (*thread).tls_dtor_count = count - 1;
+            (*thread).tls_dtors[count - 1]
+        };
+        if let Some(function) = entry.function {
+            // SAFETY: the pair came from a `__cxa_thread_atexit` call.
+            unsafe { function(entry.object) };
+        }
+    }
+
+    // POSIX's key destructors, and its rule for them: repeat the sweep until no key
+    // has a value left or the round limit is reached, because a destructor is
+    // allowed to set its own key again.
+    const ROUNDS: usize = 4;
+    for _ in 0..ROUNDS {
+        let mut any = false;
+        for key in 0..MAX_KEYS {
+            // SAFETY: our own block.
+            let value = unsafe { (*thread).keys[key] };
+            if value.is_null() {
+                continue;
+            }
+            let dtor = KEY_DTORS[key].load(Ordering::Acquire);
+            // Cleared before the call, as POSIX requires: the destructor sees a key
+            // with no value, so a destructor that reads its own key does not get the
+            // object it is destroying.
+            // SAFETY: our own block.
+            unsafe { (*thread).keys[key] = ptr::null_mut() };
+            if dtor.is_null() {
+                continue;
+            }
+            any = true;
+            // SAFETY: the pointer came from `pthread_key_create`, whose declared
+            // type is this.
+            let dtor: unsafe extern "C" fn(*mut c_void) =
+                unsafe { core::mem::transmute(dtor) };
+            // SAFETY: as registered.
+            unsafe { dtor(value) };
+        }
+        if !any {
+            break;
+        }
+    }
+}
+
+/// Run the current thread's exit lists. Called from the process exit path for
+/// `main`, which is a thread like any other and whose `thread_local`s would
+/// otherwise never be destroyed at all.
+///
+/// # Safety
+/// Called once, on the way out.
+pub(crate) unsafe fn run_current_thread_exit() {
+    // SAFETY: forwarded; `current()` is this thread's own block.
+    unsafe { run_thread_exit(current()) };
+}
+
+/// The current stack pointer, or zero where there is no such register to name.
+///
+/// Zero rather than a plausible address off the host build: this is used to work out
+/// where a thread's stack is, and the host tests neither have this system's stack
+/// layout nor ask about it.
+fn stack_pointer() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let sp: usize;
+        // SAFETY: reading the stack pointer has no side effects.
+        unsafe { core::arch::asm!("mov {sp}, sp", sp = out(reg) sp, options(nomem, nostack)) };
+        sp
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    0
 }
 
 /// This thread's control block, or null if it has none (which cannot happen after
@@ -664,6 +837,24 @@ impl RwLock {
 /// Called by the kernel with the argument `pthread_create` passed.
 extern "C" fn thread_entry(arg: *mut c_void) -> ! {
     let thread = arg.cast::<Thread>();
+
+    // Where this thread's stack is, recorded by the only party that can know.
+    //
+    // The kernel maps the stack and sets `sp` to the top of it, and the top is page
+    // aligned — `sched::spawn_thread` reserves whole pages and points `sp` at
+    // `base + pages * 4096`. The parent is never told the address, so the child
+    // recovers it from the one place it appears: its own stack pointer, rounded up
+    // to the page boundary it started on. That is a derivation from two facts the
+    // kernel states, not an estimate: the only thing between the top and `sp` here
+    // is this function's prologue, which is a few dozen bytes.
+    //
+    // `pthread_create` has already written the size.
+    let sp = stack_pointer();
+    if sp != 0 {
+        // SAFETY: `arg` is the control block this thread was created with.
+        unsafe { (*thread).stack_top.store((sp + 0xfff) & !0xfff, Ordering::Release) };
+    }
+
     // SAFETY: `arg` is the control block this thread was created with; the kernel
     // already installed our thread pointer, so `current()` agrees with it.
     let (start, argument) = unsafe { ((*thread).start, (*thread).arg) };
@@ -671,6 +862,10 @@ extern "C" fn thread_entry(arg: *mut c_void) -> ! {
         Some(f) => f(argument),
         None => ptr::null_mut(),
     };
+    // Before anything observes this thread as finished. A joiner that woke first
+    // would be entitled to reuse everything the destructors below are still using.
+    // SAFETY: our own block, and we are the thread it describes.
+    unsafe { run_thread_exit(thread) };
     // SAFETY: as above.
     unsafe {
         (*thread).retval.store(retval, Ordering::Release);
@@ -694,7 +889,8 @@ extern "C" fn thread_entry(arg: *mut c_void) -> ! {
 pub mod exports {
     use super::{
         c_int, c_void, current, new_thread_block, ptr, sys, thread_entry, Cond, Mutex, Ordering,
-        Queue, RwLock, Sem, Thread, KEYS_USED, KEY_DTORS, MAX_KEYS, SLOTS, STACK_PAGES,
+        Queue, RwLock, Sem, Thread, KEYS_USED, KEY_DTORS, MAX_KEYS, MAX_THREAD_STACK_PAGES, SLOTS,
+        STACK_PAGES,
     };
 
     /// `EAGAIN`, the errno POSIX gives for "no resources for another thread".
@@ -703,17 +899,27 @@ pub mod exports {
     const ETIMEDOUT: c_int = 110;
     /// `EINVAL`.
     const EINVAL: c_int = 22;
+    /// No such thread — what `pthread_getattr_np` answers when it is asked about one
+    /// that has not started, which is distinguishable from a bad argument.
+    const ESRCH: c_int = 3;
     /// `EBUSY`, for `pthread_mutex_trylock`.
     const EBUSY: c_int = 16;
     /// `ENOSYS`, for the things this system genuinely does not have.
     const ENOSYS: c_int = 38;
 
-    /// `pthread_attr_t` as this library defines it: a stack size and a detach flag.
+    /// `pthread_attr_t` as this library defines it: a stack size, a detach flag, and
+    /// — once [`pthread_getattr_np`] has filled it in — where a *running* thread's
+    /// stack actually is. Four words, matching `pthread.h`.
     #[repr(C)]
     pub struct Attr {
         stack_pages: u64,
         detached: c_int,
-        _pad: [u64; 2],
+        /// Low address of the stack region, or zero when this attribute block
+        /// describes a thread that does not exist yet. Zero is why
+        /// `pthread_attr_getstack` can tell "nobody asked about a real thread" from
+        /// "here is where it is".
+        stack_base: u64,
+        _pad: [u64; 1],
     }
 
     /// # Safety
@@ -742,6 +948,15 @@ pub mod exports {
         } else {
             unsafe { (*attr).stack_pages.max(1) }
         };
+
+        // The size is known here and the address is not — the child writes that in
+        // `thread_entry`, from the one register it appears in.
+        // SAFETY: nothing else can see the block yet.
+        unsafe {
+            (*block)
+                .stack_size
+                .store(pages as usize * 4096, Ordering::Release);
+        }
 
         // From here a second thread exists, and anything that cached "single
         // threaded" is wrong. Published *before* the thread starts.
@@ -831,6 +1046,10 @@ pub mod exports {
     pub unsafe extern "C" fn pthread_exit(retval: *mut c_void) -> ! {
         let me = current();
         if !me.is_null() {
+            // The same order as [`thread_entry`]: the exit lists run before anyone
+            // is told this thread has finished.
+            // SAFETY: our own block, and we are the thread it describes.
+            unsafe { super::run_thread_exit(me) };
             // SAFETY: our own block.
             unsafe {
                 (*me).retval.store(retval, Ordering::Release);
@@ -1162,6 +1381,59 @@ pub mod exports {
         0
     }
 
+    /// Register a destructor for one of this thread's `thread_local` objects.
+    ///
+    /// The compiler emits a call to this for every `thread_local` with a non-trivial
+    /// destructor, right after constructing it. The list is per thread and runs when
+    /// the thread ends — see [`run_thread_exit`](super::run_thread_exit) for what
+    /// that used to do instead, and what it cost.
+    ///
+    /// Both spellings are defined because both are emitted: glibc's header declares
+    /// `__cxa_thread_atexit_impl` and libstdc++ calls `__cxa_thread_atexit`, and
+    /// which one appears depends on how the translation unit was compiled.
+    ///
+    /// # Safety
+    /// C ABI: `destructor` is called with `object` when this thread ends.
+    #[no_mangle]
+    pub unsafe extern "C" fn __cxa_thread_atexit(
+        destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+        object: *mut c_void,
+        _dso: *mut c_void,
+    ) -> c_int {
+        let me = current();
+        if me.is_null() {
+            // Before `thread::init` ran, which is before `main`. Nothing has a
+            // thread block yet, and a `thread_local` constructed this early belongs
+            // to the process for as long as it exists.
+            return -1;
+        }
+        // SAFETY: our own block; only this thread touches these fields.
+        unsafe {
+            let count = (*me).tls_dtor_count;
+            if count >= super::MAX_TLS_DTORS {
+                // Refused rather than dropped. The caller turns a refusal into a
+                // failed construction; a destructor quietly never registered is a
+                // leak nobody can see.
+                return -1;
+            }
+            (*me).tls_dtors[count] = super::TlsDtor { function: destructor, object };
+            (*me).tls_dtor_count = count + 1;
+        }
+        0
+    }
+
+    /// # Safety
+    /// As [`__cxa_thread_atexit`].
+    #[no_mangle]
+    pub unsafe extern "C" fn __cxa_thread_atexit_impl(
+        destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+        object: *mut c_void,
+        dso: *mut c_void,
+    ) -> c_int {
+        // SAFETY: forwarded.
+        unsafe { __cxa_thread_atexit(destructor, object, dso) }
+    }
+
     #[no_mangle]
     pub extern "C" fn pthread_setspecific(key: c_int, value: *const c_void) -> c_int {
         let me = current();
@@ -1193,6 +1465,9 @@ pub mod exports {
         unsafe {
             (*attr).stack_pages = STACK_PAGES;
             (*attr).detached = 0;
+            // Fresh attributes describe a thread that does not exist yet, so there
+            // is no stack to point at. `pthread_getattr_np` is what fills this in.
+            (*attr).stack_base = 0;
         }
         0
     }
@@ -1210,8 +1485,17 @@ pub mod exports {
     pub unsafe extern "C" fn pthread_attr_setstacksize(attr: *mut Attr, bytes: usize) -> c_int {
         // Rounded up to pages, and never zero: a thread with no stack is a fault at
         // its first instruction, which is a confusing way to report a bad argument.
+        let pages = (bytes.div_ceil(4096) as u64).max(1);
+        // Refused here rather than at `pthread_create`, because this is where the
+        // caller named the number. A size past the kernel's ceiling makes
+        // `SpawnThread` answer `InvalidArgument`, which `pthread_create` can only
+        // report as `EAGAIN` — "try again later" for a request that will never
+        // succeed. `EINVAL` at the point of the argument is the truth.
+        if pages > MAX_THREAD_STACK_PAGES {
+            return EINVAL;
+        }
         // SAFETY: forwarded from the caller.
-        unsafe { (*attr).stack_pages = (bytes.div_ceil(4096) as u64).max(1) };
+        unsafe { (*attr).stack_pages = pages };
         0
     }
 
@@ -1652,36 +1936,95 @@ pub mod exports {
         0
     }
 
+    /// The attributes of a thread that is *running*, which is a different question
+    /// from the attributes a thread would be created with.
+    ///
     /// # Safety
-    /// C ABI: `attr` receives this thread's attributes.
+    /// C ABI: `id` names a live thread, or is this one; `attr` receives its
+    /// attributes.
     #[no_mangle]
-    pub unsafe extern "C" fn pthread_getattr_np(_id: usize, attr: *mut Attr) -> c_int {
+    pub unsafe extern "C" fn pthread_getattr_np(id: usize, attr: *mut Attr) -> c_int {
+        if attr.is_null() {
+            return EINVAL;
+        }
         // SAFETY: forwarded from the caller.
-        unsafe { pthread_attr_init(attr) }
+        unsafe { pthread_attr_init(attr) };
+
+        let thread = if id == 0 { super::current() } else { id as *mut Thread };
+        if thread.is_null() {
+            return ESRCH;
+        }
+        // SAFETY: `thread` is a live control block; both fields are atomics written
+        // by the thread they describe.
+        unsafe {
+            let top = (*thread).stack_top.load(Ordering::Acquire);
+            let size = (*thread).stack_size.load(Ordering::Acquire);
+            if top == 0 || size == 0 {
+                // The thread has not recorded its stack yet, which for a thread
+                // that exists means it has not reached its first instruction.
+                // Saying so beats handing back the defaults as if they were facts.
+                return ESRCH;
+            }
+            (*attr).stack_base = (top - size) as u64;
+            (*attr).stack_pages = (size / 4096) as u64;
+        }
+        0
     }
 
     /// # Safety
     /// C ABI: `base` and `size` receive the thread's stack.
     ///
-    /// Both come back zero: the kernel maps the stack and never tells the thread
-    /// where it is. A guessed answer here would be used by a garbage collector or a
-    /// stack-overflow check, which are exactly the callers that must not be lied to.
+    /// This used to return `ENOSYS` with both outputs zeroed, on the grounds that
+    /// the kernel maps the stack and never tells the thread where it is, and that a
+    /// guessed answer would be used by exactly the callers who must not be lied to —
+    /// garbage collectors and stack-overflow checks.
+    ///
+    /// The second half of that was right and the first half was not. V4, the
+    /// JavaScript engine inside QML, is precisely such a caller: `stackProperties()`
+    /// in `qv4stacklimits.cpp` ends with `qFatal("Cannot find stack base")` when this
+    /// refuses, so the refusal was not a safe answer but a QML program that aborted
+    /// before its first line ran.
+    ///
+    /// And the answer was available all along. The main thread's stack is the
+    /// kernel's own `[USER_STACK_TOP - USER_STACK_MAX_PAGES * 4096, USER_STACK_TOP)`,
+    /// which is a constant of this ABI; a spawned thread's is `pages` pages ending at
+    /// the `sp` the kernel started it with, which the thread records in
+    /// `thread_entry`. Neither is a guess.
     #[no_mangle]
     pub unsafe extern "C" fn pthread_attr_getstack(
-        _attr: *const Attr,
+        attr: *const Attr,
         base: *mut *mut c_void,
         size: *mut usize,
     ) -> c_int {
+        if attr.is_null() {
+            return EINVAL;
+        }
+        // SAFETY: forwarded from the caller.
+        let (low, bytes) = unsafe { ((*attr).stack_base, (*attr).stack_pages * 4096) };
+        if low == 0 {
+            // These attributes were never filled in by `pthread_getattr_np`, so
+            // they describe a thread that does not exist and have no stack to name.
+            // SAFETY: forwarded from the caller.
+            unsafe {
+                if !base.is_null() {
+                    *base = ptr::null_mut();
+                }
+                if !size.is_null() {
+                    *size = 0;
+                }
+            }
+            return EINVAL;
+        }
         // SAFETY: forwarded from the caller.
         unsafe {
             if !base.is_null() {
-                *base = ptr::null_mut();
+                *base = low as *mut c_void;
             }
             if !size.is_null() {
-                *size = 0;
+                *size = bytes as usize;
             }
         }
-        ENOSYS
+        0
     }
 
     /// # Safety

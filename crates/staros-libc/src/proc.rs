@@ -798,9 +798,13 @@ pub mod exports {
     /// The limits this system actually has.
     ///
     /// `RLIMIT_STACK` is the real number: the kernel grows a task's stack on demand
-    /// and stops at 256 KiB, and a program that sizes a recursion or an `alloca`
-    /// from this value is entitled to the truth rather than to `RLIM_INFINITY`. The
-    /// descriptor limit is likewise the table's real size.
+    /// and stops at `USER_STACK_MAX_PAGES`, and a program that sizes a recursion or
+    /// an `alloca` from this value is entitled to the truth rather than to
+    /// `RLIM_INFINITY`. The descriptor limit is likewise the table's real size.
+    ///
+    /// The number is `crate::thread::MAIN_STACK_SIZE`, which is a copy of the
+    /// kernel's constant — see the comment there for why a C library cannot import
+    /// it and where the other side is.
     ///
     /// # Safety
     /// C ABI: `out` is valid for one `Rlimit`.
@@ -810,7 +814,10 @@ pub mod exports {
             return fail(EINVAL, -1);
         }
         let (cur, max) = match resource {
-            RLIMIT_STACK => (256 * 1024, 256 * 1024),
+            RLIMIT_STACK => (
+                crate::thread::MAIN_STACK_SIZE as u64,
+                crate::thread::MAIN_STACK_SIZE as u64,
+            ),
             RLIMIT_NOFILE => (crate::fd::MAX_OPEN as u64, crate::fd::MAX_OPEN as u64),
             RLIMIT_AS => (RLIM_INFINITY, RLIM_INFINITY),
             _ => (RLIM_INFINITY, RLIM_INFINITY),
