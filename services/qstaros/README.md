@@ -17,7 +17,7 @@ without a second copy to keep in step.
 
 ```sh
 QT_SRC=~/qt-src/qtbase-everywhere-src-6.11.1
-STAROS=~/Documents/StarOS-Kernel-main/kernel-new
+STAROS=~/Documents/StarOS-Kernel-main/kernel-Aarch64
 
 # 1. the patches, three of them, each explained in patches/README.md
 cd "$QT_SRC"

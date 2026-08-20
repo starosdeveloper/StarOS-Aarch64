@@ -897,7 +897,7 @@ build.rs (cpio→rlib + `--extern`, как `fdt`); читает info, парси
 `timeout -k` (урок дестабилизации хоста); rc 124/137 = провал. **Falsification:**
 инъекция ложного ассерта → `SMOKE TEST FAILED — 1 failed`, указан конфиг, exit=1 —
 то есть зелёный прогон что-то доказывает. **CI:** `.github/workflows/ci.yml` (в
-корне репо; `working-directory: kernel-new`) — джоб `host-tests` (`cargo kclippy -D
+корне репо; `working-directory: kernel-Aarch64`) — джоб `host-tests` (`cargo kclippy -D
 warnings` + `cargo ktest-host`) и джоб `smoke-test` (ставит `qemu-system-arm`,
 запускает скрипт); тулчейн ставится сам из `rust-toolchain.toml`. Локально: **47
 ассертов, 6 конфигов, exit=0, зомби ноль.** (Репозиторий пока не под git — workflow

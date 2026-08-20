@@ -42,7 +42,7 @@ Concrete consequences we are designing away from:
 ## Crate map
 
 ```
-kernel-new/
+kernel-Aarch64/
 ├── crates/
 │   ├── abi/            # syscall numbers, error codes, Handle — the kernel↔user contract
 │   ├── hal/            # hardware traits: SerialConsole, Timer, InterruptController
