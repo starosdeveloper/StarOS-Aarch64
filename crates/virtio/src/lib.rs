@@ -280,6 +280,22 @@ impl InputEvent {
     pub const fn is_key_press(&self) -> bool {
         self.kind == ev::KEY && self.value != 0
     }
+
+    /// Every whole event in a buffer the device filled, in order.
+    ///
+    /// A device is allowed to pack several events into one buffer and a pointer
+    /// always does: a single movement is `ABS_X`, `ABS_Y`, `SYN` — twenty-four
+    /// bytes in one descriptor. A driver that parsed only the first would report
+    /// horizontal motion and never vertical, and nothing in the log would say so,
+    /// because every event it *did* report would be correct.
+    ///
+    /// A trailing partial event is dropped rather than guessed at, by the same rule
+    /// [`parse`](InputEvent::parse) follows: the length came from the device.
+    pub fn parse_all(bytes: &[u8]) -> impl Iterator<Item = Self> + '_ {
+        bytes
+            .chunks_exact(INPUT_EVENT_BYTES)
+            .filter_map(Self::parse)
+    }
 }
 
 /// Input event classes, as the Linux input layer numbers them — which is what
@@ -293,6 +309,182 @@ pub mod ev {
     pub const REL: u16 = 0x02;
     /// An absolute axis moved (tablet, touchscreen).
     pub const ABS: u16 = 0x03;
+}
+
+/// Axis codes, for both [`ev::ABS`] and [`ev::REL`]: X is 0 and Y is 1 in both.
+pub mod axis {
+    /// Horizontal.
+    pub const X: u16 = 0x00;
+    /// Vertical.
+    pub const Y: u16 = 0x01;
+}
+
+/// The button codes a pointer reports, which are [`ev::KEY`] events with codes
+/// above the keyboard's range — the input layer makes no other distinction, and
+/// neither does anything downstream of this driver.
+pub mod btn {
+    /// Left button, and the only one a `virtio-tablet` reports by default.
+    pub const LEFT: u16 = 0x110;
+    /// Right button.
+    pub const RIGHT: u16 = 0x111;
+    /// Middle button.
+    pub const MIDDLE: u16 = 0x112;
+
+    /// Whether a key code is a pointer button rather than a keyboard key.
+    ///
+    /// The boundary is `BTN_MISC` (0x100): everything below it is a key on a
+    /// keyboard, everything from it up is a button on something you point with.
+    /// A consumer that skipped this test would deliver a mouse click to whatever
+    /// holds the keyboard focus, which is a window that may be nowhere near the
+    /// pointer.
+    #[must_use]
+    pub const fn is_button(code: u16) -> bool {
+        code >= 0x100
+    }
+}
+
+/// The device-specific configuration space of a `virtio-input`, as offsets from
+/// the device's base address.
+///
+/// This is how one input device is told from another. A keyboard and a tablet are
+/// both `DeviceID` 18 and both answer every transport register identically; the
+/// only thing that separates them is which event classes they claim here. A
+/// manager that picked by slot order would work on the machine it was written on.
+///
+/// Reading it is a two-step conversation, not a read: write `SELECT` and `SUBSEL`,
+/// then read `SIZE` — zero means "the device has nothing to say about that" — and
+/// then `SIZE` bytes from `UNION`.
+pub mod cfg {
+    use super::reg;
+
+    /// Which configuration item the device should expose.
+    pub const SELECT: usize = reg::CONFIG;
+    /// Which sub-item: the event class for [`EV_BITS`], the axis for [`ABS_INFO`].
+    pub const SUBSEL: usize = reg::CONFIG + 1;
+    /// How many bytes of [`UNION`] the device filled in. Zero is a complete answer:
+    /// it means this device does not have the thing that was asked about.
+    pub const SIZE: usize = reg::CONFIG + 2;
+    /// Where the selected item's bytes begin — five reserved bytes after `SIZE`.
+    pub const UNION: usize = reg::CONFIG + 8;
+    /// How many bytes the union holds at most.
+    pub const UNION_BYTES: usize = 128;
+
+    /// Select nothing; the state a probe should leave behind it.
+    pub const UNSET: u8 = 0x00;
+    /// The device's name, as a string in the union.
+    pub const ID_NAME: u8 = 0x01;
+    /// Which codes of the event class in `SUBSEL` this device can report, as a
+    /// bitmap. Size zero means it does not report that class at all.
+    pub const EV_BITS: u8 = 0x11;
+    /// The range of the absolute axis in `SUBSEL`, as an [`super::AbsInfo`].
+    pub const ABS_INFO: u8 = 0x12;
+}
+
+/// The range of one absolute axis, as `VIRTIO_INPUT_CFG_ABS_INFO` reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AbsInfo {
+    /// Smallest value the axis reports.
+    pub min: u32,
+    /// Largest value the axis reports.
+    pub max: u32,
+    /// Noise the device suggests ignoring; not used here, parsed so the layout is
+    /// complete and a short answer is detected rather than guessed at.
+    pub fuzz: u32,
+    /// Dead zone around the centre.
+    pub flat: u32,
+    /// Resolution, in units per millimetre.
+    pub res: u32,
+}
+
+/// Bytes in the `abs_info` structure.
+pub const ABS_INFO_BYTES: usize = 20;
+
+impl AbsInfo {
+    /// Parse the five little-endian words the device wrote into the union.
+    #[must_use]
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < ABS_INFO_BYTES {
+            return None;
+        }
+        let word = |i: usize| {
+            u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
+        };
+        Some(Self {
+            min: word(0),
+            max: word(4),
+            fuzz: word(8),
+            flat: word(12),
+            res: word(16),
+        })
+    }
+
+    /// Where `value` sits on this axis, as a fraction of it scaled to
+    /// `0..=`[`AXIS_SCALE`].
+    ///
+    /// The driver normalises rather than converting to pixels, because it is the
+    /// only process that holds the axis range and it is *not* the process that
+    /// knows the screen. Sending raw device units would make every consumer ask
+    /// for the range; sending pixels would put the screen geometry in a keyboard
+    /// driver. A fraction is the one form that needs neither.
+    ///
+    /// Saturating rather than wrapping: a device is entitled to report a value
+    /// outside the range it advertised — QEMU's tablet does at the very edges —
+    /// and a pointer that jumps to the opposite corner at the edge of the screen
+    /// is a bug nobody would look for in arithmetic.
+    #[must_use]
+    pub fn normalise(&self, value: u32) -> u32 {
+        // A degenerate range is what a device with no such axis reports, and
+        // dividing by it would fault. The middle is the honest answer: there is no
+        // position to report, and the corner would look like one.
+        if self.max <= self.min {
+            return AXIS_SCALE / 2;
+        }
+        let span = u64::from(self.max - self.min);
+        let clamped = value.clamp(self.min, self.max);
+        let offset = u64::from(clamped - self.min);
+        // 64-bit throughout: `offset * AXIS_SCALE` overflows 32 bits for any range
+        // wider than 65536, and a tablet advertising 0..32767 is one multiply away
+        // from that.
+        ((offset * u64::from(AXIS_SCALE)) / span) as u32
+    }
+}
+
+/// The scale a normalised axis position uses: `0..=65535`, one axis position per
+/// pixel of a screen far wider than any this will run on.
+pub const AXIS_SCALE: u32 = 65535;
+
+/// What kind of input device this is, decided by the event classes it claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputKind {
+    /// Keys, and no axes: a keyboard.
+    Keyboard,
+    /// Absolute axes: a tablet or a touchscreen. The position it reports *is* the
+    /// position, so no pointer needs to be tracked between events.
+    Tablet,
+    /// Relative axes: a mouse. Every event is a delta from wherever the pointer
+    /// was, so somebody downstream has to remember where that is.
+    Mouse,
+    /// Something this system has no use for.
+    Other,
+}
+
+/// Classify a device from the three questions worth asking of `EV_BITS`.
+///
+/// Absolute before relative, and both before keys, because the interesting device
+/// claims more than one: QEMU's `virtio-tablet` reports `EV_ABS` for the position
+/// *and* `EV_KEY` for its button, so a test that asked about keys first would
+/// call it a keyboard and route its clicks by focus.
+#[must_use]
+pub const fn classify(has_abs: bool, has_rel: bool, has_key: bool) -> InputKind {
+    if has_abs {
+        InputKind::Tablet
+    } else if has_rel {
+        InputKind::Mouse
+    } else if has_key {
+        InputKind::Keyboard
+    } else {
+        InputKind::Other
+    }
 }
 
 #[cfg(test)]
@@ -432,5 +624,129 @@ mod tests {
     #[test]
     fn the_magic_register_spells_virt() {
         assert_eq!(MAGIC_VALUE.to_le_bytes(), *b"virt");
+    }
+
+    #[test]
+    fn one_buffer_can_hold_a_whole_pointer_movement() {
+        // What a tablet actually sends for one movement, in one descriptor:
+        // ABS_X = 100, ABS_Y = 200, SYN_REPORT. A driver reading only the first
+        // event moves the pointer horizontally for ever.
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&[0x03, 0x00, 0x00, 0x00, 100, 0, 0, 0]);
+        buf[8..16].copy_from_slice(&[0x03, 0x00, 0x01, 0x00, 200, 0, 0, 0]);
+        buf[16..24].copy_from_slice(&[0x00; 8]);
+
+        let events: Vec<InputEvent> = InputEvent::parse_all(&buf).collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], InputEvent { kind: ev::ABS, code: axis::X, value: 100 });
+        assert_eq!(events[1], InputEvent { kind: ev::ABS, code: axis::Y, value: 200 });
+        assert_eq!(events[2].kind, ev::SYN);
+    }
+
+    #[test]
+    fn a_partial_trailing_event_is_dropped_not_guessed_at() {
+        // Twelve bytes: one whole event and half of another. The length comes from
+        // the device's used ring, and half an event is not an event.
+        let mut buf = [0u8; 12];
+        buf[0..8].copy_from_slice(&[0x01, 0x00, 0x1e, 0x00, 0x01, 0, 0, 0]);
+        let events: Vec<InputEvent> = InputEvent::parse_all(&buf).collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code, 30);
+        assert!(InputEvent::parse_all(&[]).next().is_none());
+    }
+
+    #[test]
+    fn abs_info_parses_the_five_words_the_device_writes() {
+        // QEMU's virtio-tablet: 0..32767 on both axes, no fuzz, no flat, no res.
+        let mut bytes = [0u8; ABS_INFO_BYTES];
+        bytes[4..8].copy_from_slice(&32767u32.to_le_bytes());
+        let info = AbsInfo::parse(&bytes).unwrap();
+        assert_eq!(info.min, 0);
+        assert_eq!(info.max, 32767);
+        assert_eq!(info.fuzz, 0);
+        // Nineteen bytes is not an abs_info, and reading one out of it would take
+        // the last word from whatever follows in the union.
+        assert_eq!(AbsInfo::parse(&bytes[..19]), None);
+    }
+
+    #[test]
+    fn an_axis_normalises_across_its_whole_range() {
+        let info = AbsInfo { min: 0, max: 32767, ..AbsInfo::default() };
+        assert_eq!(info.normalise(0), 0);
+        assert_eq!(info.normalise(32767), AXIS_SCALE, "the far edge must reach the far edge");
+        // The middle, within one part in sixty-five thousand.
+        let middle = info.normalise(16383);
+        assert!(middle.abs_diff(AXIS_SCALE / 2) <= 2, "middle was {middle}");
+    }
+
+    #[test]
+    fn an_axis_that_does_not_start_at_zero_still_normalises() {
+        // A touchscreen calibrated to a sub-range is the ordinary case on real
+        // hardware, and treating `value` as if `min` were zero puts the pointer
+        // permanently past the right edge.
+        let info = AbsInfo { min: 1000, max: 5000, ..AbsInfo::default() };
+        assert_eq!(info.normalise(1000), 0);
+        assert_eq!(info.normalise(5000), AXIS_SCALE);
+        assert_eq!(info.normalise(3000), AXIS_SCALE / 2);
+    }
+
+    #[test]
+    fn an_axis_saturates_rather_than_wrapping_outside_its_range() {
+        // A device may report past what it advertised. Wrapping here would send the
+        // pointer to the opposite corner at the edge of the screen — a jump nobody
+        // would look for in a division.
+        let info = AbsInfo { min: 100, max: 200, ..AbsInfo::default() };
+        assert_eq!(info.normalise(0), 0);
+        assert_eq!(info.normalise(u32::MAX), AXIS_SCALE);
+        // And a degenerate range — what a device with no such axis reports —
+        // answers the middle rather than dividing by zero.
+        let none = AbsInfo::default();
+        assert_eq!(none.normalise(1234), AXIS_SCALE / 2);
+    }
+
+    #[test]
+    fn a_wide_axis_does_not_overflow_the_scaling_multiply() {
+        // `offset * AXIS_SCALE` leaves 32 bits for any range wider than 65536, and
+        // a device advertising a million units is legal. In 32-bit arithmetic this
+        // returns a small number for a large position.
+        let info = AbsInfo { min: 0, max: 1_000_000, ..AbsInfo::default() };
+        assert_eq!(info.normalise(1_000_000), AXIS_SCALE);
+        assert_eq!(info.normalise(500_000), AXIS_SCALE / 2);
+        let wide = AbsInfo { min: 0, max: u32::MAX, ..AbsInfo::default() };
+        assert_eq!(wide.normalise(u32::MAX), AXIS_SCALE);
+    }
+
+    #[test]
+    fn a_tablet_is_not_mistaken_for_a_keyboard() {
+        // QEMU's virtio-tablet claims EV_ABS *and* EV_KEY, because its button is a
+        // key event. Asking about keys first calls it a keyboard, and then its
+        // clicks are routed by keyboard focus to a window that may be elsewhere.
+        assert_eq!(classify(true, false, true), InputKind::Tablet);
+        assert_eq!(classify(false, true, true), InputKind::Mouse);
+        assert_eq!(classify(false, false, true), InputKind::Keyboard);
+        assert_eq!(classify(false, false, false), InputKind::Other);
+    }
+
+    #[test]
+    fn a_button_is_told_from_a_key_by_its_code() {
+        assert!(btn::is_button(btn::LEFT));
+        assert!(btn::is_button(btn::RIGHT));
+        // Key code 30 is 'a', and the highest ordinary key code is still below the
+        // button range.
+        assert!(!btn::is_button(30));
+        assert!(!btn::is_button(0xff));
+    }
+
+    #[test]
+    fn the_configuration_space_is_where_the_specification_puts_it() {
+        // These four offsets are the whole of how one input device is told from
+        // another, and every one of them is silent when wrong: a `SIZE` read from
+        // the wrong byte answers zero, which reads as "this device does not do
+        // that" rather than as a mistake.
+        assert_eq!(cfg::SELECT, 0x100);
+        assert_eq!(cfg::SUBSEL, 0x101);
+        assert_eq!(cfg::SIZE, 0x102);
+        // Five reserved bytes after SIZE, so the union starts on the eighth.
+        assert_eq!(cfg::UNION, 0x108);
     }
 }

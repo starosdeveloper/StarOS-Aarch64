@@ -91,7 +91,12 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // Send a message: `x0` = endpoint *handle*, `x1` = pointer to a user
         // `Message`. If the message names a capability (`Message.cap`), that
         // capability is resolved from the caller's table and transferred.
-        Some(Syscall::Send) => {
+        // Both sends, differing in one thing: whether a full endpoint parks the
+        // caller or answers `WouldBlock`. Written as one arm because everything
+        // before that decision — the capability, the message, the transferred
+        // handle — is identical, and a second copy of it is a second place for the
+        // capability check to be got wrong.
+        Some(kind @ (Syscall::Send | Syscall::SendNoWait)) => {
             let id = match sched::resolve_cap(req.args[0] as u32) {
                 Some(Cap::Endpoint { obj, send: true, .. }) => match obj::get(obj) {
                     Some(Object::Endpoint { id }) => id,
@@ -114,7 +119,12 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
                     None => return KError::BadHandle.as_raw(),
                 }
             };
-            ipc::send(id, KMessage { msg, cap })
+            let km = KMessage { msg, cap };
+            if matches!(kind, Syscall::Send) {
+                ipc::send(id, km)
+            } else {
+                ipc::send_nowait(id, km)
+            }
         }
 
         // Receive a message: `x0` = endpoint *handle*, `x1` = pointer to a user
@@ -157,7 +167,7 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
             // capability *and* the underlying object must not have been revoked.
             let outcome = match sched::resolve_cap(req.args[0] as u32) {
                 Some(Cap::Device { obj }) => match obj::get(obj) {
-                    Some(Object::Device { phys }) => Ok(phys),
+                    Some(Object::Device { phys }) => Ok((obj, phys)),
                     // The device object was revoked (possibly by another task).
                     _ => Err(("object was revoked", KError::BadHandle)),
                 },
@@ -165,7 +175,7 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
                 None => Err(("no such capability", KError::BadHandle)),
             };
             match outcome {
-                Ok(phys) => sched::map_device_current(phys),
+                Ok((obj, phys)) => sched::map_device_current(obj, phys),
                 Err((reason, err)) => {
                     klog!(
                         "[cap] task {} denied MapMemory(handle {}): {reason}",

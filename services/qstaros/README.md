@@ -159,15 +159,30 @@ machine that has not built Qt — which is every machine, the first time.
 | `qstarosscreen` | the screen's geometry and depth, from the server's answer |
 | `qstaroswindow` | a surface and its two buffers |
 | `qstarosbackingstore` | a `QImage` over the shared pixels — not a copy of them |
+| `qstarosinput` | the event messages, and the two tables nothing else can supply: Linux key code to `Qt::Key`, and a button mask to the transition Qt wants |
 | `qstarosintegration` | which of QPA's optional interfaces exist here |
 | `main.cpp` | the factory Qt asks for the platform named "staros" |
 
 Capability handles 3, 4 and 5 are the display request endpoint, its reply, and
 the input channel. The order is the ABI; there is nothing to ask.
 
+Input is a `QSocketNotifier` on handle 5, created in `initialize()` and not in
+the constructor — a notifier registers with the event dispatcher of the thread
+that makes it, and when the integration is constructed there is not one yet.
+Built early it attaches to nothing and never fires, which looks exactly like a
+plugin that works: the window appears, the scene animates, and no key ever
+arrives.
+
+What comes in is already routed. The compositor decided which window a key or a
+click belongs to before it sent it, and this plugin does not choose — it is not
+the process that knows where the windows are. It only names things the way Qt
+names them.
+
 ## What is deliberately absent
 
-No OpenGL, no theme, no cursor, no clipboard. The last three are optional by
+No OpenGL, no theme, no cursor, no clipboard. There is input now, but no cursor
+to show where it is: drawing one is the compositor's, above the window stack,
+and it needs damage tracking under a moving shape. The last three are optional by
 QPA's own contract, which is why they can be absent rather than stubbed: an
 optional interface Qt asks for and does not get is a feature it turns off, and
 a stub that answers wrongly is a feature it uses.

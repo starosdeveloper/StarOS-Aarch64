@@ -246,6 +246,20 @@ pub fn storm_stats() -> ([u64; boot::MAX_CPUS], [u64; boot::MAX_CPUS], u32, u32)
 /// drains a slot. Returns `0` on success (possibly after blocking) or a negative
 /// [`KError`].
 pub fn send(ep: usize, km: KMessage) -> isize {
+    send_inner(ep, km, true)
+}
+
+/// Send `km` to endpoint `ep` without ever parking: [`KError::WouldBlock`] when
+/// there is no room, rather than waiting for one.
+///
+/// Backs `SendNoWait`, which exists for the one caller shape that must not block —
+/// a server pushing unsolicited events to a client. See the syscall's own
+/// documentation for what happened without it.
+pub fn send_nowait(ep: usize, km: KMessage) -> isize {
+    send_inner(ep, km, false)
+}
+
+fn send_inner(ep: usize, km: KMessage, may_block: bool) -> isize {
     if ep >= NUM_ENDPOINTS {
         return KError::InvalidArgument.as_raw();
     }
@@ -264,6 +278,8 @@ pub fn send(ep: usize, km: KMessage) -> isize {
         Buffered,
         Block,
         Full,
+        /// No room, and the caller asked not to wait.
+        WouldBlock,
     }
     let (action, bound) = {
         // The guard's scope is this block: it is released before any of the
@@ -275,6 +291,11 @@ pub fn send(ep: usize, km: KMessage) -> isize {
             Action::Deliver(w)
         } else if e.push_msg(km) {
             Action::Buffered
+        } else if !may_block {
+            // Decided inside the lock, with the rest: asking whether there is room
+            // and then sending is two decisions about a queue other cores are using,
+            // and the answer to the first stops being true between them.
+            Action::WouldBlock
         } else if e.push_send_waiter(me, km) {
             Action::Block
         } else {
@@ -313,6 +334,10 @@ pub fn send(ep: usize, km: KMessage) -> isize {
             0
         }
         Action::Full => KError::OutOfResources.as_raw(),
+        // No log line. This is the ordinary outcome for an event nobody is reading,
+        // it happens once per pointer movement, and a server that counts its drops
+        // has better evidence than a kernel that narrates them.
+        Action::WouldBlock => KError::WouldBlock.as_raw(),
     }
 }
 

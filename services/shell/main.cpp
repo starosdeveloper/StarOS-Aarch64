@@ -74,7 +74,25 @@ static const char SCENE_PATH[] = "qml/Main.qml";
 // enough for both animations in `Main.qml` to pass through a full cycle — the
 // runner's is 1000 ms, the pulse's 700 ms each way — so a frame counter over this
 // window is a rate and not a single sample.
-static const int RUN_MS = 1200;
+//
+// Raised from 1200 ms when the scene grew a button, and then again — to fifteen
+// seconds — when the reason for the first raise turned out to be much larger than
+// it looked.
+//
+// The check has to *see* the button before it can click it, and seeing means
+// pulling a 640x480 framebuffer over QMP and examining every pixel of it in Python.
+// That is a second or more per frame, and the button is not on screen until Qt has
+// started, loaded a scene and rendered it. At three seconds the window in which a
+// click could land was often already closed: the click went to a machine that had
+// powered off, and what the log showed was a scene that drew perfectly and an input
+// path that appeared dead.
+//
+// Fifteen seconds is not patience, it is the shape of the measurement — a run that
+// ends before the experiment can be performed cannot fail the experiment, it can
+// only fail to run it. `cargo krun` waits that much longer for a scene that is
+// visibly doing something; the smoke matrix's ramfb boot has a ninety-second
+// budget and uses well under half of it.
+static const int RUN_MS = 15000;
 
 int main(int argc, char **argv)
 {
@@ -154,7 +172,7 @@ int main(int argc, char **argv)
     QQuickView view;
     view.setResizeMode(QQuickView::SizeRootObjectToView);
     view.setTitle(QStringLiteral("shell"));
-    view.resize(320, 240);
+    view.resize(320, 300);
 
     // Counted at the point the scene graph says a frame is done, not at the point
     // an animation changes a number. The two are different claims: a property can
@@ -194,7 +212,16 @@ int main(int argc, char **argv)
 
     since.start();
     view.show();
-    std::printf("[shell] view shown\n");
+    // And ask for the keyboard, which showing a window does not do here.
+    //
+    // Raising a window and taking the keystroke somebody is mid-way through typing
+    // are separate acts in this display server — see `services/displaysrv` — so the
+    // plugin raises on show and claims focus only when Qt asks it to. This is Qt
+    // asking. A pointer needs none of it: a click goes to whatever is under it,
+    // which is the whole difference between the two and the reason they are routed
+    // by different means.
+    view.requestActivate();
+    std::printf("[shell] view shown and the keyboard claimed\n");
     std::fflush(stdout);
 
     // The moving property, sampled rather than trusted.
@@ -225,6 +252,14 @@ int main(int argc, char **argv)
         std::printf("[shell] %d frame(s) in %lld ms\n", frames, elapsed);
         std::printf("[shell] the animated rectangle moved from x=%.1f to x=%.1f\n",
                     firstX, lastX);
+        // What arrived from the outside world. Printed as counts because the colour
+        // on the screen answers a weaker question: it says a click was delivered at
+        // least once, and says nothing about a second one, or about a key — which
+        // travels the same wire and is routed by a different rule at the other end.
+        std::printf("[shell] input: %d click(s) reached a MouseArea, "
+                    "%d key(s) reached the scene, the last was Qt key %d\n",
+                    root->property("clicks").toInt(), root->property("keys").toInt(),
+                    root->property("lastKey").toInt());
         std::fflush(stdout);
         QGuiApplication::quit();
     });

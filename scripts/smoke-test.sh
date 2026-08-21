@@ -500,7 +500,7 @@ req "[displaysrv] composited client surfaces onto a screen no client can touch"
 # further down, as a lower bound, and by `scripts/qml-check.sh`, which looks at the
 # pixels.
 req "[displaysrv] 4 surface(s) live,"
-req "8 refused, 2 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus"
+req "8 refused, 2 client(s) reaped, 0 input event(s) routed, 0 dropped for want of a window"
 # A fourth client opened a window, asked the server to watch it, and crashed. The
 # kernel signals the notification it delegated, the server takes its windows off
 # the screen, and the count says it happened. Whether the *pixels* went back is
@@ -558,11 +558,18 @@ req "[shell] threads: a QThread with an 8 MiB stack ran and joined, and took a Q
 # The engine parsed and instantiated it. `Main_QMLTYPE_0` is the type QML generates
 # for the file, so this line distinguishes "the component loaded" from "a QQuickView
 # exists"; the size is the root item's, resolved by QML rather than by the window.
-req "[shell] scene loaded, root is a Main_QMLTYPE_0 of 320x240"
+req "[shell] scene loaded, root is a Main_QMLTYPE_0 of 320x300"
 # The render loop is a loop. The count itself is not asserted — see the note on the
 # display server's tally above — but a scene graph that rendered once and stopped
 # prints a single digit here, and one that never rendered prints nothing at all.
 req "frame(s) in"
+# The input tally, on a machine with no input devices at all — this config starts
+# QEMU with neither a keyboard nor a tablet, so the honest answer is zero and the
+# assertion is that the scene *says so*. A counter that only ever appears when it is
+# non-zero is a counter that cannot distinguish "nothing arrived" from "nobody was
+# counting", and the pixels-and-clicks claim is made by `scripts/qml-check.sh`,
+# which supplies a device and a click.
+req "[shell] input: 0 click(s) reached a MouseArea, 0 key(s) reached the scene"
 # And it ended by itself, which is the same claim `exec returned 0` makes for
 # `qt-hello` and the one that took the longest to earn.
 req "[shell] exec returned 0"

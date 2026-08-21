@@ -40,6 +40,7 @@ SEND=$!
 printf '\n' | timeout -k 5 60 qemu-system-aarch64 \
     -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M \
     -display none -device ramfb -device virtio-keyboard-device \
+    -device virtio-tablet-device \
     -kernel "$TMP/Image" \
     -qmp "unix:$QMP,server,nowait" \
     -serial file:"$TMP/serial.log" >/dev/null 2>&1
@@ -49,7 +50,7 @@ cat "$TMP/send.out"
 
 echo
 echo "serial log said:"
-grep -a -E "\[devicemgr\] (found|no virtio)|\[inputsrv\]|\[inputclient\]" "$TMP/serial.log" | sed 's/^/  /'
+grep -a -E "\[devicemgr\] (found|no virtio)|\[inputsrv\]|\[inputclient\]|\[displaysrv\] pointer" "$TMP/serial.log" | sed 's/^/  /'
 
 # The claim, in two halves. First: a key press, decoded by a driver in EL0. Code 30
 # is 'a' in the Linux input numbering that virtio-input passes through unchanged.
@@ -69,6 +70,24 @@ if ! grep -qa "\[inputclient\] key code 30 reached my window through displaysrv"
     exit 1
 fi
 
+# And the third half, which is a different claim rather than more of the same one.
+#
+# A key is routed by *who has the keyboard*; a pointer is routed by *what is under
+# it*. Those are separate decisions in the compositor and they fail separately: a
+# server that routed clicks by focus passes both tests above and delivers every
+# click to the wrong window. The position also crosses two conversions on the way —
+# device units to a fraction in the driver, fraction to pixels here — and neither
+# process holds both numbers, which is the point of splitting it that way and the
+# reason getting it wrong lands the pointer somewhere plausible but not where it is.
+if ! grep -qa "\[displaysrv\] pointer at (" "$TMP/serial.log"; then
+    echo
+    echo "input-check: FAIL — the tablet was clicked and no pointer event reached a window."
+    echo "  Either the driver never assembled a position from ABS_X/ABS_Y/SYN, or the"
+    echo "  compositor's hit test found nothing under a pointer that was over a window."
+    exit 1
+fi
+
 echo
-echo "input-check: PASS — the key crossed device, virtqueue, interrupt, driver, the compositor, and a process boundary"
+echo "input-check: PASS — the key crossed device, virtqueue, interrupt, driver, the compositor, and a process boundary,"
+echo "                    and a click crossed the same path to the window it was over rather than the one with the focus"
 exit 0

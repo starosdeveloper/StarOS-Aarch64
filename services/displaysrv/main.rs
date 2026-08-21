@@ -78,6 +78,29 @@
 //! next client to claim focus would deliver a keystroke to a window that was not on
 //! screen when it was typed, which is worse than losing it.
 //!
+//! ## The pointer does not follow the focus
+//!
+//! A key belongs to whoever claimed the keyboard. A click belongs to whatever is
+//! **under the pointer**, and those are routinely different windows — that is what
+//! clicking on a window that is not focused means. So a pointer event is routed by
+//! hit test: the topmost surface covering the position wins, and the position is
+//! rewritten into that surface's own coordinates before it is sent, because a
+//! client knows where things are inside its window and has never been told where
+//! its window is.
+//!
+//! The position arrives as a fraction of the input device, `0..=65535` on each
+//! axis, and is turned into pixels here. That split is the point: the driver is the
+//! only process holding the tablet's axis range and this is the only process
+//! holding the screen's size, so neither has to be told the other's number.
+//!
+//! Buttons are a **mask**, not events. A client that receives "button 1 went down"
+//! has to remember what the others were doing to know whether this is a drag; a
+//! client that receives the whole state does not, and a client that missed a
+//! message recovers on the next one instead of staying wrong for ever.
+//!
+//! A pointer over no window at all is dropped and counted, exactly like a key with
+//! nobody focused. There is no window to be wrong about.
+//!
 //! `Screen` comes first in that list because it has to come first in time: a client
 //! cannot size a buffer before it knows what it is drawing onto, and the geometry is
 //! the one thing here that no client can work out for itself. The stride is
@@ -131,6 +154,8 @@
 use core::arch::{asm, naked_asm};
 use core::panic::PanicInfo;
 
+use staros_virtio::{btn, AXIS_SCALE};
+
 /// The kernel-seeded data page. Process id at `+0`; the framebuffer's user address
 /// at `+40`, width at `+48`, height at `+52`, stride at `+56` (see
 /// `AddressSpace::write_fb_info`).
@@ -147,6 +172,33 @@ const SYS_WAIT_ANY: usize = 24;
 const SYS_SHARED_PAGES: usize = 28;
 const SYS_ENDPOINT_BIND: usize = 30;
 const SYS_ENDPOINT_PENDING: usize = 31;
+const SYS_SEND_NOWAIT: usize = 33;
+const SYS_CLOCK_NOW: usize = 20;
+
+/// How long to sleep when an event is held and there is nothing else to do.
+///
+/// Short enough that the second half of a click is not visibly late, long enough
+/// that a stuck client does not turn this server into a spin. It is a retry
+/// interval and not a timer: the ordinary case is that some other wake-up arrives
+/// first and the flush happens then.
+const RETRY_NS: u64 = 2_000_000;
+
+/// A deadline `RETRY_NS` from now, or 0 for "no deadline" when there is nothing to
+/// retry. Zero is what the kernel reads as "wait indefinitely".
+fn retry_deadline(busy: bool) -> u64 {
+    if !busy {
+        return 0;
+    }
+    // SAFETY: `ClockNow` takes no arguments and only reads the counter.
+    let now = unsafe { syscall1(SYS_CLOCK_NOW, 0) };
+    if now < 0 {
+        // No clock on this machine. Waiting for ever is wrong here, so ask for the
+        // smallest deadline there is: it has already passed, and the wait becomes a
+        // poll. That is worse than a timer and better than a lost event.
+        return 1;
+    }
+    now as u64 + RETRY_NS
+}
 
 /// Input arrives from the driver here, and leaves for the focused client on
 /// `EV_BASE + client`.
@@ -207,6 +259,32 @@ const FORMAT_XRGB8888: u64 = 1;
 const TAG_ERROR: u64 = 0;
 const TAG_OK: u64 = 2;
 
+// The tags the input driver sends here, and the two this server sends on.
+/// A keyboard key: `words[0]` = code, `words[1]` = 1 down / 0 up. Forwarded to the
+/// focused client unchanged — the Linux key code is what the driver decoded and
+/// renumbering it here would put a translation table in every client.
+const TAG_INPUT_KEY: u64 = 1;
+/// From the driver: a pointer position, each axis a fraction of the device.
+/// To a client: a position in *its* surface, with the whole button state.
+const TAG_INPUT_POINTER: u64 = 4;
+/// From the driver: one button changed. Never forwarded as itself — it changes the
+/// mask, and what the client receives is a pointer message carrying that mask, so
+/// that a click and the position it happened at are one message and cannot be
+/// delivered out of order.
+const TAG_INPUT_BUTTON: u64 = 5;
+
+/// Which bit of the button mask each button occupies. The codes are the driver's
+/// (which are Linux's); the bits are this protocol's, because a mask of raw codes
+/// would be a 273-bit mask.
+fn button_bit(code: u64) -> u64 {
+    match code as u16 {
+        btn::LEFT => 1,
+        btn::RIGHT => 2,
+        btn::MIDDLE => 4,
+        _ => 0,
+    }
+}
+
 // Refusal reasons.
 /// The request itself is wrong: unknown tag, no buffer, zero geometry.
 const ERR_MALFORMED: u64 = 1;
@@ -260,6 +338,7 @@ const CLIENTS_EXPECTED: u32 = 4;
 /// words, then the capability handle. Four words, not six — getting that wrong
 /// puts `cap` sixteen bytes past where the kernel writes it, and the symptom is a
 /// server that receives real messages and calls every one of them malformed.
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct Message {
     tag: u64,
@@ -473,6 +552,24 @@ impl Compositor {
         self.count -= 1;
     }
 
+    /// The topmost surface covering a screen position, if any.
+    ///
+    /// From the top down, and the first hit wins — the opposite direction to
+    /// compositing, and for the same reason: the surface whose pixels the user can
+    /// see at that spot is the one they meant to click. Walking bottom-up and
+    /// keeping the last hit gives the same answer and costs a full scan; walking
+    /// down and stopping is the answer as soon as it is known.
+    ///
+    /// `at()` is what decides coverage, so a click lands on a window exactly where
+    /// that window is drawn. A rectangle test written separately here would be a
+    /// second definition of where a window is, and the day they disagreed the
+    /// symptom would be a strip along one edge that draws but cannot be clicked.
+    fn topmost_at(&self, sx: usize, sy: usize) -> Option<usize> {
+        (0..self.count)
+            .rev()
+            .find(|&i| self.surfaces[i].at(sx, sy).is_some())
+    }
+
     /// Repaint one rectangle of the screen from every surface that overlaps it,
     /// bottom to top, and return how many pixels were written.
     fn composite(&self, screen: &mut Screen, rect: Rect) -> usize {
@@ -581,6 +678,11 @@ extern "C" fn main() -> ! {
     let mut focus: Option<usize> = None;
     let mut routed = 0u32;
     let mut dropped = 0u32;
+    // Where the pointer is. Not per client and not per surface: there is one on the
+    // desk, and which window it is over is a question answered per event.
+    let mut pointer = Pointer::new();
+    // One held event per client, for the third message of a click. See `Outbox`.
+    let mut outbox = Outbox::new();
     // The driver's endpoint waits in the same set as the clients'. One notification
     // for messages and deaths and input alike is the whole reason `EndpointBind`
     // exists — a second wait would mean hearing about a key only when a client
@@ -605,21 +707,30 @@ extern "C" fn main() -> ! {
             reaped += 1;
             puts("[displaysrv] a client died; its windows are off the screen\n");
         }
+        // Anything held from last turn goes first, so a click's release cannot
+        // arrive after the press that came behind it.
+        outbox.flush(clients, &mut routed);
         // Input before requests, for the same reason deaths come before both: a key
         // is a fact about the outside world, and the client it belongs to may be
         // blocked waiting for it while it sits here.
-        while let Some(event) = take_input() {
-            match focus {
-                Some(client) => {
-                    forward(client, &event);
-                    routed += 1;
-                }
-                None => dropped += 1,
+        pump_input(
+            &compositor,
+            &screen,
+            focus,
+            &mut pointer,
+            &mut outbox,
+            &mut routed,
+            &mut dropped,
+        );
+        let client = match next_client(arrivals, clients, &mut turn, outbox.busy()) {
+            Woken::Client(client) => client,
+            // Round again: the top of this loop is where input is drained, and
+            // going there is the whole point of being woken by it.
+            Woken::Input => continue,
+            Woken::Failed => {
+                puts("[displaysrv] woken with nothing queued\n");
+                break;
             }
-        }
-        let Some(client) = next_client(arrivals, clients, &mut turn) else {
-            puts("[displaysrv] woken with nothing queued\n");
-            break;
         };
         let mut msg = Message::new();
         // SAFETY: `Recv` writes one `Message` through this pointer. A message is
@@ -718,18 +829,26 @@ extern "C" fn main() -> ! {
                 focus = None;
             }
         }
-        while let Some(event) = take_input() {
-            if let Some(client) = focus {
-                forward(client, &event);
-            }
-        }
+        outbox.flush(clients, &mut routed);
+        pump_input(
+            &compositor,
+            &screen,
+            focus,
+            &mut pointer,
+            &mut outbox,
+            &mut routed,
+            &mut dropped,
+        );
         let handles = [arrivals as u32];
+        let deadline = retry_deadline(outbox.busy());
         // SAFETY: `WaitAny` reads one handle from this array and parks; the array
         // outlives the call.
         let rc = unsafe {
-            syscall3(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, 0)
+            syscall3(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline)
         };
-        if rc < 0 {
+        // An expired deadline is the retry, not a failure; only an indefinite wait
+        // returning an error means there is nothing left to wait on.
+        if rc < 0 && deadline == 0 {
             exit();
         }
     }
@@ -862,6 +981,160 @@ fn watch(watches: &mut [u32; MAX_CLIENTS], client: usize, _arrivals: u64, msg: &
     Ok(1)
 }
 
+/// Where the pointer is on the screen and which of its buttons are down.
+///
+/// One pointer for the machine, not one per client: there is one on the desk. It
+/// lives here rather than in the driver because a position in pixels needs the
+/// screen, and the driver has never been told how big it is.
+struct Pointer {
+    x: usize,
+    y: usize,
+    buttons: u64,
+    /// Whether a position has ever arrived. A button that clicks before anything
+    /// has moved has no position to happen at, and (0, 0) is a lie that lands on
+    /// whatever window is in the corner.
+    seen: bool,
+}
+
+impl Pointer {
+    const fn new() -> Self {
+        Self { x: 0, y: 0, buttons: 0, seen: false }
+    }
+}
+
+/// Turn one axis of a device-relative position into a pixel on this screen.
+///
+/// `extent - 1` and not `extent`: the far edge of the device is the *last* pixel,
+/// not one past it. Scaling by the width would put the rightmost position outside
+/// the screen, where the hit test finds nothing and a click at the edge of a
+/// maximised window does nothing at all.
+fn to_pixels(fraction: u64, extent: usize) -> usize {
+    if extent == 0 {
+        return 0;
+    }
+    let f = fraction.min(u64::from(AXIS_SCALE));
+    (f * (extent as u64 - 1) / u64::from(AXIS_SCALE)) as usize
+}
+
+/// Read everything the driver has sent and route it: keys by focus, the pointer by
+/// what is under it.
+fn pump_input(
+    compositor: &Compositor,
+    screen: &Screen,
+    focus: Option<usize>,
+    pointer: &mut Pointer,
+    outbox: &mut Outbox,
+    routed: &mut u32,
+    dropped: &mut u32,
+) {
+    while let Some(event) = take_input() {
+        let delivered = match event.tag {
+            TAG_INPUT_KEY => match focus {
+                Some(client) => outbox.send(client, &event),
+                None => Delivery::Dropped,
+            },
+            TAG_INPUT_POINTER => {
+                pointer.x = to_pixels(event.words[0], screen.width);
+                pointer.y = to_pixels(event.words[1], screen.height);
+                pointer.seen = true;
+                deliver_pointer(compositor, pointer, outbox)
+            }
+            TAG_INPUT_BUTTON => {
+                let bit = button_bit(event.words[0]);
+                if event.words[1] != 0 {
+                    pointer.buttons |= bit;
+                } else {
+                    pointer.buttons &= !bit;
+                }
+                // The button is delivered as a pointer message at the position it
+                // happened at, so a client cannot receive a click before the move
+                // that put the pointer where it was clicked.
+                deliver_pointer(compositor, pointer, outbox)
+            }
+            // An event kind this server does not route. Counted, not ignored: a
+            // driver sending something nobody handles is a fact worth one number.
+            _ => Delivery::Dropped,
+        };
+        match delivered {
+            Delivery::Sent => *routed += 1,
+            Delivery::Held => {}
+            Delivery::Dropped => *dropped += 1,
+        }
+    }
+}
+
+/// Whether the first pointer event has been announced. The line is printed once,
+/// because a pointer produces one of these per movement and a log that carried them
+/// all would be a log about the mouse.
+static mut POINTER_ANNOUNCED: bool = false;
+
+/// Send the pointer's state to whoever owns the surface under it, in that
+/// surface's coordinates. `false` if there is no window there.
+fn deliver_pointer(compositor: &Compositor, pointer: &Pointer, outbox: &mut Outbox) -> Delivery {
+    if !pointer.seen {
+        return Delivery::Dropped;
+    }
+    let Some(index) = compositor.topmost_at(pointer.x, pointer.y) else {
+        return Delivery::Dropped;
+    };
+    let surface = compositor.surfaces[index];
+    // SAFETY: this server is one EL0 task, so its code runs on one core at a time
+    // and nothing races this flag.
+    if !unsafe { POINTER_ANNOUNCED } {
+        // SAFETY: as above.
+        unsafe { POINTER_ANNOUNCED = true };
+        announce_pointer(pointer.x, pointer.y, surface.id, surface.owner);
+    }
+    let mut msg = Message::new();
+    msg.tag = TAG_INPUT_POINTER;
+    // Surface-local first, because that is the one a client acts on. Screen
+    // coordinates come too: a client dragging a window needs to know where the
+    // pointer is in the space the window moves through, and computing it from the
+    // local position means knowing where its own window is, which is the one thing
+    // this protocol never tells it.
+    msg.words[0] = pack(pointer.x - surface.x, pointer.y - surface.y);
+    msg.words[1] = pack(pointer.x, pointer.y);
+    msg.words[2] = pointer.buttons;
+    msg.words[3] = surface.id;
+    outbox.send(surface.owner, &msg)
+}
+
+/// Say, once, where the pointer landed and what it landed on.
+///
+/// One line built in one buffer, for the reason `inputsrv` learned twice: three
+/// `DebugWrite` calls are three chances for another task to write between them, and
+/// a line that is *usually* whole is the worst kind of evidence.
+fn announce_pointer(x: usize, y: usize, surface: u64, owner: usize) {
+    let mut line = [0u8; 160];
+    let mut n = 0;
+    let put = |bytes: &[u8], line: &mut [u8; 160], n: &mut usize| {
+        for &b in bytes {
+            if *n < line.len() {
+                line[*n] = b;
+                *n += 1;
+            }
+        }
+    };
+    put(b"[displaysrv] pointer at (", &mut line, &mut n);
+    n += number(x as u64, &mut line[n..]);
+    put(b", ", &mut line, &mut n);
+    n += number(y as u64, &mut line[n..]);
+    put(b") landed on surface ", &mut line, &mut n);
+    n += number(surface, &mut line[n..]);
+    put(b" of client ", &mut line, &mut n);
+    n += number(owner as u64, &mut line[n..]);
+    put(b" - routed by what is under it, not by who has the keyboard\n", &mut line, &mut n);
+    // SAFETY: `DebugWrite` reads `n` bytes from a buffer we own.
+    unsafe {
+        let _ = syscall2(SYS_DEBUG_WRITE, line.as_ptr() as u64, n as u64);
+    }
+}
+
+/// Two 32-bit values in one word, the same packing the damage rectangle uses.
+fn pack(low: usize, high: usize) -> u64 {
+    (low as u64 & 0xffff_ffff) | ((high as u64) << 32)
+}
+
 /// Take one input event from the driver, if one is waiting — non-blocking.
 ///
 /// `EndpointPending` first and `Recv` only when it says there is something: `Recv`
@@ -879,19 +1152,137 @@ fn take_input() -> Option<Message> {
     (rc >= 0).then_some(msg)
 }
 
-/// Hand an event to a client, unchanged.
+/// How many events this server will hold for one client that is not keeping up.
+///
+/// Eight, and the number comes from a burst rather than from taste. Pressing a key
+/// and clicking a button at nearly the same moment is five messages — key down, key
+/// up, the pointer's move, its press and its release — and they arrive at this
+/// server in one go, because the driver hands over everything its device produced
+/// before going back to sleep. A client's endpoint ring holds two. So without room
+/// for the rest, three of the five are lost, and the ones lost are whichever came
+/// last: the release, which is the half of a click that makes it a click.
+///
+/// It is a bound and not a buffer. A client that cannot take eight events in a turn
+/// of this loop is a client whose input is already stale, and the ninth is dropped
+/// and counted rather than waited for — because waiting is what stops the screen.
+const OUTBOX_DEPTH: usize = 8;
+
+/// Events per client that would not fit when they were produced.
+///
+/// An endpoint's ring holds two messages, deliberately — it is tiny so that the
+/// blocking-send path gets exercised rather than hidden. A single click is *three*
+/// messages: the move that put the pointer there, the press, and the release. So
+/// the third one of an ordinary click meets a full ring, and with `SendNoWait` it
+/// would simply be lost.
+///
+/// Losing which one matters. A dropped position corrects itself on the next
+/// movement — the message carries the whole state, which is why it does. A dropped
+/// **release** does not: the client is left holding a button nobody let go of, and
+/// the click it was half-way through never completes. That is what happened, and
+/// what it looked like was a button that highlighted and never fired.
+///
+/// So a short queue per client, flushed at the top of every turn of the loop — by
+/// which time the client has usually drained a message and there is room. When even
+/// that is full the *newest* event is dropped rather than the oldest, because order
+/// is the one thing a stream of button transitions cannot survive losing: a release
+/// delivered before its press leaves a client holding a button for ever.
+struct Outbox {
+    queues: [[Message; OUTBOX_DEPTH]; MAX_CLIENTS],
+    /// Where each client's queue starts and how much of it is in use.
+    head: [usize; MAX_CLIENTS],
+    len: [usize; MAX_CLIENTS],
+}
+
+impl Outbox {
+    const fn new() -> Self {
+        Self {
+            queues: [[Message::new(); OUTBOX_DEPTH]; MAX_CLIENTS],
+            head: [0; MAX_CLIENTS],
+            len: [0; MAX_CLIENTS],
+        }
+    }
+
+    /// Try to deliver everything held for each client, oldest first, stopping at the
+    /// first one that will not fit. Called before anything else each turn, so held
+    /// events go out ahead of the ones behind them.
+    fn flush(&mut self, clients: usize, routed: &mut u32) {
+        for client in 0..clients {
+            while self.len[client] > 0 {
+                let event = self.queues[client][self.head[client]];
+                if !push(client, &event) {
+                    break;
+                }
+                self.head[client] = (self.head[client] + 1) % OUTBOX_DEPTH;
+                self.len[client] -= 1;
+                *routed += 1;
+            }
+        }
+    }
+
+    /// Whether anything is waiting to go out.
+    ///
+    /// The waits below consult this. A held event is not woken by anything — the
+    /// client draining its endpoint signals nobody — so a server that parked with no
+    /// deadline would sit on the last event of a burst until the next unrelated
+    /// thing happened. In a click that is the release, and it would arrive whenever
+    /// the pointer next moved, which may be never.
+    fn busy(&self) -> bool {
+        self.len.iter().any(|&n| n > 0)
+    }
+
+    /// Send now, queue it for the next turn, or drop it.
+    ///
+    /// Anything already queued goes first even if the ring has room, because sending
+    /// this one past it would reorder them.
+    fn send(&mut self, client: usize, event: &Message) -> Delivery {
+        if self.len[client] == 0 && push(client, event) {
+            return Delivery::Sent;
+        }
+        if self.len[client] == OUTBOX_DEPTH {
+            return Delivery::Dropped;
+        }
+        let tail = (self.head[client] + self.len[client]) % OUTBOX_DEPTH;
+        self.queues[client][tail] = *event;
+        self.len[client] += 1;
+        Delivery::Held
+    }
+}
+
+/// What became of one event. Three outcomes and not two, because "held" is neither
+/// of the others: counting it as routed would count it twice when it goes out, and
+/// counting it as dropped would report a loss that did not happen.
+enum Delivery {
+    Sent,
+    Held,
+    Dropped,
+}
+
+/// Hand an event to a client, unchanged, and say whether it fitted.
 ///
 /// Unchanged is the decision: the driver's tag is the Linux event kind, and a
 /// server that renumbered them would make every client carry a translation table
 /// for a mapping that already existed. The event is not tagged with a window
 /// either — the client has the focus or it does not, and a window id here would be
 /// a second answer to a question the focus already settled.
-fn forward(client: usize, event: &Message) {
-    // SAFETY: `Send` reads one `Message` through this pointer, to a send-only
-    // endpoint this task holds.
-    unsafe {
-        let _ = syscall2(SYS_SEND, EV_BASE + client as u64, core::ptr::from_ref(event) as u64);
-    }
+///
+/// **`SendNoWait`, never `Send`.** This is the only place in this server that
+/// pushes to a program which asked for nothing, and several clients in this tree
+/// never read their event endpoint at all. A blocking send to one of them parks the
+/// compositor for ever — the screen stops, every other window stops with it, and the
+/// input driver blocks behind it on the next event. That is not a hypothetical: it
+/// is what a pointer moving over `fbclient` did, and the symptom was a keyboard that
+/// worked once and then went quiet, three processes away from the cause.
+fn push(client: usize, event: &Message) -> bool {
+    // SAFETY: `SendNoWait` reads one `Message` through this pointer, to a send-only
+    // endpoint this task holds, and never parks us.
+    let rc = unsafe {
+        syscall2(
+            SYS_SEND_NOWAIT,
+            EV_BASE + client as u64,
+            core::ptr::from_ref(event) as u64,
+        )
+    };
+    rc >= 0
 }
 
 /// Which client has died since this was last asked, if any — non-blocking.
@@ -951,6 +1342,25 @@ fn reply_words(client: usize, tag: u64, words: [u64; 4]) {
     }
 }
 
+/// Why this server woke up.
+///
+/// Three answers and not two, and the third is the one that was missing. `Recv` on a
+/// client endpoint is the only *blocking* thing this loop does, so anything that has
+/// to be noticed has to be a reason to stop waiting — and input was not one. The
+/// server slept until a client sent a request, which is fine while clients are busy
+/// and is a keyboard that stops working the moment they go quiet: the driver blocks
+/// in `Send` on a full endpoint, its interrupt goes unacknowledged, and the device
+/// falls silent. What that looks like from the outside is a test that passes when the
+/// key is pressed early in the boot and fails when it is pressed late.
+enum Woken {
+    /// This client has a request queued.
+    Client(usize),
+    /// The driver sent something; go round and drain it.
+    Input,
+    /// The wait itself failed; there is nothing left to serve.
+    Failed,
+}
+
 /// Wait until some client has a message queued, and return which.
 ///
 /// The notification says *something* arrived, never what: `WaitAny` consumes the
@@ -969,26 +1379,42 @@ fn reply_words(client: usize, tag: u64, words: [u64; 4]) {
 /// window that never repaints while another animates smoothly. Cheap enough that
 /// there is no reason to leave the unfair version in and find out later which of
 /// the two windows was the shell.
-fn next_client(arrivals: u64, clients: usize, turn: &mut usize) -> Option<usize> {
+fn next_client(arrivals: u64, clients: usize, turn: &mut usize, busy: bool) -> Woken {
     loop {
+        // Input first, and before the clients rather than after them. A key is a
+        // fact about the outside world with a person behind it; a request is a
+        // program that will wait. And the driver is *blocked* while its message
+        // sits here — an endpoint's ring is small — so a server that served every
+        // queued request before looking is a server that stops the keyboard for the
+        // length of a busy frame.
+        // SAFETY: `EndpointPending` only reads the queue length of a handle we hold
+        // with receive rights.
+        if unsafe { syscall1(SYS_ENDPOINT_PENDING, EP_INPUT) } > 0 {
+            return Woken::Input;
+        }
         for step in 0..clients {
             let client = (*turn + step) % clients;
-            // SAFETY: `EndpointPending` only reads the queue length of a handle we
-            // hold with receive rights.
+            // SAFETY: as above.
             let pending = unsafe { syscall1(SYS_ENDPOINT_PENDING, request_handle(client)) };
             if pending > 0 {
                 *turn = (client + 1) % clients;
-                return Some(client);
+                return Woken::Client(client);
             }
         }
         let handles = [arrivals as u32];
-        // SAFETY: `WaitAny` reads one handle from this array and parks with no
-        // deadline; the array outlives the call.
+        let deadline = retry_deadline(busy);
+        // SAFETY: `WaitAny` reads one handle from this array; the array outlives the
+        // call.
         let rc = unsafe {
-            syscall3(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, 0)
+            syscall3(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline)
         };
+        // A deadline that expired is not a failure — it is the retry this server
+        // asked for. Only a wait with no deadline can fail its way out of the loop.
         if rc < 0 {
-            return None;
+            if deadline != 0 {
+                return Woken::Input;
+            }
+            return Woken::Failed;
         }
     }
 }
@@ -1003,9 +1429,16 @@ fn report(
     routed: u32,
     dropped: u32,
 ) {
-    let mut line = [0u8; 160];
+    // 256 and not 160. The old buffer fitted the old wording exactly, and naming
+    // the counters properly — "input event(s)" rather than "key(s)", "for want of a
+    // window" rather than "of focus" — pushed the line past the end. Nothing said
+    // so: `put` stops at the end of the buffer and `number` writes nothing when it
+    // will not fit, so the report simply ended mid-word. The smoke matrix caught it
+    // because it asserts the whole line; a person reading the console would have
+    // seen a tally that looked complete.
+    let mut line = [0u8; 256];
     let mut n = 0;
-    let put = |bytes: &[u8], line: &mut [u8; 160], n: &mut usize| {
+    let put = |bytes: &[u8], line: &mut [u8; 256], n: &mut usize| {
         for &b in bytes {
             if *n < line.len() {
                 line[*n] = b;
@@ -1025,9 +1458,9 @@ fn report(
     n += number(u64::from(reaped), &mut line[n..]);
     put(b" client(s) reaped, ", &mut line, &mut n);
     n += number(u64::from(routed), &mut line[n..]);
-    put(b" key(s) routed, ", &mut line, &mut n);
+    put(b" input event(s) routed, ", &mut line, &mut n);
     n += number(u64::from(dropped), &mut line[n..]);
-    put(b" dropped for want of focus\n", &mut line, &mut n);
+    put(b" dropped for want of a window\n", &mut line, &mut n);
     // SAFETY: `DebugWrite` reads `n` bytes from a buffer we own.
     unsafe {
         let _ = syscall2(SYS_DEBUG_WRITE, line.as_ptr() as u64, n as u64);

@@ -20,6 +20,7 @@
 #include "qstarosconnection.h"
 
 class QStarosScreen;
+class QStarosInput;
 
 class QStarosIntegration : public QPlatformIntegration
 {
@@ -27,6 +28,7 @@ public:
     QStarosIntegration();
     ~QStarosIntegration() override;
 
+    void initialize() override;
     bool hasCapability(QPlatformIntegration::Capability cap) const override;
     QPlatformWindow *createPlatformWindow(QWindow *window) const override;
     QPlatformBackingStore *createPlatformBackingStore(QWindow *window) const override;
@@ -42,4 +44,10 @@ private:
     mutable QStarosConnection m_connection;
     QStarosScreen *m_screen = nullptr;
     QPlatformFontDatabase *m_fontDatabase = nullptr;
+    // Created in `initialize`, not in the constructor. A `QSocketNotifier` needs an
+    // event dispatcher to attach to, and at construction time there is none: the
+    // integration is built so that `QGuiApplication` can ask it for one. Building it
+    // early gives a notifier that is never armed — every key silently ignored, with
+    // a plugin that started normally.
+    QStarosInput *m_input = nullptr;
 };

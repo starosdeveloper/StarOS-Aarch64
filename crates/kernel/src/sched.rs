@@ -180,7 +180,17 @@ struct Task {
     /// through its address space one page per request until the page tables eat the
     /// heap. Remembering the placement serves both: the same object comes back to
     /// the same address, a new one gets the next.
-    shared: SharedPlacements,
+    shared: Placements<MAX_SHARED_MAPPINGS>,
+    /// Where each *device* page this task has mapped landed, by the same rule as
+    /// [`Task::shared`] and for a reason that took a second device to notice.
+    ///
+    /// `MapMemory` used to answer with one fixed address for every device, which is
+    /// exactly one device: a driver that mapped a second one silently replaced the
+    /// first, and the symptom is a driver reading a slot it never asked for — the
+    /// same failure the fixed shared address gave, one region over. It went
+    /// unnoticed because until `inputsrv` drove a keyboard *and* a pointer, no
+    /// process in this tree held two devices at once.
+    devices: Placements<MAX_DEVICE_MAPPINGS>,
 }
 
 /// How many distinct shared buffers one task may have mapped at once.
@@ -192,10 +202,25 @@ struct Task {
 /// silently reused address.
 const MAX_SHARED_MAPPINGS: usize = 16;
 
-/// The per-task record of shared-buffer placements. See [`Task::shared`].
+/// How many distinct device pages one task may have mapped at once.
+///
+/// Larger than the shared ceiling, and not because drivers hold many devices. It
+/// is `devicemgr` that sets this number: QEMU's `virt` declares **thirty-two**
+/// `virtio,mmio` slots and the only way to tell which are populated is to map each
+/// one and read its `DeviceID`. Every one of those probes is a distinct object and
+/// therefore a distinct placement, so a table that fits only the devices a manager
+/// *keeps* would run out while it was still looking.
+const MAX_DEVICE_MAPPINGS: usize = 48;
+
+/// The per-task record of where mapped objects landed. See [`Task::shared`].
+///
+/// One entry per *object*, not per mapping call: the same object comes back to the
+/// same address, a new one gets the next. The region it grows through is the
+/// `base` the table was created with, so shared buffers and device pages use the
+/// same arithmetic in two different windows.
 #[derive(Clone, Copy)]
-struct SharedPlacements {
-    entries: [Option<(crate::obj::ObjectRef, u64)>; MAX_SHARED_MAPPINGS],
+struct Placements<const N: usize> {
+    entries: [Option<(crate::obj::ObjectRef, u64)>; N],
     /// The next unused address. Grows by whole buffers, never reused: a placement
     /// outlives the mapping in the tables, because unmapping is not a thing this
     /// system does yet and pretending otherwise would hand out an address whose
@@ -203,11 +228,11 @@ struct SharedPlacements {
     cursor: u64,
 }
 
-impl SharedPlacements {
-    const fn new() -> Self {
+impl<const N: usize> Placements<N> {
+    const fn new(base: u64) -> Self {
         Self {
-            entries: [None; MAX_SHARED_MAPPINGS],
-            cursor: staros_arch_aarch64::addrspace::USER_SHARED_VA,
+            entries: [None; N],
+            cursor: base,
         }
     }
 
@@ -227,6 +252,15 @@ impl SharedPlacements {
         *slot = Some((obj, va));
         self.cursor += u64::from(pages) * 4096;
         Some(va)
+    }
+}
+
+/// The address a task's device page `obj` occupies, choosing one if this is the
+/// first time it has been mapped. `None` when the table is full.
+fn place_device(cur: usize, sched: &mut Scheduler, obj: crate::obj::ObjectRef) -> Option<(u64, bool)> {
+    match sched.tasks[cur].devices.find(obj) {
+        Some(va) => Some((va, true)),
+        None => sched.tasks[cur].devices.place(obj, 1).map(|va| (va, false)),
     }
 }
 
@@ -498,7 +532,7 @@ fn post_switch() {
 ///   capability minted *after* the thread starts is not visible to it.
 pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
     let cpu = me();
-    let (cur, _old_space, caps, pid, shared) = {
+    let (cur, _old_space, caps, pid, shared, devices) = {
         let sched = SCHED.lock();
         let cur = sched.current[cpu];
         match sched.tasks[cur].space {
@@ -508,6 +542,7 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
                 sched.tasks[cur].caps.clone(),
                 sched.tasks[cur].pid,
                 sched.tasks[cur].shared,
+                sched.tasks[cur].devices,
             ),
             None => return KError::InvalidArgument.as_raw(),
         }
@@ -570,6 +605,10 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
         // space at those addresses. A thread starting with an empty table would put
         // its first new buffer on top of one its creator is using.
         shared,
+        // And the device pages, for the same reason: they are already in this
+        // address space, and a thread of a driver that mapped its device afresh
+        // would put it on top of a shared buffer its creator is drawing into.
+        devices,
     }) else {
         return KError::OutOfResources.as_raw();
     };
@@ -644,7 +683,8 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         wake_pending: false,
         on_cpu: AtomicBool::new(false),
         death_notify: None,
-        shared: SharedPlacements::new(),
+        shared: Placements::new(staros_arch_aarch64::addrspace::USER_SHARED_VA),
+        devices: Placements::new(staros_arch_aarch64::addrspace::USER_DEV_VA),
     })?;
 
     let mut sched = SCHED.lock();
@@ -1383,19 +1423,38 @@ pub fn resolve_cap(handle: u32) -> Option<Cap> {
 ///
 /// The caller (the syscall layer) is responsible for deciding *which* physical
 /// pages a task may map; this only performs the mapping for whoever asked.
-pub fn map_device_current(dev_phys: u64) -> isize {
+///
+/// One placement per device *object*, like [`map_shared_current`]: mapping the same
+/// capability twice returns the same address, and a second device gets a second
+/// one. The fixed address this used to return is a system in which a process may
+/// hold exactly one device, and nothing says so — the second driver simply reads
+/// the first device's registers.
+pub fn map_device_current(obj: crate::obj::ObjectRef, dev_phys: u64) -> isize {
+    // A device does not have to start on a page boundary. The page is what gets
+    // mapped and placed; the offset within it is added back to what the caller is
+    // told, which is the difference between a driver reading its device and a
+    // driver reading the slot eight before it.
+    let page_off = dev_phys & (PAGE_SIZE as u64 - 1);
     // Copy the (small, `Copy`) address-space handle out under a short borrow; the
     // mapping itself touches only page tables and system registers, no switch.
-    let space = {
-        let sched = SCHED.lock();
-        sched.tasks[sched.current[me()]].space
+    let (space, base, already) = {
+        let mut sched = SCHED.lock();
+        let cur = sched.current[me()];
+        let space = sched.tasks[cur].space;
+        match place_device(cur, &mut sched, obj) {
+            Some((base, already)) => (space, base, already),
+            None => return KError::OutOfResources.as_raw(),
+        }
     };
+    if already {
+        return (base + page_off) as isize;
+    }
     match space {
         Some(s) => {
             // SAFETY: at EL1 with the task's tables reachable through the linear
             // map; the syscall layer has already vetted `dev_phys` as a mappable
             // device page. The walk may need a frame for a missing table.
-            let va = crate::mem::with(|frames| unsafe { s.map_device(frames, dev_phys) });
+            let va = crate::mem::with(|frames| unsafe { s.map_device(frames, base, dev_phys) });
             va.map_or(KError::OutOfResources.as_raw(), |v| v as isize)
         }
         None => KError::InvalidArgument.as_raw(),

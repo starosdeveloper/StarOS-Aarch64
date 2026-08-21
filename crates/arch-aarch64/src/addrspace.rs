@@ -929,10 +929,16 @@ impl AddressSpace {
         Some(USER_DMA_VA)
     }
 
-    /// Map the MMIO page at physical `dev_phys` into this space at [`USER_DEV_VA`]
-    /// as EL0-accessible Device memory, and return that virtual address. This is
-    /// the mechanism behind the `MapMemory` syscall: it hands a user-space driver
-    /// direct, unprivileged access to a device's registers.
+    /// Map the MMIO page at physical `dev_phys` into this space at `base` as
+    /// EL0-accessible Device memory, and return the address *of the device*. This
+    /// is the mechanism behind the `MapMemory` syscall: it hands a user-space
+    /// driver direct, unprivileged access to a device's registers.
+    ///
+    /// `base` is a parameter rather than [`USER_DEV_VA`] for the same reason
+    /// [`map_shared`](AddressSpace::map_shared) takes one: a fixed address is a
+    /// space with room for exactly one device, and the second one lands on top of
+    /// the first with nothing to say so. The caller keeps one placement per device
+    /// object; this only writes the tables.
     ///
     /// This only adds a previously-absent page, so it is safe to do to the
     /// *active* address space. Returns `None` if the pool cannot supply a table
@@ -945,7 +951,12 @@ impl AddressSpace {
     /// Must run at EL1 with this space's tables writable through the linear map.
     /// `dev_phys` must be a real device page the caller is permitted to map (the
     /// kernel gates which addresses reach here). Rewrites a live page table.
-    pub unsafe fn map_device<A: FrameAllocator>(&self, alloc: &mut A, dev_phys: u64) -> Option<u64> {
+    pub unsafe fn map_device<A: FrameAllocator>(
+        &self,
+        alloc: &mut A,
+        base: u64,
+        dev_phys: u64,
+    ) -> Option<u64> {
         // A page maps a page, but a device does not have to start on one. Round
         // down to map, and hand back the address *of the device* — the offset
         // within the page, added back.
@@ -962,7 +973,7 @@ impl AddressSpace {
         // SAFETY: forwarded from this function's contract. The barrier/TLB flush
         // publish the new mapping to the walker for the currently active regime.
         unsafe {
-            if !self.map_page(alloc, USER_DEV_VA, user_device_page(page)) {
+            if !self.map_page(alloc, base, user_device_page(page)) {
                 return None;
             }
             asm!(
@@ -973,7 +984,7 @@ impl AddressSpace {
                 options(nostack, preserves_flags),
             );
         }
-        Some(USER_DEV_VA + page_off)
+        Some(base + page_off)
     }
 }
 

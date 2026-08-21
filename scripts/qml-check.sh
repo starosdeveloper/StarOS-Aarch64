@@ -54,6 +54,7 @@ VERIFY=$!
 printf '\n' | timeout -k 5 120 qemu-system-aarch64 \
     -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M \
     -display none -device ramfb -device virtio-keyboard-device \
+    -device virtio-tablet-device \
     -kernel "$TMP/Image" -initrd "$INITRD" \
     -qmp "unix:$QMP,server,nowait" \
     -serial file:"$TMP/serial.log" >/dev/null 2>&1

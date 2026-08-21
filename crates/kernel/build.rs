@@ -103,9 +103,20 @@ fn main() {
         "staros_abi",
         &canonical(&Path::new(&manifest_dir).join("../abi/src/lib.rs")),
     );
-    let cpio_rlib = build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
-    build_displaysrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
-    build_inputsrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
+    // The virtio crate, built once for the two programs that need it. The device
+    // manager tells one input device from another through the configuration-space
+    // offsets in it, and the driver computes its ring layout from it; a second copy
+    // of either would be a second place for the same numbers to be wrong.
+    let virtio_rlib = build_rlib(
+        &out_dir,
+        &rustc,
+        "staros_virtio",
+        &canonical(&Path::new(&manifest_dir).join("../virtio/src/lib.rs")),
+    );
+    let cpio_rlib =
+        build_devicemgr(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy, &virtio_rlib);
+    build_displaysrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy, &virtio_rlib);
+    build_inputsrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy, &virtio_rlib);
     build_fssrv(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy, &cpio_rlib, &abi_rlib);
     build_fsclient(&manifest_dir, &out_dir, &rustc, &image_ld, &objcopy);
     // The C library, and a C program linked against it. This is the toolchain Qt
@@ -639,26 +650,16 @@ fn build_fsclient(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Pat
 /// against it. The layout arithmetic it needs is the *whole* reason that crate
 /// exists — a driver that computed its own ring offsets would be the one place
 /// the mistake could not be host-tested.
-fn build_inputsrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Path, objcopy: &Path) {
-    let virtio_src = canonical(&Path::new(manifest_dir).join("../virtio/src/lib.rs"));
+fn build_inputsrv(
+    manifest_dir: &str,
+    out_dir: &str,
+    rustc: &str,
+    image_ld: &Path,
+    objcopy: &Path,
+    virtio_rlib: &Path,
+) {
     let src = canonical(&Path::new(manifest_dir).join("../../services/inputsrv/main.rs"));
-    println!("cargo:rerun-if-changed={}", virtio_src.display());
     println!("cargo:rerun-if-changed={}", src.display());
-
-    let virtio_rlib = Path::new(out_dir).join("libstaros_virtio.rlib");
-    let status = Command::new(rustc)
-        .args(["--edition", "2021"])
-        .args(["--target", "aarch64-unknown-none"])
-        .args(["--crate-name", "staros_virtio"])
-        .args(["--crate-type", "lib"])
-        .arg("-Copt-level=2")
-        .arg("-Cpanic=abort")
-        .arg("-o")
-        .arg(&virtio_rlib)
-        .arg(&virtio_src)
-        .status()
-        .expect("failed to spawn rustc for the virtio rlib");
-    assert!(status.success(), "rustc failed to build the virtio rlib");
 
     let debug_elf = Path::new(out_dir).join("inputsrv.debug.elf");
     let elf = Path::new(out_dir).join("inputsrv.elf");
@@ -695,15 +696,17 @@ fn build_inputsrv(manifest_dir: &str, out_dir: &str, rustc: &str, image_ld: &Pat
 
 /// Build the `displaysrv` EL0 program and publish its ELF path.
 ///
-/// One `rustc` step: unlike `devicemgr` it links against no crate of ours. It owns
-/// the screen and speaks a message protocol, and both of those are plain
-/// arithmetic over slices the kernel already handed it.
+/// It links `virtio` for one reason: the button codes and the axis scale that
+/// arrive in an input message are defined by the driver that sends them, and a
+/// compositor with its own copy of `BTN_LEFT` is a compositor that will one day
+/// disagree with the driver about which button was pressed.
 fn build_displaysrv(
     manifest_dir: &str,
     out_dir: &str,
     rustc: &str,
     image_ld: &Path,
     objcopy: &Path,
+    virtio_rlib: &Path,
 ) {
     let src = canonical(&Path::new(manifest_dir).join("../../services/displaysrv/main.rs"));
     println!("cargo:rerun-if-changed={}", src.display());
@@ -716,6 +719,8 @@ fn build_displaysrv(
         .args(["--crate-name", "staros_displaysrv"])
         .args(["--crate-type", "bin"])
         .args(SERVICE_FLAGS)
+        .arg("--extern")
+        .arg(format!("staros_virtio={}", virtio_rlib.display()))
         .arg(format!("-Clink-arg=-T{}", image_ld.display()))
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")
@@ -754,6 +759,7 @@ fn build_devicemgr(
     rustc: &str,
     image_ld: &Path,
     objcopy: &Path,
+    virtio_rlib: &Path,
 ) -> PathBuf {
     let fdt_src = canonical(&Path::new(manifest_dir).join("../fdt/src/lib.rs"));
     let cpio_src = canonical(&Path::new(manifest_dir).join("../cpio/src/lib.rs"));
@@ -812,6 +818,8 @@ fn build_devicemgr(
         .arg(format!("staros_fdt={}", fdt_rlib.display()))
         .arg("--extern")
         .arg(format!("staros_cpio={}", cpio_rlib.display()))
+        .arg("--extern")
+        .arg(format!("staros_virtio={}", virtio_rlib.display()))
         .arg(format!("-Clink-arg=-T{}", image_ld.display()))
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")

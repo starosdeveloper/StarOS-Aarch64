@@ -302,6 +302,28 @@ pub enum Syscall {
     /// program dying, so a library registers on the thread whose death means the
     /// program is over.
     NotifyOnExit = 32,
+    /// Send exactly as [`Send`] does, but return [`WouldBlock`] instead of parking
+    /// when the endpoint has no room: `arg0` = endpoint handle, `arg1` = message.
+    ///
+    /// [`Send`] blocking is right for a driver, and that is why it does: a driver
+    /// that dropped events silently gives a keyboard which occasionally misses a
+    /// keystroke, and back-pressure that stops the driver is a failure with a shape.
+    ///
+    /// It is wrong for a **server pushing to a client**, and the difference is who
+    /// is punished. A display server delivering a pointer event to whatever window
+    /// is under the pointer is delivering to a program it knows nothing about —
+    /// which may never read its event endpoint at all, and several in this tree do
+    /// not. One of those, moved over by an idle pointer, parks the compositor for
+    /// ever: the screen stops, every other window stops with it, and the input
+    /// driver blocks behind it in turn. That happened, and from the outside it looked
+    /// like a keyboard that worked once and then stopped.
+    ///
+    /// So a server pushing unsolicited events uses this and counts what it drops. A
+    /// client that is not reading its events is a client with no use for them.
+    ///
+    /// [`Send`]: Syscall::Send
+    /// [`WouldBlock`]: crate::error::KError::WouldBlock
+    SendNoWait = 33,
 }
 
 impl Syscall {
@@ -342,6 +364,7 @@ impl Syscall {
             30 => Some(Syscall::EndpointBind),
             31 => Some(Syscall::EndpointPending),
             32 => Some(Syscall::NotifyOnExit),
+            33 => Some(Syscall::SendNoWait),
             _ => None,
         }
     }
@@ -353,11 +376,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=32 {
+        for n in 0..=33 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(33), None);
+        assert_eq!(Syscall::from_raw(34), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

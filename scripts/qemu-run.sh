@@ -104,9 +104,69 @@ fi
 # plain `cargo krun` shows. A machine with no framebuffer gives the kernel no
 # screen to hand over, so `displaysrv` and its client are never created and the
 # most visible thing this system does is invisible in its most ordinary command.
-# The device costs nothing when nothing draws (the guest allocates the buffer), and
-# `-display none` keeps the run headless — the pixels are inspected with
-# `scripts/fb-check.sh`, not by opening a window.
+# The device costs nothing when nothing draws (the guest allocates the buffer).
+#
+# `-device virtio-tablet-device` is the pointer, and it is a *tablet* rather than a
+# mouse because a tablet reports where it is instead of how far it moved. A mouse's
+# deltas need somewhere to keep the pointer between events, and the process that
+# would keep it is the compositor — so a mouse is a second definition of where the
+# pointer is, living in a driver. Absolute positions have one.
+
+# Whether this QEMU can open a window, and whether there is a session to open it in.
+#
+# Both halves are asked because both can be false independently, and the failure is
+# the same silence either way: a screen nobody sees, a keyboard nobody types on, and
+# a scene that reports `0 click(s), 0 key(s)` — which reads exactly like an input
+# path that does not work.
+#
+# Arch splits the UI drivers into their own packages (`qemu-ui-gtk`, `qemu-ui-sdl`),
+# and a `qemu-system-aarch64` without them lists **only** `none` under
+# `-display help`. That is not a misconfiguration to work around; it is a fact to
+# report, which is what the `else` branch below does.
+ui=""
+for backend in gtk sdl; do
+    if qemu-system-aarch64 -display help 2>/dev/null | grep -qx "$backend"; then
+        ui="$backend"
+        break
+    fi
+done
+if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    ui=""
+fi
+
+if [ -n "$ui" ]; then
+    # A real window: the screen `displaysrv` owns, and a keyboard and tablet that
+    # take what is typed and clicked into it. The serial log still comes back here —
+    # `mon:stdio` keeps the console in this terminal, where every other line of
+    # evidence in this project already is. Ctrl-A then X still quits.
+    echo "qemu: opening a $ui window — the screen is real, and so are the keyboard and the pointer" >&2
+    exec qemu-system-aarch64 \
+        -M virt,gic-version=2 \
+        -cpu cortex-a72 \
+        -m 256M \
+        -display "$ui" \
+        -serial mon:stdio \
+        -device ramfb \
+        -device virtio-keyboard-device \
+        -device virtio-tablet-device \
+        ${initrd:+-initrd "$initrd"} \
+        -kernel "$image" \
+        "$@"
+fi
+
+# No window available. Say why, and say it *before* the boot rather than leaving the
+# input counters to be read as a broken path.
+if qemu-system-aarch64 -display help 2>/dev/null | grep -qx none &&
+   ! qemu-system-aarch64 -display help 2>/dev/null | grep -qxE 'gtk|sdl'; then
+    echo "qemu: this build has no graphical display backend (only 'none')," >&2
+    echo "      so the screen cannot be shown and nothing can be typed or clicked." >&2
+    echo "      The scene will report 0 clicks and 0 keys, and that is the machine," >&2
+    echo "      not the input path — pacman -S qemu-ui-gtk gives it a window." >&2
+    echo "      Meanwhile ./scripts/qml-check.sh synthesises a click over QMP and" >&2
+    echo "      checks the pixels it changed." >&2
+else
+    echo "qemu: no display session (DISPLAY/WAYLAND_DISPLAY unset); running headless." >&2
+fi
 exec qemu-system-aarch64 \
     -M virt,gic-version=2 \
     -cpu cortex-a72 \
@@ -115,6 +175,7 @@ exec qemu-system-aarch64 \
     -display none \
     -device ramfb \
     -device virtio-keyboard-device \
+    -device virtio-tablet-device \
     ${initrd:+-initrd "$initrd"} \
     -kernel "$image" \
     "$@"

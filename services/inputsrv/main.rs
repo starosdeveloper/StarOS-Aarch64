@@ -1,29 +1,71 @@
 //! `inputsrv` — a virtio-input driver, entirely in EL0.
 //!
-//! The kernel has no idea this device exists. It never reads its registers, never
-//! touches its rings, and never sees an event. What it provides is three
+//! The kernel has no idea these devices exist. It never reads their registers,
+//! never touches their rings, and never sees an event. What it provides is three
 //! primitives: a capability that maps one MMIO page, a capability that turns an
 //! interrupt line into a notification, and physically-contiguous memory a device
-//! can address. Everything else — the queue, the handshake, the descriptors, the
+//! can address. Everything else — the queues, the handshakes, the descriptors, the
 //! event decoding — is this program.
 //!
+//! ## Two devices, one driver
+//! Something to type on and something to point with. They are the same device as
+//! far as virtio is concerned — both `DeviceID` 18, both driven through the same
+//! registers — so the difference is not in how they are read but in what their
+//! events *mean*, and that is one `match` rather than a second program. The device
+//! manager tells this one apart from that one and says which is which when it hands
+//! them over; a driver cannot work it out for itself, because working it out means
+//! reading a device it has not been given yet.
+//!
 //! ## What makes this the first real user of `CreateDma`
-//! A virtqueue is memory *the device reads by physical address*. Until now the DMA
-//! path existed to be tested; here it is load-bearing twice over: the rings have
-//! to be contiguous because the device is given one address for all three, and
+//! A virtqueue is memory *the device reads by physical address*. The DMA path
+//! existed to be tested before this; here it is load-bearing twice over: the rings
+//! have to be contiguous because the device is given one address for all three, and
 //! non-cacheable because the device writes the used ring while this program reads
 //! it, with no cache maintenance between them.
+//!
+//! Both devices' queues live in **one** allocation, carved into per-device regions.
+//! Not thrift: `MapDma` places every buffer at the same address, so a second
+//! allocation would land on top of the first and the second device's ring would be
+//! the first device's ring. One allocation makes the arithmetic explicit instead of
+//! making the collision invisible.
 //!
 //! ## The handshake, in the order the specification requires
 //! Status ACKNOWLEDGE, then DRIVER; select queue 0 (`eventq`); read its maximum
 //! size; write the size we chose, the alignment, and the page frame the rings live
 //! in; fill the queue with buffers for the device to write; status DRIVER_OK. Then
-//! sleep on the notification until the device says something.
+//! sleep on the notifications until a device says something.
 //!
 //! Legacy transport (version 1) is what QEMU's `virt` gives with `-device
 //! virtio-keyboard-device`, and it is what this drives: the modern one moves the
 //! queue registers around and negotiates features, neither of which buys anything
 //! for a device with no features.
+//!
+//! ## What leaves here
+//! Three kinds of message, to whoever holds the receiving end — which is the
+//! display server, because it is the only process that knows which window is where.
+//!
+//! ```text
+//! tag = 1 Key      words[0] = key code, words[1] = 1 down / 0 up
+//! tag = 4 Pointer  words[0] = x, words[1] = y, each 0..=65535 across the device
+//! tag = 5 Button   words[0] = button code, words[1] = 1 down / 0 up
+//! ```
+//!
+//! A pointer position is a **fraction of the device**, not pixels. This program
+//! holds the axis ranges and does not hold the screen geometry; the compositor
+//! holds the screen and has no business knowing what a tablet calls its far edge.
+//! Sending raw device units would make the compositor ask for the range, and
+//! sending pixels would put a screen size in a driver.
+//!
+//! Motion is published on `SYN` and not before. A movement arrives as `ABS_X`,
+//! `ABS_Y`, `SYN` — three events, and the first two are half a position each. A
+//! driver that forwarded them separately would move the pointer to a corner between
+//! every pair of axes, which on a fast device is a cursor that shakes.
+//!
+//! ## This driver does not exit
+//! It used to, after one key press, because it existed to prove a path. A key can
+//! be pressed for as long as the machine runs, and a driver that has gone by then
+//! is a decoded keystroke with nowhere to go — the same failure the display server
+//! had, one process upstream.
 
 #![no_std]
 #![no_main]
@@ -31,10 +73,11 @@
 use core::arch::{asm, naked_asm};
 use core::panic::PanicInfo;
 
-use staros_virtio::{ev, reg, status, Descriptor, InputEvent, QueueLayout};
-use staros_virtio::{DESC_F_WRITE, DEVICE_ID_INPUT, MAGIC_VALUE};
+use staros_virtio::{axis, btn, cfg, ev, reg, status};
+use staros_virtio::{AbsInfo, Descriptor, InputEvent, QueueLayout};
+use staros_virtio::{ABS_INFO_BYTES, DESC_F_WRITE, DEVICE_ID_INPUT, MAGIC_VALUE};
 
-/// Where a mapped DMA buffer appears in our address space.
+/// Where the DMA buffer holding every queue appears in our address space.
 const USER_DMA_VA: u64 = 0x7_0000_0000;
 
 // Syscall numbers — must match `staros_abi::syscall::Syscall`.
@@ -43,39 +86,46 @@ const SYS_RECV: usize = 2;
 const SYS_MAP_MEMORY: usize = 3;
 const SYS_EXIT: usize = 4;
 const SYS_IRQ_REGISTER: usize = 7;
-const SYS_WAIT: usize = 8;
 const SYS_IRQ_ACK: usize = 9;
 const SYS_DEBUG_WRITE: usize = 19;
 const SYS_CREATE_DMA: usize = 16;
 const SYS_MAP_DMA: usize = 17;
+const SYS_WAIT_ANY: usize = 24;
 const SYS_DMA_PHYS: usize = 27;
 
-/// The endpoint the device manager delegates our device and interrupt on.
+/// The endpoint the device manager delegates our devices and interrupts on.
 const EP_MANAGER: u64 = 1;
 /// Where decoded events go. Send only: a driver publishes, it does not consume.
 const EP_EVENTS: u64 = 2;
 
-/// The event kinds this driver publishes, as the message tag. They are the Linux
-/// numbers virtio-input passes through unchanged, so a consumer that already knows
-/// `EV_KEY` needs no translation table.
+/// The kind tags the device manager uses when it hands a device over, and the
+/// terminator that says no more are coming.
+const KIND_END: u64 = 0;
+const KIND_KEYBOARD: u64 = 1;
+const KIND_TABLET: u64 = 2;
+const KIND_MOUSE: u64 = 3;
+
+/// The message tags this driver publishes. `TAG_KEY` keeps the Linux number for
+/// `EV_KEY` because that is what it is; the other two are this system's, because a
+/// normalised position and a raw axis event are not the same message.
 const TAG_KEY: u64 = 1;
-const TAG_REL: u64 = 2;
-const TAG_ABS: u64 = 3;
+const TAG_POINTER: u64 = 4;
+const TAG_BUTTON: u64 = 5;
+
+/// The most devices this driver will accept. Two: a keyboard and a pointer.
+const MAX_DEVICES: usize = 2;
 
 /// Queue size. Eight buffers is more than a keyboard produces between two of our
-/// wake-ups, and small enough that the whole queue is two pages.
+/// wake-ups, and small enough that a queue is two pages.
 const QUEUE_SIZE: u16 = 8;
-/// Bytes per event buffer. One event is eight bytes; the device may pack several
-/// into one buffer, so give it room for four.
+/// Bytes per event buffer. One event is eight bytes; the device packs several into
+/// one buffer whenever a movement happens, so give it room for four.
 const EVENT_BUF_BYTES: usize = 32;
 /// The legacy transport's required alignment for the used ring.
 const QUEUE_ALIGN: usize = 4096;
-/// Pages for rings plus buffers. The rings need two pages at this size; the eight
-/// event buffers fit in the third.
-const DMA_PAGES: u64 = 3;
-/// How many key presses to report before this driver has proved its point and
-/// exits, so the demo terminates on its own.
-const PRESSES_WANTED: u32 = 1;
+/// Pages per device: the rings need two at this size, and the eight event buffers
+/// fit in the third.
+const PAGES_PER_DEVICE: u64 = 3;
 
 /// A message, laid out exactly as `staros_ipc::Message` (four words, then the cap).
 #[repr(C)]
@@ -95,6 +145,60 @@ impl Message {
     }
 }
 
+/// One device this driver is driving.
+struct Device {
+    /// Its registers, at the offset within the page the kernel told us.
+    mmio: u64,
+    /// The interrupt capability, re-armed after every batch.
+    irq_cap: u32,
+    /// The notification `IrqRegister` gave us for that line.
+    notif: u32,
+    /// Where its queue lives, in our space, and the layout of it.
+    queue: QueueLayout,
+    rings: u64,
+    buffers: u64,
+    /// How far into the used ring we have read.
+    last_used: u16,
+    /// What the manager said this is.
+    kind: u64,
+    /// The axis ranges, read from the configuration space. A keyboard's are the
+    /// degenerate ones, which normalise to the middle and are never sent.
+    abs_x: AbsInfo,
+    abs_y: AbsInfo,
+    /// The position accumulated since the last `SYN`, and whether either axis moved
+    /// in it. Both axes are remembered because a device sends only what changed: a
+    /// purely horizontal movement is one `ABS_X` and a `SYN`, and a driver that
+    /// treated the missing axis as zero would drag the pointer along the top edge.
+    x: u32,
+    y: u32,
+    moved: bool,
+}
+
+impl Device {
+    const fn empty() -> Self {
+        Self {
+            mmio: 0,
+            irq_cap: 0,
+            notif: 0,
+            // A layout that cannot be built is not a device; this is a placeholder
+            // for an array slot that is never read before `setup` overwrites it.
+            queue: match QueueLayout::new(QUEUE_SIZE, QUEUE_ALIGN) {
+                Some(q) => q,
+                None => panic!("the queue size is a constant and it is valid"),
+            },
+            rings: 0,
+            buffers: 0,
+            last_used: 0,
+            kind: KIND_END,
+            abs_x: AbsInfo { min: 0, max: 0, fuzz: 0, flat: 0, res: 0 },
+            abs_y: AbsInfo { min: 0, max: 0, fuzz: 0, flat: 0, res: 0 },
+            x: 0,
+            y: 0,
+            moved: false,
+        }
+    }
+}
+
 /// Entry point: linked at `USER_BASE`, entered by the kernel with a fresh stack.
 #[unsafe(naked)]
 #[no_mangle]
@@ -104,23 +208,107 @@ extern "C" fn _start() -> ! {
 }
 
 extern "C" fn main() -> ! {
-    // Two capabilities arrive over IPC: the device page, then its interrupt line.
-    // We hold no authority of our own — a driver is only ever as capable as what
-    // it was handed.
-    let Some(dev_cap) = recv_cap() else {
-        puts("[inputsrv] no device capability arrived\n");
+    // The queues for every device, in one contiguous non-cacheable run. Allocated
+    // before we know how many devices there are, because the allocation is what
+    // must not be repeated: a second `CreateDma` would map on top of this one.
+    // SAFETY: plain syscalls; the kernel allocates and maps the run.
+    let dma = unsafe { syscall1(SYS_CREATE_DMA, PAGES_PER_DEVICE * MAX_DEVICES as u64) };
+    if dma < 0 {
+        puts("[inputsrv] no DMA buffer for the queues\n");
         exit();
-    };
-    let Some(irq_cap) = recv_cap() else {
-        puts("[inputsrv] no interrupt capability arrived\n");
+    }
+    // SAFETY: as above; returns the VA the run is mapped at.
+    let va = unsafe { syscall1(SYS_MAP_DMA, dma as u64) };
+    if va < 0 || va as u64 != USER_DMA_VA {
+        puts("[inputsrv] the DMA buffer did not map where expected\n");
         exit();
-    };
+    }
+    // The address the *devices* must be given. Not the one above: a device has no
+    // page table, and the VA `MapDma` returned means nothing to it. Asking for the
+    // physical address is what `DmaPhys` is for — a syscall this driver's existence
+    // is the reason for, since every earlier user of the DMA path only ever read
+    // and wrote the buffer itself.
+    // SAFETY: plain syscall; the kernel resolves the capability we hold.
+    let dma_phys = unsafe { syscall1(SYS_DMA_PHYS, dma as u64) };
+    if dma_phys <= 0 {
+        puts("[inputsrv] the kernel would not say where the DMA buffer lives\n");
+        exit();
+    }
+    let dma_phys = dma_phys as u64;
 
+    let mut devices = [Device::empty(), Device::empty()];
+    let mut count = 0;
+    while count < MAX_DEVICES {
+        // Two messages per device — what it is with the device capability, then the
+        // same kind with its interrupt — and a terminator when there are no more.
+        let Some((kind, dev_cap)) = recv_cap() else {
+            puts("[inputsrv] the device manager stopped talking mid-handover\n");
+            exit();
+        };
+        if kind == KIND_END {
+            break;
+        }
+        let Some((_, irq_cap)) = recv_cap() else {
+            puts("[inputsrv] a device arrived without its interrupt\n");
+            exit();
+        };
+        if setup(&mut devices[count], kind, dev_cap, irq_cap, dma_phys, count) {
+            count += 1;
+        }
+    }
+    if count == 0 {
+        puts("[inputsrv] no input devices on this machine; nothing to drive\n");
+        exit();
+    }
+
+    put_line(
+        "[inputsrv] virtio-input driver up in EL0: ",
+        count as u64,
+        " device(s), queues armed, waiting\n",
+    );
+
+    // Live for as long as the machine does. See the module comment: a driver that
+    // stops after proving itself is a driver that is absent when somebody types.
+    loop {
+        let handles = [devices[0].notif, devices[1].notif];
+        // SAFETY: `WaitAny` reads `count` handles from this array and parks with no
+        // deadline; the array outlives the call.
+        let rc = unsafe {
+            syscall3(SYS_WAIT_ANY, handles.as_ptr() as u64, count as u64, 0)
+        };
+        if rc < 0 {
+            puts("[inputsrv] the wait failed; the driver is going down\n");
+            exit();
+        }
+        // Every device is drained, not only the one the wait named. `WaitAny`
+        // consumes one signal, and two devices interrupting at once produce two
+        // signals and one wake-up: draining only the named one leaves the other's
+        // events in its ring until it happens to interrupt again, which for a
+        // keyboard is the next keystroke — so the previous one arrives late and out
+        // of order.
+        for device in &mut devices[..count] {
+            drain(device);
+        }
+    }
+}
+
+/// Bring one device up: map it, check it, build its queue, arm its interrupt.
+/// `false` if anything about it is not what it claimed to be.
+fn setup(
+    device: &mut Device,
+    kind: u64,
+    dev_cap: u32,
+    irq_cap: u32,
+    dma_phys: u64,
+    slot: usize,
+) -> bool {
     // SAFETY: `MapMemory` maps the MMIO page the capability names into our space.
+    // One placement per device object, so the second device does not land on the
+    // first — which it did, silently, until the kernel started remembering.
     let mmio = unsafe { syscall1(SYS_MAP_MEMORY, u64::from(dev_cap)) };
     if mmio < 0 {
-        puts("[inputsrv] the device page would not map\n");
-        exit();
+        puts("[inputsrv] a device page would not map\n");
+        return false;
     }
     let mmio = mmio as u64;
 
@@ -139,42 +327,20 @@ extern "C" fn main() -> ! {
     };
     if magic != MAGIC_VALUE || device_id != DEVICE_ID_INPUT {
         puts("[inputsrv] that is not a virtio-input device\n");
-        exit();
+        return false;
     }
 
     let Some(queue) = QueueLayout::new(QUEUE_SIZE, QUEUE_ALIGN) else {
         puts("[inputsrv] impossible queue size\n");
-        exit();
+        return false;
     };
 
-    // The rings and the event buffers, in one physically-contiguous,
-    // non-cacheable allocation — the two properties a device sharing memory with
-    // us needs and ordinary memory does not have.
-    // SAFETY: plain syscalls; the kernel allocates and maps the run.
-    let dma = unsafe { syscall1(SYS_CREATE_DMA, DMA_PAGES) };
-    if dma < 0 {
-        puts("[inputsrv] no DMA buffer for the queue\n");
-        exit();
-    }
-    // SAFETY: as above; returns the VA the run is mapped at.
-    let va = unsafe { syscall1(SYS_MAP_DMA, dma as u64) };
-    if va < 0 || va as u64 != USER_DMA_VA {
-        puts("[inputsrv] the DMA buffer did not map where expected\n");
-        exit();
-    }
-    let rings = USER_DMA_VA;
-    // The address the *device* must be given. Not the one above: a device has no
-    // page table, and the VA `MapDma` returned means nothing to it. Asking for the
-    // physical address is what `DmaPhys` is for — a syscall this driver's existence
-    // is the reason for, since every earlier user of the DMA path only ever read
-    // and wrote the buffer itself.
-    // SAFETY: plain syscall; the kernel resolves the capability we hold.
-    let phys = unsafe { syscall1(SYS_DMA_PHYS, dma as u64) };
-    if phys <= 0 {
-        puts("[inputsrv] the kernel would not say where the DMA buffer lives\n");
-        exit();
-    }
-    let phys = phys as u64;
+    // This device's slice of the one DMA run. Page-aligned because `QUEUE_PFN` is
+    // written as a page frame number and a queue that started mid-page would be
+    // handed to the device rounded down — onto the previous device's used ring.
+    let region = slot as u64 * PAGES_PER_DEVICE * 4096;
+    let rings = USER_DMA_VA + region;
+    let phys = dma_phys + region;
 
     // SAFETY: writing the transport's registers in the order the specification
     // requires; the page is ours and Device-mapped.
@@ -193,7 +359,7 @@ extern "C" fn main() -> ! {
     let max = unsafe { read32(mmio, reg::QUEUE_NUM_MAX) };
     if max == 0 {
         puts("[inputsrv] the event queue is unusable\n");
-        exit();
+        return false;
     }
     // SAFETY: as above.
     unsafe {
@@ -203,14 +369,14 @@ extern "C" fn main() -> ! {
     }
 
     // Fill the queue: every descriptor points at one event buffer and is marked
-    // device-writable. The buffers live past the rings, in the same allocation.
+    // device-writable. The buffers live past the rings, in the same region.
     // Two addresses for the same memory, and keeping them apart is the whole of
     // what a driver does differently from an ordinary program: the descriptors
     // carry the *physical* one, because the device dereferences it, and this
     // program reads the events through the *virtual* one.
     let buffers_off = (queue.total_bytes() as u64 + 63) & !63;
     let buffers_phys = phys + buffers_off;
-    let buffers_va = rings + buffers_off;
+    let buffers = rings + buffers_off;
     for i in 0..QUEUE_SIZE {
         let desc = Descriptor {
             addr: buffers_phys + u64::from(i) * EVENT_BUF_BYTES as u64,
@@ -218,7 +384,8 @@ extern "C" fn main() -> ! {
             flags: DESC_F_WRITE,
             next: 0,
         };
-        // SAFETY: inside the DMA run, which is `DMA_PAGES` pages and mapped for us.
+        // SAFETY: inside this device's region of the DMA run, which is
+        // `PAGES_PER_DEVICE` pages and mapped for us.
         unsafe {
             let slot = (rings + (i as usize * 16) as u64) as *mut Descriptor;
             slot.write_volatile(desc);
@@ -239,65 +406,178 @@ extern "C" fn main() -> ! {
     // SAFETY: `IrqRegister` enables the line and returns a notification handle.
     let notif = unsafe { syscall1(SYS_IRQ_REGISTER, u64::from(irq_cap)) };
     if notif < 0 {
-        puts("[inputsrv] the interrupt would not register\n");
-        exit();
+        puts("[inputsrv] an interrupt would not register\n");
+        return false;
     }
 
-    puts("[inputsrv] virtio-input driver up in EL0: queue armed, waiting for the device\n");
-
-    let mut last_used = 0u16;
-    let mut presses = 0;
-    while presses < PRESSES_WANTED {
-        // SAFETY: blocks until the kernel forwards this device's interrupt.
-        let _ = unsafe { syscall1(SYS_WAIT, notif as u64) };
-        // SAFETY: acknowledging at the transport, then reading the used ring the
-        // device just advanced.
-        unsafe {
-            let isr = read32(mmio, reg::INTERRUPT_STATUS);
-            write32(mmio, reg::INTERRUPT_ACK, isr);
-        }
-        // SAFETY: inside the mapped DMA run.
-        let used_idx = unsafe { ((rings + queue.used_idx_offset() as u64) as *const u16).read_volatile() };
-        while last_used != used_idx {
-            // SAFETY: as above; each used element is an (id, len) pair.
-            let (id, len) = unsafe {
-                let e = (rings + queue.used_ring_offset(last_used) as u64) as *const u32;
-                (e.read_volatile(), e.add(1).read_volatile())
-            };
-            if let Some(event) = read_event(buffers_va, id, len) {
-                if event.is_key_press() {
-                    put_line(
-                        "[inputsrv] key press from the device: code ",
-                        u64::from(event.code),
-                        " - decoded in EL0, the kernel never saw the event\n",
-                    );
-                    publish(TAG_KEY, u64::from(event.code), u64::from(event.value));
-                    presses += 1;
-                } else if event.kind == ev::REL || event.kind == ev::ABS {
-                    puts("[inputsrv] pointer motion from the device\n");
-                    let tag = if event.kind == ev::REL { TAG_REL } else { TAG_ABS };
-                    publish(tag, u64::from(event.code), u64::from(event.value));
-                }
-            }
-            // Hand the buffer straight back: the device may refill it.
-            // SAFETY: republishing the descriptor in the available ring.
-            unsafe {
-                let ring = (rings + queue.avail_ring_offset(last_used) as u64) as *mut u16;
-                ring.write_volatile(id as u16);
-                let idx = (rings + queue.avail_idx_offset() as u64) as *mut u16;
-                idx.write_volatile(idx.read_volatile().wrapping_add(1));
-            }
-            last_used = last_used.wrapping_add(1);
-        }
-        // SAFETY: tell the device there are buffers again, then re-enable the line.
-        unsafe {
-            write32(mmio, reg::QUEUE_NOTIFY, 0);
-            syscall1(SYS_IRQ_ACK, u64::from(irq_cap));
-        }
+    device.mmio = mmio;
+    device.irq_cap = irq_cap;
+    device.notif = notif as u32;
+    device.queue = queue;
+    device.rings = rings;
+    device.buffers = buffers;
+    device.last_used = 0;
+    device.kind = kind;
+    // A pointer's axis ranges, read *after* the handshake because the configuration
+    // space is only guaranteed to answer once the device knows a driver is there.
+    if kind == KIND_TABLET {
+        device.abs_x = abs_info(mmio, axis::X);
+        device.abs_y = abs_info(mmio, axis::Y);
+        put_line(
+            "[inputsrv] a tablet: absolute axes 0..",
+            u64::from(device.abs_x.max),
+            " wide, reported as a fraction so the compositor keeps the screen size\n",
+        );
+    } else if kind == KIND_KEYBOARD {
+        puts("[inputsrv] a keyboard\n");
+    } else if kind == KIND_MOUSE {
+        puts("[inputsrv] a mouse: relative axes, which nothing consumes yet\n");
     }
+    true
+}
 
-    puts("[inputsrv] input driver exiting\n");
-    exit();
+/// Read one absolute axis's range out of the configuration space.
+///
+/// A size of zero means the device has no such axis, and the degenerate range this
+/// returns for it normalises to the middle rather than dividing by nothing. That is
+/// the honest answer: a device with no Y axis has no Y position, and a corner would
+/// look like one.
+fn abs_info(mmio: u64, which: u16) -> AbsInfo {
+    let mut bytes = [0u8; ABS_INFO_BYTES];
+    // SAFETY: `mmio` is our mapped device page; these offsets are inside it, and
+    // the two writes are the documented way to select a configuration item.
+    let size = unsafe {
+        ((mmio + cfg::SELECT as u64) as *mut u8).write_volatile(cfg::ABS_INFO);
+        ((mmio + cfg::SUBSEL as u64) as *mut u8).write_volatile(which as u8);
+        ((mmio + cfg::SIZE as u64) as *const u8).read_volatile() as usize
+    };
+    if size < ABS_INFO_BYTES {
+        return AbsInfo { min: 0, max: 0, fuzz: 0, flat: 0, res: 0 };
+    }
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: `i < ABS_INFO_BYTES <= size`, and the union is at least that long.
+        *byte = unsafe { ((mmio + cfg::UNION as u64 + i as u64) as *const u8).read_volatile() };
+    }
+    AbsInfo::parse(&bytes).unwrap_or(AbsInfo { min: 0, max: 0, fuzz: 0, flat: 0, res: 0 })
+}
+
+/// Read everything one device has produced since last time, publish it, and give
+/// the buffers back.
+fn drain(device: &mut Device) {
+    // SAFETY: acknowledging at the transport, then reading the used ring the device
+    // advanced. Acknowledging before reading is deliberate: an event that arrives
+    // between the two is still in the ring and is read on this pass, whereas
+    // acknowledging afterwards can lose the interrupt for it entirely.
+    unsafe {
+        let isr = read32(device.mmio, reg::INTERRUPT_STATUS);
+        write32(device.mmio, reg::INTERRUPT_ACK, isr);
+    }
+    // SAFETY: inside the mapped DMA run.
+    let used_idx = unsafe {
+        ((device.rings + device.queue.used_idx_offset() as u64) as *const u16).read_volatile()
+    };
+    // No early return when the ring has not moved, and this is the whole of why two
+    // devices are harder than one.
+    //
+    // Every wake-up drains *both* devices, so a device whose ring is empty is the
+    // ordinary case — the other one interrupted. `IrqAck` at the bottom is what
+    // re-enables the line, and returning here skips it: the device is left masked,
+    // its next event raises an interrupt nobody hears, and it goes silent for ever
+    // while the other keeps working. The symptom was a keyboard that stopped after
+    // the pointer moved, or a pointer that stopped after a keystroke — whichever
+    // lost the race — and it looked exactly like a flaky test.
+    while device.last_used != used_idx {
+        // SAFETY: as above; each used element is an (id, len) pair.
+        let (id, len) = unsafe {
+            let e = (device.rings + device.queue.used_ring_offset(device.last_used) as u64)
+                as *const u32;
+            (e.read_volatile(), e.add(1).read_volatile())
+        };
+        handle_buffer(device, id, len);
+        // Hand the buffer straight back: the device may refill it.
+        // SAFETY: republishing the descriptor in the available ring.
+        unsafe {
+            let ring =
+                (device.rings + device.queue.avail_ring_offset(device.last_used) as u64) as *mut u16;
+            ring.write_volatile(id as u16);
+            let idx = (device.rings + device.queue.avail_idx_offset() as u64) as *mut u16;
+            idx.write_volatile(idx.read_volatile().wrapping_add(1));
+        }
+        device.last_used = device.last_used.wrapping_add(1);
+    }
+    // SAFETY: tell the device there are buffers again, then re-enable the line.
+    unsafe {
+        write32(device.mmio, reg::QUEUE_NOTIFY, 0);
+        syscall1(SYS_IRQ_ACK, u64::from(device.irq_cap));
+    }
+}
+
+/// Decode every event in one filled buffer.
+///
+/// Every event, not the first. A device packs a whole movement into one descriptor
+/// — `ABS_X`, `ABS_Y`, `SYN` — and a driver that read one event per buffer reports
+/// horizontal motion and never vertical, with nothing in the log to say so, because
+/// everything it does report is correct.
+fn handle_buffer(device: &mut Device, id: u32, len: u32) {
+    if id >= u32::from(QUEUE_SIZE) {
+        return;
+    }
+    let base = device.buffers + u64::from(id) * EVENT_BUF_BYTES as u64;
+    let len = (len as usize).min(EVENT_BUF_BYTES);
+    // SAFETY: `base` is one of our own event buffers, inside the DMA run, and `len`
+    // is clamped to its size.
+    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+    // Collected first, then handled: the borrow of the buffer ends before anything
+    // is published, and publishing may block.
+    let mut events = [InputEvent::default(); EVENT_BUF_BYTES / 8];
+    let mut n = 0;
+    for event in InputEvent::parse_all(bytes) {
+        events[n] = event;
+        n += 1;
+    }
+    for event in &events[..n] {
+        handle_event(device, *event);
+    }
+}
+
+/// Turn one decoded event into a message, or into a piece of one.
+fn handle_event(device: &mut Device, event: InputEvent) {
+    match event.kind {
+        ev::KEY if btn::is_button(event.code) => {
+            publish(TAG_BUTTON, u64::from(event.code), u64::from(event.value));
+        }
+        ev::KEY => {
+            if event.is_key_press() {
+                put_line(
+                    "[inputsrv] key press from the device: code ",
+                    u64::from(event.code),
+                    " - decoded in EL0, the kernel never saw the event\n",
+                );
+            }
+            publish(TAG_KEY, u64::from(event.code), u64::from(event.value));
+        }
+        ev::ABS if event.code == axis::X => {
+            device.x = device.abs_x.normalise(event.value);
+            device.moved = true;
+        }
+        ev::ABS if event.code == axis::Y => {
+            device.y = device.abs_y.normalise(event.value);
+            device.moved = true;
+        }
+        // The end of one physical action, and the only moment a position is whole.
+        ev::SYN => {
+            if device.moved {
+                device.moved = false;
+                publish(TAG_POINTER, u64::from(device.x), u64::from(device.y));
+            }
+        }
+        // Relative axes are decoded and dropped, on purpose. Turning a delta into a
+        // position needs somewhere to keep the pointer, and the process that keeps
+        // it is the compositor — this driver would be inventing a second one that
+        // disagreed with it. The day a mouse is attached, the delta goes in a
+        // message of its own rather than in this one.
+        _ => {}
+    }
 }
 
 /// Publish one decoded event to whoever holds the receiving end.
@@ -308,11 +588,11 @@ extern "C" fn main() -> ! {
 /// occasionally misses a keystroke, which is the hardest class of bug there is to
 /// believe. Blocking makes the back-pressure visible instead: the driver stops
 /// acknowledging interrupts, the device's queue fills, and the failure has a shape.
-fn publish(tag: u64, code: u64, value: u64) {
+fn publish(tag: u64, first: u64, second: u64) {
     let mut msg = Message::new();
     msg.tag = tag;
-    msg.words[0] = code;
-    msg.words[1] = value;
+    msg.words[0] = first;
+    msg.words[1] = second;
     // SAFETY: `Send` reads one `Message` through this pointer; the endpoint handle
     // is the capability the kernel installed for exactly this.
     unsafe {
@@ -320,29 +600,23 @@ fn publish(tag: u64, code: u64, value: u64) {
     }
 }
 
-/// Read one event out of the buffer descriptor `id` names, if the device wrote a
-/// whole one.
-fn read_event(buffers: u64, id: u32, len: u32) -> Option<InputEvent> {
-    if id >= u32::from(QUEUE_SIZE) {
-        return None;
-    }
-    let base = buffers + u64::from(id) * EVENT_BUF_BYTES as u64;
-    let len = (len as usize).min(EVENT_BUF_BYTES);
-    // SAFETY: `base` is one of our own event buffers, inside the DMA run, and
-    // `len` is clamped to its size.
-    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-    InputEvent::parse(bytes)
-}
-
-/// Receive one capability from the device manager.
-fn recv_cap() -> Option<u32> {
+/// Receive one capability from the device manager, with the tag saying what it is.
+fn recv_cap() -> Option<(u64, u32)> {
     let mut msg = Message::new();
     // SAFETY: `Recv` writes one `Message` through this pointer.
     let rc = unsafe { syscall2(SYS_RECV, EP_MANAGER, core::ptr::addr_of_mut!(msg) as u64) };
-    if rc < 0 || msg.cap == 0 {
+    if rc < 0 {
         return None;
     }
-    Some(msg.cap)
+    // The terminator carries no capability, and that is the one message where a
+    // zero handle is not a failure.
+    if msg.tag == KIND_END {
+        return Some((KIND_END, 0));
+    }
+    if msg.cap == 0 {
+        return None;
+    }
+    Some((msg.tag, msg.cap))
 }
 
 /// Read a 32-bit device register.
@@ -371,7 +645,6 @@ fn puts(s: &str) {
     }
 }
 
-/// Write a decimal number.
 /// Print `prefix`, a number, and `suffix` as **one** line, in one `DebugWrite`.
 ///
 /// Three calls would be three chances for another task to write between them, and
@@ -443,6 +716,26 @@ unsafe fn syscall2(number: usize, a0: u64, a1: u64) -> isize {
     // SAFETY: as `syscall1`, with a second argument in x1.
     unsafe {
         asm!("svc #0", in("x8") number, inout("x0") a0 => ret, in("x1") a1, options(nostack));
+    }
+    ret
+}
+
+/// A three-argument syscall. Only `WaitAny` needs the third register.
+///
+/// # Safety
+/// As [`syscall1`].
+unsafe fn syscall3(number: usize, a0: u64, a1: u64, a2: u64) -> isize {
+    let ret;
+    // SAFETY: as `syscall2`, with a third argument in x2.
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") number,
+            inout("x0") a0 => ret,
+            in("x1") a1,
+            in("x2") a2,
+            options(nostack),
+        );
     }
     ret
 }

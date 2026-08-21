@@ -25,6 +25,7 @@ qt_internal_add_plugin(QStarosIntegrationPlugin
         qstarosscreen.cpp qstarosscreen.h
         qstaroswindow.cpp qstaroswindow.h
         qstarosbackingstore.cpp qstarosbackingstore.h
+        qstarosinput.cpp qstarosinput.h
         qstarosintegration.cpp qstarosintegration.h
     DEFINES
         QT_NO_FOREACH

@@ -136,14 +136,37 @@ size_t staros_shared_bytes(unsigned int cap);
 #define STAROS_FORMAT_XRGB8888 1u
 
 /* ---- Input -------------------------------------------------------------- */
-/* Decoded events arrive from services/inputsrv as messages: the tag is the event
- * kind, words[0] the code and words[1] the value. The numbers are Linux's, which
- * virtio-input passes through unchanged, so a consumer that already knows EV_KEY
- * needs no translation table. */
+/* Events arrive from services/displaysrv on the event endpoint — never from the
+ * driver directly. The compositor is the only process that knows which window is
+ * where, so it is the only one that can say which of these is yours.
+ *
+ * A key goes to whoever claimed STAROS_DISPLAY_FOCUS. A pointer event goes to
+ * whatever is under the pointer, which is routinely a different window: clicking
+ * on a window that is not focused is what that means. */
 
-#define STAROS_INPUT_KEY 1u
-#define STAROS_INPUT_REL 2u
-#define STAROS_INPUT_ABS 3u
+#define STAROS_INPUT_KEY 1u     /* words[0] = Linux key code, words[1] = 1 down /
+                                 * 0 up. The code is the driver's, undisturbed:
+                                 * renumbering here would put a translation table
+                                 * in every client for a mapping that exists. */
+#define STAROS_INPUT_POINTER 4u /* words[0] = x | y<<32, in *this surface's* pixels
+                                 * words[1] = x | y<<32, on the screen
+                                 * words[2] = which buttons are down, as a mask
+                                 * words[3] = the surface it is over
+                                 *
+                                 * Both coordinate spaces, because a client acts in
+                                 * its own and drags in the screen's, and it has
+                                 * never been told where its window is.
+                                 *
+                                 * The buttons are the whole state and not a change:
+                                 * a client that receives "button 1 went down" has
+                                 * to remember the rest to know whether this is a
+                                 * drag, and a client that missed one message stays
+                                 * wrong for ever. This one recovers on the next. */
+
+/* Bits of the button mask in words[2] of a pointer message. */
+#define STAROS_BUTTON_LEFT   1u
+#define STAROS_BUTTON_RIGHT  2u
+#define STAROS_BUTTON_MIDDLE 4u
 
 /* ---- Measurements ------------------------------------------------------- */
 

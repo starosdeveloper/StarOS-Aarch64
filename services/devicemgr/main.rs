@@ -25,6 +25,7 @@ use core::panic::PanicInfo;
 
 use staros_cpio::Archive;
 use staros_fdt::Fdt;
+use staros_virtio::{cfg, classify, ev, InputKind};
 
 /// The kernel-seeded data page: id at `+0`, DTB user address at `+8`, DTB length
 /// at `+16`, initramfs user address at `+24`, initramfs length at `+32` (see
@@ -54,14 +55,33 @@ const SYS_BIND_DMA: usize = 18;
 const SYS_SPAWN_IMAGE: usize = 26;
 const SYS_MAP_MEMORY: usize = 3;
 
-/// Virtio-mmio register offsets and values we need to *identify* a device. The
-/// full map lives in `staros_virtio`, which this program does not link — three
-/// constants are cheaper than a second rlib in the build for a program that only
-/// reads two registers.
-const VIRTIO_MAGIC: u64 = 0x000;
-const VIRTIO_DEVICE_ID: u64 = 0x008;
-const VIRTIO_MAGIC_VALUE: u32 = 0x7472_6976; // 'virt'
-const VIRTIO_DEVICE_ID_INPUT: u32 = 18;
+/// Virtio-mmio register offsets and values we need to *identify* a device.
+///
+/// These came from three local constants and now come from `staros_virtio`, which
+/// this program links. The reason is the configuration space: telling a keyboard
+/// from a tablet is a conversation with the device at four more offsets, and four
+/// offsets copied into a second file is four offsets that will one day disagree
+/// with the driver reading the same registers.
+const VIRTIO_MAGIC: u64 = staros_virtio::reg::MAGIC as u64;
+const VIRTIO_DEVICE_ID: u64 = staros_virtio::reg::DEVICE_ID as u64;
+const VIRTIO_MAGIC_VALUE: u32 = staros_virtio::MAGIC_VALUE;
+const VIRTIO_DEVICE_ID_INPUT: u32 = staros_virtio::DEVICE_ID_INPUT;
+
+/// How many input devices we look for. Two: something to type on and something to
+/// point with, which is what the display server can route and what QEMU is started
+/// with. A third would be found and passed on the day the driver is told to expect
+/// one — the terminator in the protocol below is what makes that an edit here and
+/// nowhere else.
+const MAX_INPUT_DEVICES: usize = 2;
+
+/// The kind tag in the message that hands a device to the driver: what it is, so
+/// the driver knows how to read it before it has read anything.
+const KIND_KEYBOARD: u64 = 1;
+const KIND_TABLET: u64 = 2;
+const KIND_MOUSE: u64 = 3;
+/// The terminator: no more devices are coming. A driver that counted messages
+/// instead would need to be told the number twice.
+const KIND_END: u64 = 0;
 
 /// The error the kernel returns from `BindDma` on a machine with no IOMMU
 /// (`KError::NotSupported`), so the demo can tell "no SMMU here" from a real
@@ -162,29 +182,53 @@ extern "C" fn devicemgr_main() -> ! {
     // mint a device and an interrupt capability, delegate both. The difference is
     // that finding it needed a *look* at each slot's registers rather than a
     // property in the tree — see `find_virtio_input`.
-    match find_virtio_input(&fdt) {
-        Some((phys, intid)) => {
-            // SAFETY: minting from the authority we hold, as above.
-            let (dev, irq) = unsafe {
-                (
-                    syscall2(SYS_GRANT_DEVICE, AUTHORITY, phys),
-                    syscall2(SYS_GRANT_IRQ, AUTHORITY, u64::from(intid)),
-                )
-            };
-            if dev < 0 || irq < 0 {
-                puts("[devicemgr] could not mint capabilities for the input device\n");
-            } else {
-                send_cap(EP_INPUT, dev as u32);
-                send_cap(EP_INPUT, irq as u32);
-                puts("[devicemgr] found a virtio-input device at ");
-                put_hex(phys);
-                puts(" intid ");
-                put_dec(u64::from(intid));
-                puts(" and delegated it to the input driver\n");
-            }
+    let mut found = [(0u64, 0u32, InputKind::Other); MAX_INPUT_DEVICES];
+    let count = find_virtio_inputs(&fdt, &mut found);
+    for &(phys, intid, kind) in &found[..count] {
+        // SAFETY: minting from the authority we hold, as above.
+        let (dev, irq) = unsafe {
+            (
+                syscall2(SYS_GRANT_DEVICE, AUTHORITY, phys),
+                syscall2(SYS_GRANT_IRQ, AUTHORITY, u64::from(intid)),
+            )
+        };
+        if dev < 0 || irq < 0 {
+            puts("[devicemgr] could not mint capabilities for the input device\n");
+            continue;
         }
-        None => puts("[devicemgr] no virtio-input device on this machine\n"),
+        // The kind travels with the device and not after it. A driver that had to
+        // work out what it was holding would do it by reading the same
+        // configuration space this program just read — with the difference that a
+        // driver may not look at a device it was not given, so it could only ever
+        // check the answer it had already been handed.
+        let kind_tag = match kind {
+            InputKind::Keyboard => KIND_KEYBOARD,
+            InputKind::Tablet => KIND_TABLET,
+            InputKind::Mouse => KIND_MOUSE,
+            InputKind::Other => continue,
+        };
+        send_kind(EP_INPUT, kind_tag, dev as u32);
+        send_kind(EP_INPUT, kind_tag, irq as u32);
+        puts("[devicemgr] found a ");
+        puts(match kind {
+            InputKind::Keyboard => "keyboard",
+            InputKind::Tablet => "tablet",
+            InputKind::Mouse => "mouse",
+            InputKind::Other => "device",
+        });
+        puts(" at ");
+        put_hex(phys);
+        puts(" intid ");
+        put_dec(u64::from(intid));
+        puts(" and delegated it to the input driver\n");
     }
+    if count == 0 {
+        puts("[devicemgr] no virtio-input device on this machine\n");
+    }
+    // Always sent, even when nothing was found: the driver waits for this and a
+    // machine with no input devices is the case where waiting for ever is easiest
+    // to mistake for a hung driver.
+    send_kind(EP_INPUT, KIND_END, 0);
 
     // Enforcement (roadmap 2.3): make DMA safe against a bus master. A driver we
     // trust with a DMA-capable device could, without an IOMMU, point that device
@@ -315,14 +359,19 @@ fn unpack_initramfs() {
 
 /// Send a capability (by handle) over endpoint `ep`, transferring nothing else.
 fn send_cap(ep: u64, cap: u32) {
-    let mut msg = Msg { tag: 0, words: [0; 4], cap, _pad: 0 };
+    send_kind(ep, 0, cap);
+}
+
+/// Send a capability with a tag saying what it is.
+fn send_kind(ep: u64, kind: u64, cap: u32) {
+    let mut msg = Msg { tag: kind, words: [0; 4], cap, _pad: 0 };
     // SAFETY: `Send` reads a `Message` at the pointer; `Msg` matches its layout,
     // and `ep` is a send-capable endpoint handle.
     unsafe { syscall2(SYS_SEND, ep, (&raw mut msg) as u64) };
 }
 
-/// Find the virtio-mmio slot that actually holds an input device, and return its
-/// physical base and interrupt id.
+/// Find every virtio-mmio slot that holds an input device, up to `out.len()`, and
+/// say what kind each one is. Returns how many were written.
 ///
 /// QEMU's `virt` machine declares **thirty-two** identical `virtio,mmio` nodes and
 /// leaves almost all of them empty; which one is populated depends on the order
@@ -330,9 +379,18 @@ fn send_cap(ep: u64, cap: u32) {
 /// only way to tell is to look at each slot's `DeviceID` register, which means
 /// mapping it. That is exactly what a device manager is for — it holds the
 /// authority to mint a capability for any page, so it can look where a driver may
-/// not, and hand on only the one slot that matters.
-fn find_virtio_input(fdt: &Fdt<'_>) -> Option<(u64, u32)> {
+/// not, and hand on only the slots that matter.
+///
+/// And `DeviceID` is only half the answer. A keyboard and a tablet are both id 18;
+/// what separates them is the configuration space, read here rather than in the
+/// driver for the same reason the slot search is here — this program may look at a
+/// device before deciding to give it away, and the driver may not.
+fn find_virtio_inputs(fdt: &Fdt<'_>, out: &mut [(u64, u32, InputKind)]) -> usize {
+    let mut found = 0;
     for node in fdt.find_all_compatible("virtio,mmio") {
+        if found == out.len() {
+            break;
+        }
         let Some((phys, _)) = node.reg().and_then(|mut r| r.next()) else {
             continue;
         };
@@ -344,9 +402,12 @@ fn find_virtio_input(fdt: &Fdt<'_>) -> Option<(u64, u32)> {
         };
         let intid = if kind == 0 { SPI_BASE + number } else { number };
 
-        // Mint ourselves a capability for this slot and map it. The mapping goes
-        // to the same fixed address every time, so each slot is inspected and
-        // replaced — we are looking, not keeping.
+        // Mint ourselves a capability for this slot and map it.
+        //
+        // Each probe is its own object and so lands at its own address — the kernel
+        // keeps one placement per device object, and this loop is the reason that
+        // table is larger than the number of devices anyone holds. We are looking,
+        // not keeping: the address is used for the length of this iteration.
         // SAFETY: `GrantDevice` mints from the authority we hold; `MapMemory` maps
         // the page the capability names into our own space.
         let va = unsafe {
@@ -359,19 +420,55 @@ fn find_virtio_input(fdt: &Fdt<'_>) -> Option<(u64, u32)> {
         if va < 0 {
             continue;
         }
+        let base = va as u64;
         // SAFETY: the page is mapped Device memory, read-only here; these two
         // registers exist on every virtio-mmio transport, populated or not.
         let (magic, device_id) = unsafe {
             (
-                ((va as u64 + VIRTIO_MAGIC) as *const u32).read_volatile(),
-                ((va as u64 + VIRTIO_DEVICE_ID) as *const u32).read_volatile(),
+                ((base + VIRTIO_MAGIC) as *const u32).read_volatile(),
+                ((base + VIRTIO_DEVICE_ID) as *const u32).read_volatile(),
             )
         };
-        if magic == VIRTIO_MAGIC_VALUE && device_id == VIRTIO_DEVICE_ID_INPUT {
-            return Some((phys, intid));
+        if magic != VIRTIO_MAGIC_VALUE || device_id != VIRTIO_DEVICE_ID_INPUT {
+            continue;
         }
+        out[found] = (phys, intid, probe_input_kind(base));
+        found += 1;
     }
-    None
+    found
+}
+
+/// Ask a mapped `virtio-input` which event classes it reports, and decide from
+/// that what it is.
+///
+/// The conversation is: write which item is wanted and its sub-item, then read how
+/// many bytes the device filled in. Zero is a complete answer — "I do not report
+/// that class at all" — which is why the *size* is what is tested rather than the
+/// bytes: a keyboard asked about absolute axes answers zero bytes, and reading the
+/// union anyway would read whatever the last query left there.
+fn probe_input_kind(base: u64) -> InputKind {
+    classify(
+        reports(base, ev::ABS),
+        reports(base, ev::REL),
+        reports(base, ev::KEY),
+    )
+}
+
+/// Whether the device at `base` reports any codes of event class `class`.
+fn reports(base: u64, class: u16) -> bool {
+    // SAFETY: `base` is a mapped virtio-mmio page and both offsets are inside it.
+    // The two writes are the transport's documented way of selecting a
+    // configuration item, and the read that follows is what the device answered.
+    unsafe {
+        ((base + cfg::SELECT as u64) as *mut u8).write_volatile(cfg::EV_BITS);
+        ((base + cfg::SUBSEL as u64) as *mut u8).write_volatile(class as u8);
+        let size = ((base + cfg::SIZE as u64) as *const u8).read_volatile();
+        // Leave the selection unset behind us. The device keeps whatever was
+        // selected last, and a driver that read the union without selecting first
+        // would get this program's leftovers and no indication that it had.
+        ((base + cfg::SELECT as u64) as *mut u8).write_volatile(cfg::UNSET);
+        size != 0
+    }
 }
 
 /// Find the first PL011 UART in the tree and return its physical base and GIC

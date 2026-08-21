@@ -1,6 +1,7 @@
 #include "qstarosintegration.h"
 
 #include "qstarosbackingstore.h"
+#include "qstarosinput.h"
 #include "qstarosscreen.h"
 #include "qstaroswindow.h"
 
@@ -85,9 +86,20 @@ QStarosIntegration::QStarosIntegration()
 
 QStarosIntegration::~QStarosIntegration()
 {
+    delete m_input;
     delete m_fontDatabase;
     if (m_screen != nullptr)
         QWindowSystemInterface::handleScreenRemoved(m_screen);
+}
+
+void QStarosIntegration::initialize()
+{
+    // Input starts here and not in the constructor, because a `QSocketNotifier`
+    // registers with the event dispatcher of the thread that creates it — and when
+    // the constructor runs, `QGuiApplication` has not yet asked this object for one.
+    // A notifier built then attaches to nothing and never fires: the plugin loads,
+    // the window appears, and no key ever arrives.
+    m_input = new QStarosInput(m_connection.eventDescriptor());
 }
 
 bool QStarosIntegration::hasCapability(QPlatformIntegration::Capability cap) const

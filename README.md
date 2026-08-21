@@ -16,8 +16,9 @@ interrupt handling in **user space**, an SMMUv3 enforced against a real bus
 master, an initramfs, a framebuffer console, a monotonic clock user space can read
 and sleep against, waiting on a set of sources with a deadline, threads inside one
 address space, processes loaded from a file rather than from the kernel image, a
-display server in user space that owns the screen, a virtio-input driver that
-decodes real key events without the kernel seeing one, a file server that hands
+display server in user space that owns the screen and routes input to the window it
+belongs to, a virtio-input driver that decodes real key presses and pointer
+positions from two devices without the kernel seeing one, a file server that hands
 files to processes holding no archive, and a **C program** — compiled by clang
 against this tree's own libc — that prints, computes `sin(10¹⁵)` correctly,
 allocates, sleeps, reads files through `FILE*`, lists a directory that exists only
@@ -41,7 +42,7 @@ destructor runs at exit.
 | `crates/cpio` | `newc` archive reader (Linux initramfs format) |
 | `crates/framebuffer` | 8×8 font + text console over an arbitrary pixel format |
 | `crates/videocore` | Raspberry Pi VideoCore property-mailbox **messages** (no MMIO) |
-| `crates/virtio` | Split-virtqueue layout, MMIO register map, input event format (no MMIO) |
+| `crates/virtio` | Split-virtqueue layout, MMIO register map, input event format, configuration-space offsets, and the axis arithmetic that turns a device position into a fraction (no MMIO) |
 | `crates/iommu` | SMMUv3 descriptor/queue bit layouts (no MMIO) |
 | `crates/staros-libc` | The C library EL0 programs link against, all 282 symbols a real Qt 6 build needs: `str*`/`mem*`/`printf`/`scanf` and the whole of libm written from scratch, `malloc` over `MapAnon`, time and the calendar over `ClockNow`, files and `FILE*` and directories over the file server, `pthread`s with real thread-local storage over `SpawnThread`, `poll`/`eventfd`/`pipe` over `WaitAny`, and the process layer — `getpid`, `uname`, `setjmp`/`longjmp`, `backtrace` |
 
@@ -63,15 +64,15 @@ board `unsafe`.
 |-----------|------|
 | `services/init` | First EL0 process; `boot/image.rs` flattens the ELF to a bootable `Image` |
 | `services/devicemgr` | Device manager: parses the DTB **in user space**, mints device/IRQ capabilities from an authority cap, delegates them to drivers over IPC |
-| `services/displaysrv` | Display server: owns the framebuffer, composites client surfaces delivered as shared-memory capabilities |
-| `services/inputsrv` | virtio-input driver: virtqueue, interrupt and event decoding, all in EL0 |
+| `services/displaysrv` | Display server: owns the framebuffer, composites client surfaces delivered as shared-memory capabilities, and routes input — a key to whoever claimed the keyboard, a pointer to whatever is under it, in that surface's own coordinates |
+| `services/inputsrv` | virtio-input driver: two devices — a keyboard and a tablet — with their virtqueues, interrupts and event decoding all in EL0. It normalises a pointer position into a fraction of the device and never learns the size of the screen |
 | `services/fssrv` | File server: owns the initramfs, answers `Open`/`Read`/`Stat`/`List`/`Close` over IPC through a client-supplied shared buffer |
 | `services/fsclient` | A process with no archive and no device, reading a file anyway — the only way "these bytes arrived over IPC" means anything |
 | `services/hello-c` | A program written in **C**, compiled by clang and linked against `crates/staros-libc` — the toolchain Qt will arrive through, exercised by something small enough to debug: formatting, mathematics, number parsing, the heap, `mmap`, the calendar, the clock, files through `FILE*`, a directory listing over a flat archive, the process layer, four threads with their own TLS, and `poll` |
-| `services/qstaros` | The **QPA plugin**: `QPlatformIntegration`, `QPlatformScreen`, `QPlatformWindow` over a `displaysrv` surface, and a `QPlatformBackingStore` that is a `QImage` over the shared pixels — no copy between `QPainter` and the compositor. Compiles for aarch64 against this tree's own sysroot; linking waits on a Qt cross-built against it |
+| `services/qstaros` | The **QPA plugin**: `QPlatformIntegration`, `QPlatformScreen`, `QPlatformWindow` over a `displaysrv` surface, and a `QPlatformBackingStore` that is a `QImage` over the shared pixels — no copy between `QPainter` and the compositor. Input arrives on the same `poll` the event loop already runs, through a `QSocketNotifier` on the compositor's event endpoint, and becomes `handleMouseEvent`/`handleKeyEvent` |
 | `services/hello-cpp` | A program written in **C++** with the real standard library: `std::vector<std::string>`, `std::sort`, three `std::thread`s under a `std::mutex`, a namespace-scope constructor, a function-local static whose destructor runs at exit, and nine `dynamic_cast`s over all three of the ABI's type-information shapes |
 | `services/qt-hello` | A program written with **Qt**: `QGuiApplication`, a `QRasterWindow` painted with `QPainter`, text in a font read from the initramfs, and an event loop that ends by itself |
-| `services/shell` | A program written in **QML**: a `QQuickView` over a scene read off the filesystem at run time, rendered by Qt Quick's software adaptation — no OpenGL, no JIT, every QML module linked in and imported by name |
+| `services/shell` | A program written in **QML**: a `QQuickView` over a scene read off the filesystem at run time, rendered by Qt Quick's software adaptation — no OpenGL, no JIT, every QML module linked in and imported by name. Its `MouseArea` and `Keys.onPressed` are the far end of the input path, and it prints how many of each arrived |
 
 All ten EL0 programs are built by `crates/kernel/build.rs` and embedded in the
 kernel image; there is no separate build step. The C and C++ ones are skipped, with
@@ -109,11 +110,11 @@ intrinsics); prefer them over a bare `cargo build`.
 cargo kbuild                 # build the kernel ELF for aarch64
 cargo krun                   # build + boot it in QEMU (with a framebuffer)
 cargo kclippy                # clippy across the workspace
-cargo ktest-host             # portable-crate unit tests on the host (183 tests)
+cargo ktest-host             # portable-crate unit tests on the host (221 tests)
 ./scripts/smoke-test.sh      # boot the whole matrix and assert on the output
 ./scripts/fb-check.sh        # assert on the *pixels* the display server composited
-./scripts/qml-check.sh       # assert on the *pixels* of the QML scene: is the red rectangle there
-./scripts/input-check.sh     # press a key on the emulated keyboard and check the driver decoded it
+./scripts/qml-check.sh       # assert on the *pixels* of the QML scene, then click it and assert they changed
+./scripts/input-check.sh     # press a key and click on the emulated devices, and check both reached a window
 ./scripts/gdb-check.sh       # break inside an EL0 program over QEMU's gdbstub and unwind its stack
 ./scripts/libc-progress.sh   # score crates/staros-libc against the symbols Qt needs
 ./scripts/header-check.sh    # every function the sysroot declares must be one the library defines
@@ -128,15 +129,33 @@ protocol a real bootloader uses**, and the only path that passes a device tree i
 `x0`. Exit QEMU with `Ctrl-A` then `X`.
 
 The runner builds a *complete* machine on purpose: `-device ramfb` so there is a
-screen to hand to `displaysrv`, `-device virtio-keyboard-device` so `inputsrv` has
-a device to find, and an initramfs built beside the image (greeting, version, and
-the `init` ELF) so the archive and `SpawnImage` paths run too. Anything left out
-here is a subsystem that reports "this machine has none" and vanishes from the
-log — which is how the display server and then the input driver each went
-unnoticed after being written. The devices cost nothing when nothing uses them.
+screen to hand to `displaysrv`, `-device virtio-keyboard-device` and
+`-device virtio-tablet-device` so `inputsrv` has something to type on and something
+to point with, and an initramfs built beside the image (greeting, version, and the
+`init` ELF) so the archive and `SpawnImage` paths run too. Anything left out here
+is a subsystem that reports "this machine has none" and vanishes from the log —
+which is how the display server and then the input driver each went unnoticed after
+being written. The devices cost nothing when nothing uses them.
 
-To press a key on that keyboard, run `./scripts/input-check.sh`: a headless
-`cargo krun` has no way to deliver one, so the driver arms its queue and waits.
+The pointer is a *tablet* and not a mouse, and that is a decision. A tablet reports
+where it is; a mouse reports how far it moved, and turning deltas into a position
+needs somewhere to keep the pointer — which is the compositor, so a mouse driver
+would be a second answer to where the pointer is.
+
+If this QEMU has a graphical UI driver and there is a session to open it in, the
+runner opens a **window**: the screen `displaysrv` owns, with a keyboard and a
+tablet that take what is typed and clicked into it, and the serial log still coming
+back to the terminal through `-serial mon:stdio`.
+
+Arch ships those UI drivers as separate packages, and a `qemu-system-aarch64`
+without them lists only `none` under `-display help`. Then there is no window, the
+scene reports `0 click(s), 0 key(s)` — and the runner says so before the boot rather
+than leaving that zero to be read as a broken input path. `pacman -S qemu-ui-gtk`
+is what gives it a window.
+
+Either way, `./scripts/input-check.sh` (the kernel-side path) and
+`./scripts/qml-check.sh` (all the way into a `MouseArea`) synthesise real device
+events over QMP and need no window at all.
 
 `cargo krun` output — everything below is from one run, unabridged:
 
@@ -165,7 +184,7 @@ framebuffer: ramfb 640x480 online (mirroring the console to the screen)
 syscall Yield -> 0; syscall 0xdead -> -6
 clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
 interrupt controller: GICv2 online
-clock: one tick interval (6250000 counter ticks) measured 100316 us against an expected 100000 us (agrees with the tick interval)
+clock: one tick interval (6250000 counter ticks) measured 100307 us against an expected 100000 us (agrees with the tick interval)
 smp: 1 core(s) online (PSCI v1.1)
 smp: 1 cores x 20000 locked increments = 20000 (expected 20000) — no increments lost
 smp: single core — no inter-processor interrupt to send
@@ -176,10 +195,8 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [fault]   backtrace (1 frames, x29 chain): 0x80000570
 [devicemgr] parsed the device tree in user space: PL011 @ 0x9000000 intid 33
 [devicemgr] delegated UART device+irq to the driver and a device to the server
-[devicemgr] found a virtio-input device at a003e00 intid 79 and delegated it to the input driver
-[devicemgr] no IOMMU on this machine; DMA capability stands but is unenforced
-[devicemgr] unpacked the initramfs in user space: 21 files, no storage driver
-[devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
+[devicemgr] found a tablet at a003c00 intid 78 and delegated it to the input driver
+[ipc] task 9 send blocked: ep7 ring full
 [displaysrv] the screen is mine: kernel output stopped, pixels are a process's now
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
 [fsclient] two endpoint capabilities and one page of my own memory - no archive, no device
@@ -195,24 +212,32 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [fault] task 25 killed: EL0 fault at 0x7ffedffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
 [fault]   backtrace (2 frames, x29 chain): 0x8000080c 0x80000804
 [child] hello - I was created at runtime, not by the kernel
-[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
 [client] monotonic clock: two ClockNow reads from EL0, the second strictly later - no capability needed
 [driver] user-space UART-RX driver waiting for input
-[inputsrv] virtio-input driver up in EL0: queue armed, waiting for the device
-[devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
-[devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
+
+
+[driver] newline received; user-space IRQ driver exiting
+[inputsrv] a tablet: absolute axes 0..32767 wide, reported as a fraction so the compositor keeps the screen size
+[inputsrv] a keyboard
+[inputsrv] virtio-input driver up in EL0: 2 device(s), queues armed, waiting
+[ipc] task 9 send resumed
+[devicemgr] found a keyboard at a003e00 intid 79 and delegated it to the input driver
+[devicemgr] no IOMMU on this machine; DMA capability stands but is unenforced
+[devicemgr] unpacked the initramfs in user space: 21 files, no storage driver
+[devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
 [fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
-[hello-c] clock: 234663408 ns across a 20 ms nanosleep
+[hello-c] clock: 262316528 ns across a 20 ms nanosleep
 [hello-cpp] a namespace-scope constructor ran before main
 [hello-cpp] a C++ program in EL0: vector, string, thread, and a static with a destructor
-[child] hello - I was created at runtime, not by the kernel
+[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 #server drove the UART, then revoked it for everyone
+[devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
+[devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
 [qt-hello] starting
 [child] hello - I was created at runtime, not by the kernel
 [client] read from shared memory: shared-memory works: written by the server, read by the client
 [client] read the marker from the SECOND page of a 2-page shared buffer
-[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
 [dyingclient] a 32x32 window on screen, the server watching me, and now I crash
 [fault] task 7 killed: EL0 fault at 0x0 (ec 0x24) — isolated, kernel continues
 [fault]   backtrace (2 frames, x29 chain): 0x80000cf0 0x80000cec
@@ -227,9 +252,11 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [fsclient] read 'greeting.txt' through fssrv in 2 chunks: hello from the initramfs
 [fsclient] 25 of 25 bytes in 2 reads, the second one from offset 6
 [client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block
+[child] hello - I was created at runtime, not by the kernel
 [client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
 [cap] task 0 denied MapMemory(handle 0): no such capability
 [client] kernel refused a syscall pointer into an unmapped page - it walks our tables, not a range
+[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
 [fbclient] asked the screen its size (640x480 xRGB8888), then had two 64x64 surfaces composited - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096
 [hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: hello from the initramfs
 [fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length
@@ -246,7 +273,7 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [shell] QGuiApplication constructed, platform=staros
 [qt-hello] window shown
 [qt-hello] entering the event loop
-[shell] scene 'qml/Main.qml' is 4840 bytes
+[shell] scene 'qml/Main.qml' is 7704 bytes
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
 [shell] threads: a QThread with an 8 MiB stack ran and joined, and took a QMutex the main thread was holding: yes
 [hello-c] listed 'docs': 1 file, 1 directory, over a flat archive
@@ -257,13 +284,13 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [qt-hello] quitting
 [qt-hello] exec returned 0
 [fssrv] served 233 requests, 688420 bytes of file data, and refused 11 - the archive never left this address space
-[shell] scene loaded, root is a Main_QMLTYPE_0 of 320x240
+[shell] scene loaded, root is a Main_QMLTYPE_0 of 320x300
 [displaysrv] a client died; its windows are off the screen
-[shell] view shown
+[shell] view shown and the keyboard claimed
 [shell] entering the event loop
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
-[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 21416144 ns
-[hello-c] endpoint in poll: a message from another process woke the loop in 1537968 ns
+[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 20838048 ns
+[hello-c] endpoint in poll: a message from another process woke the loop in 1208080 ns
 [hello-c] shared buffers: 16 KiB of surface, mapped at 0x500001000 and 0x500005000
 [hello-c] window: a 48x48 surface on a 640x480 screen, double buffered, from C through staros.h
 [hello-c] font: read 133796 bytes of IBM Plex Mono through fssrv, checksum 6016661948058288260
@@ -271,23 +298,23 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [hello-c] stdlib: qsort, bsearch, rand, strdup and the special functions this sysroot had only promised
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 248 requests, 275941 bytes of file data, and refused 11 - the archive never left this address space
-[shell] 56 frame(s) in 1222 ms
-[shell] the animated rectangle moved from x=26.9 to x=13.8
+[shell] 812 frame(s) in 14662 ms
+[shell] the animated rectangle moved from x=147.7 to x=153.8
+[shell] input: 0 click(s) reached a MouseArea, 0 key(s) reached the scene, the last was Qt key 0
 [shell] exec returned 0
 [displaysrv] composited client surfaces onto a screen no client can touch
-[displaysrv] 4 surface(s) live, 66 commit(s), 1146772 pixel(s) composited, 8 refused, 2 client(s) reaped, 0 key(s) routed, 0 dropped for want of focus
-[fssrv] served 371 requests, 693260 bytes of file data, and refused 23 - the archive never left this address space
-clock: the demo took 8021 ms on the monotonic clock, during which core 0 took 210 tick(s)
-sleep: 6 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 81 clock wake-up(s), worst overshoot 549877 us
-scheduler: all tasks finished after 210 timer ticks; task table grew to 42 (old fixed max 8)
-task teardown: reaped 38 dead-task kernel stacks (1216 KiB returned to the heap)
-user stacks: 64 page(s) mapped on demand (256 KiB), 1 mapped up front per task, limit 1024 KiB
-preemption: timer ticks per core — cpu0=210
+[displaysrv] 4 surface(s) live, 822 commit(s), 10502932 pixel(s) composited, 8 refused, 2 client(s) reaped, 0 input event(s) routed, 0 dropped for want of a window
+[fssrv] served 371 requests, 696124 bytes of file data, and refused 23 - the archive never left this address space
+clock: the demo took 22120 ms on the monotonic clock, during which core 0 took 1862 tick(s)
+sleep: 6 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 902 clock wake-up(s), worst overshoot 561286 us
+scheduler: all tasks finished after 1862 timer ticks; task table grew to 42 (old fixed max 8)
+task teardown: reaped 39 dead-task kernel stacks (1248 KiB returned to the heap)
+user stacks: 65 page(s) mapped on demand (260 KiB), 1 mapped up front per task, limit 1024 KiB
+preemption: timer ticks per core — cpu0=1862
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
-frame reclaim: post-teardown alloc 0x4844f000 (exited client's root was 0x48440000)
+frame reclaim: post-teardown alloc 0x48440000 (exited client's root was 0x48440000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
-  (4 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
-    task 2 (pid 2): blocked (waiting for a message)
+  (3 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
     task 6 (pid 6): blocked (waiting for a message), recv on ep22
     task 8 (pid 8): blocked (waiting for a message)
     task 11 (pid 11): blocked (waiting for a message)
@@ -298,7 +325,7 @@ shutting down (PSCI SYSTEM_OFF)
 
 Two layers, deliberately different in kind:
 
-- **`cargo ktest-host`** — 183 tests over the portable crates (`abi`, `hal`,
+- **`cargo ktest-host`** — 221 tests over the portable crates (`abi`, `hal`,
   `cpio`, `fdt`, `framebuffer`, `videocore`, `virtio`, `iommu`, `mm`, `ipc`,
   `staros-libc`, `init`), including `fdt` against real `.dtb` blobs, `cpio` against a
   real archive, `hal`'s tick↔nanosecond arithmetic against the frequencies real
@@ -307,11 +334,15 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **217 assertions, exit=0** on `--quick` (244 on the
+  failure signals. Currently **243 assertions, exit=0** on `--quick` (270 on the
   full matrix).
 - **`./scripts/input-check.sh`** — the only check that makes the *outside world*
-  act: QEMU synthesises a real key event, and the assertion is that a driver in EL0
-  decoded it, with no kernel code anywhere in the path.
+  act: QEMU synthesises a real key press and a real click, and the assertions are
+  that a driver in EL0 decoded them with no kernel code anywhere in the path, and
+  that each reached the right window by a *different* rule — the key by who claimed
+  the keyboard, the click by what was under the pointer. A compositor routing clicks
+  by focus passes every other check in this list and delivers every click to the
+  wrong window.
 - **`./scripts/fb-check.sh`** — the only check that cares what the screen *looks*
   like: it boots with `ramfb`, screendumps over QMP, and asserts named coordinates
   (the client's surface where it asked for it, the server's background around it,
@@ -325,6 +356,14 @@ Two layers, deliberately different in kind:
   phase's criterion, which was written as "`Rectangle { color: "red" }` is visible
   on the screen" and which no line of text can settle. Falsifying it is one line:
   freeze `ClockNow` and the scene never appears at all.
+
+  It is also the only check that performs an *experiment* rather than an
+  observation: having found the scene, it locates the orange button by colour,
+  synthesises a click at its centre on the emulated tablet, and reads the pixels
+  back to see it turn green. The target is found rather than written down, so the
+  compositor's hit test is under test at the same time — a server that routed by
+  anything other than where the surface actually is misses by exactly the window's
+  offset, and the button stays orange.
 - **`./scripts/gdb-check.sh`** — boots with QEMU's gdbstub, breaks inside an EL0
   program and asserts that gdb unwinds to *that program's* caller. It is the check
   for the debugger itself, which matters from here on: the code arriving in EL0 was
@@ -358,8 +397,15 @@ C++ runtime — is closed: the contract is **282 of 282 symbols**, measured by
 That number counts symbols the archive defines, not operations this system has:
 `fork` answers `ENOSYS` and writing to a file answers `EROFS`, each decision
 written down with its reason in
-[`docs/LIBC-CONTRACT.md`](docs/LIBC-CONTRACT.md). The next phase is the QPA
-plugin, where Qt's own linker gets to check the list.
+[`docs/LIBC-CONTRACT.md`](docs/LIBC-CONTRACT.md).
+
+Since then that roadmap's G6 and G7 have closed too: the QPA plugin links, a QML
+scene renders through Qt Quick's software adaptation onto the compositor's screen,
+and — as of G7.1 — a click on an emulated tablet reaches a `MouseArea` inside that
+scene while a keystroke reaches the same scene by the other route. Both are proved
+by pixels rather than by log lines: `./scripts/qml-check.sh` finds the button by its
+colour, clicks it, and reads back the colour it became. What is left in that roadmap
+is speed (G8) and the board (G9).
 
 Design rationale, the SMP/IPC/IOMMU write-ups, and an honest "not yet
 implemented" list live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
