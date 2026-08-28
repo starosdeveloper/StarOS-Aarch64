@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <QtCore/qelapsedtimer.h>
 #include <qpa/qplatformwindow.h>
 
 #include "qstarosscreen.h"
@@ -42,6 +43,25 @@ public:
 private:
     bool allocate(const QSize &size);
     void release();
+    void reportProfile() const;
+
+    // What one `present()` costs this side of the wire.
+    //
+    // Two numbers and not one, because they are two different things to fix. The
+    // round trip is the display server's compositing plus the kernel's IPC — the
+    // server prints its own half, and the difference is what the endpoints cost. The
+    // restore is this plugin's own memcpy, the price of double buffering with damage
+    // tracking, and it is the only part of a frame this file could make faster on
+    // its own.
+    struct Profile
+    {
+        qint64 frames = 0;
+        qint64 pixels = 0;
+        qint64 commitNs = 0;
+        qint64 restoreNs = 0;
+        qint64 worstCommitNs = 0;
+        qint64 worstRestoreNs = 0;
+    };
 
     QStarosScreen *m_screen;
     quint64 m_surface = 0;
@@ -50,4 +70,11 @@ private:
     int m_back = 0;
     QSize m_bufferSize;
     bool m_visible = false;
+    Profile m_profile;
+    // One timer for both stages: started once at the top of `present()` and read
+    // twice, rather than started and stopped around each. Every read is a
+    // `clock_gettime`, and on this system that is a syscall — three per frame is the
+    // fewest that can separate two stages, and a fourth would be measuring the
+    // measurement.
+    QElapsedTimer m_clock;
 };

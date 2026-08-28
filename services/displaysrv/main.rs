@@ -452,6 +452,71 @@ impl Rect {
     }
 }
 
+/// The clock, in nanoseconds, or `None` on a machine that has none.
+///
+/// `None` and not zero. A profile that silently reports zeroes on a board without a
+/// counter is a profile that says "compositing is free", which is the one answer
+/// nobody should ever believe.
+fn now_ns() -> Option<u64> {
+    // SAFETY: `ClockNow` takes no arguments and only reads the monotonic counter.
+    let now = unsafe { syscall1(SYS_CLOCK_NOW, 0) };
+    if now < 0 {
+        None
+    } else {
+        Some(now as u64)
+    }
+}
+
+/// How often a running profile prints, in commits. Frequent enough that a boot which
+/// never reaches the tally still shows the number, rare enough that the measurement
+/// does not become the load: one `DebugWrite` per 128 frames against a compositor
+/// that spends milliseconds in each of them.
+const PROFILE_EVERY: u32 = 128;
+
+/// Where the compositor's time goes.
+///
+/// One structure and not three counters scattered through the loop, because the
+/// interesting number is a *ratio* — nanoseconds per pixel — and a ratio computed
+/// from figures that were sampled at different moments is a number nobody can act
+/// on. Both halves are taken around the same call.
+///
+/// Only `Commit` is timed. `Raise` and `Destroy` composite too, and they are not
+/// frames: folding them in would inflate the pixel count with repaints nobody asked
+/// for and make the per-frame mean depend on how often windows moved.
+struct Profile {
+    /// Commits whose composite was actually measured. Not the commit count: on a
+    /// machine with no clock this stays zero while commits keep arriving, and that
+    /// difference is the honest way to say "not measured" rather than "instant".
+    frames: u64,
+    pixels: u64,
+    total_ns: u64,
+    /// The worst single composite, and how many pixels it wrote. Kept together for
+    /// the same reason the totals are: the worst frame's *cost per pixel* is the
+    /// question, and a worst time without its area cannot answer it.
+    worst_ns: u64,
+    worst_pixels: u64,
+    /// Commits that arrived while the clock was unreadable. Reported, because a
+    /// profile covering nine frames out of four hundred is not a profile.
+    unmeasured: u64,
+}
+
+impl Profile {
+    const fn new() -> Self {
+        Self { frames: 0, pixels: 0, total_ns: 0, worst_ns: 0, worst_pixels: 0, unmeasured: 0 }
+    }
+
+    /// Record one composite: `pixels` written in `ns`.
+    fn record(&mut self, pixels: usize, ns: u64) {
+        self.frames += 1;
+        self.pixels += pixels as u64;
+        self.total_ns += ns;
+        if ns > self.worst_ns {
+            self.worst_ns = ns;
+            self.worst_pixels = pixels as u64;
+        }
+    }
+}
+
 /// Every surface, bottom of the stack first.
 ///
 /// One array in stacking order rather than an array plus an order list: the order
@@ -652,6 +717,10 @@ extern "C" fn main() -> ! {
     let mut goodbyes = 0;
     let mut commits = 0u32;
     let mut pixels_drawn = 0usize;
+    // Where the time goes. See `Profile`; printed every `PROFILE_EVERY` commits and
+    // once more with the tally, so a boot that never reaches the tally — which is
+    // every boot with a client still drawing — still says the number out loud.
+    let mut profile = Profile::new();
     // Refusals are counted for the report and **not** as a reason to stop.
     //
     // They used to bound the loop, from a version where a malformed message was
@@ -777,7 +846,7 @@ extern "C" fn main() -> ! {
 
         let outcome = match msg.tag {
             TAG_CREATE => create(&mut compositor, client, &msg),
-            TAG_COMMIT => commit(&mut compositor, &mut screen, client, &msg),
+            TAG_COMMIT => commit(&mut compositor, &mut screen, client, &msg, &mut profile),
             TAG_RAISE => raise(&mut compositor, &mut screen, client, &msg),
             TAG_DESTROY => destroy(&mut compositor, &mut screen, client, &msg),
             TAG_WATCH => watch(&mut watches, client, arrivals, &msg),
@@ -791,6 +860,9 @@ extern "C" fn main() -> ! {
             Ok(result) => {
                 if msg.tag == TAG_COMMIT {
                     commits += 1;
+                    if commits % PROFILE_EVERY == 0 {
+                        report_profile(&profile);
+                    }
                 }
                 pixels_drawn += match msg.tag {
                     TAG_CREATE | TAG_WATCH | TAG_FOCUS => 0,
@@ -807,6 +879,7 @@ extern "C" fn main() -> ! {
 
     puts("[displaysrv] composited client surfaces onto a screen no client can touch\n");
     report(compositor.count, commits, pixels_drawn, rejected, reaped, routed, dropped);
+    report_profile(&profile);
 
     // The tally is printed and this server does **not** exit.
     //
@@ -900,11 +973,19 @@ fn accept_buffer(cap: u32, width: usize, height: usize) -> Result<*const u32, u6
 }
 
 /// `Commit`: recomposite the rectangle the client says changed.
+///
+/// This is the one request that is timed, because this is the one that is a frame.
+/// The clock is read *around the composite alone* — not around the whole request —
+/// so what the number describes is pixels, not the IPC that carried them. The other
+/// side of that boundary is measured in the plugin, where a `commit()` round trip is
+/// timed from the client: the difference between the two is what the kernel and the
+/// endpoints cost, and neither figure could be worked out from the other.
 fn commit(
     compositor: &mut Compositor,
     screen: &mut Screen,
     owner: usize,
     msg: &Message,
+    profile: &mut Profile,
 ) -> Result<u64, u64> {
     let index = compositor.index_of(owner, msg.words[0]).ok_or(ERR_NO_SURFACE)?;
     // A buffer with the commit means the client has been drawing somewhere else and
@@ -930,7 +1011,16 @@ fn commit(
         w: dw.min(surface.width - dx),
         h: dh.min(surface.height - dy),
     };
-    Ok(compositor.composite(screen, rect) as u64)
+    let start = now_ns();
+    let painted = compositor.composite(screen, rect);
+    match (start, now_ns()) {
+        // Saturating, not wrapping: a monotonic clock that went backwards is a
+        // kernel bug, and recording a huge worst-frame from it would hide the real
+        // one for the rest of the run.
+        (Some(a), Some(b)) => profile.record(painted, b.saturating_sub(a)),
+        _ => profile.unmeasured += 1,
+    }
+    Ok(painted as u64)
 }
 
 /// `Raise`: move a surface to the top and repaint the area it covers, so the new
@@ -1436,34 +1526,107 @@ fn report(
     // will not fit, so the report simply ended mid-word. The smoke matrix caught it
     // because it asserts the whole line; a person reading the console would have
     // seen a tally that looked complete.
-    let mut line = [0u8; 256];
-    let mut n = 0;
-    let put = |bytes: &[u8], line: &mut [u8; 256], n: &mut usize| {
+    let mut line = Line::new();
+    line.put(b"[displaysrv] ");
+    line.num(surfaces as u64);
+    line.put(b" surface(s) live, ");
+    line.num(u64::from(commits));
+    line.put(b" commit(s), ");
+    line.num(pixels as u64);
+    line.put(b" pixel(s) composited, ");
+    line.num(u64::from(rejected));
+    line.put(b" refused, ");
+    line.num(u64::from(reaped));
+    line.put(b" client(s) reaped, ");
+    line.num(u64::from(routed));
+    line.put(b" input event(s) routed, ");
+    line.num(u64::from(dropped));
+    line.put(b" dropped for want of a window\n");
+    line.flush();
+}
+
+/// Where the time went, in one line: the measurement phase G8 starts from.
+///
+/// Microseconds for the totals and nanoseconds for the per-pixel figure, because
+/// those are the magnitudes the numbers actually have — a per-pixel cost printed in
+/// microseconds is a column of zeroes, and a frame time printed in nanoseconds is a
+/// number nobody can read at a glance.
+///
+/// The means are integer division and are labelled as means. Rounding down loses at
+/// most a nanosecond per pixel against costs in the hundreds, and a fixed-point
+/// formatter in a service with no allocator would be more code than the thing being
+/// measured.
+fn report_profile(profile: &Profile) {
+    let mut line = Line::new();
+    line.put(b"[displaysrv] composite: ");
+    line.num(profile.frames);
+    line.put(b" frame(s), ");
+    line.num(profile.pixels);
+    line.put(b" px in ");
+    line.num(profile.total_ns / 1_000);
+    line.put(b" us");
+    if profile.frames > 0 {
+        line.put(b" - ");
+        line.num(profile.total_ns / profile.frames / 1_000);
+        line.put(b" us/frame, ");
+        line.num(profile.pixels / profile.frames);
+        line.put(b" px/frame");
+    }
+    if profile.pixels > 0 {
+        line.put(b", ");
+        line.num(profile.total_ns / profile.pixels);
+        line.put(b" ns/px");
+    }
+    line.put(b", worst ");
+    line.num(profile.worst_ns / 1_000);
+    line.put(b" us for ");
+    line.num(profile.worst_pixels);
+    line.put(b" px");
+    if profile.unmeasured > 0 {
+        line.put(b", ");
+        line.num(profile.unmeasured);
+        line.put(b" unmeasured (no clock)");
+    }
+    line.put(b"\n");
+    line.flush();
+}
+
+/// A line being built for `DebugWrite`, bounded and self-truncating.
+///
+/// It exists because there were two of these buffers within twenty lines of each
+/// other, each with its own `put` closure, and the first one had already ended
+/// mid-word once when the wording outgrew it. Truncation is still what happens on
+/// overflow — a diagnostic that panics is worse than a diagnostic that is short —
+/// but now there is one place where the length lives.
+struct Line {
+    buf: [u8; 256],
+    n: usize,
+}
+
+impl Line {
+    const fn new() -> Self {
+        Self { buf: [0; 256], n: 0 }
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            if *n < line.len() {
-                line[*n] = b;
-                *n += 1;
+            if self.n < self.buf.len() {
+                self.buf[self.n] = b;
+                self.n += 1;
             }
         }
-    };
-    put(b"[displaysrv] ", &mut line, &mut n);
-    n += number(surfaces as u64, &mut line[n..]);
-    put(b" surface(s) live, ", &mut line, &mut n);
-    n += number(u64::from(commits), &mut line[n..]);
-    put(b" commit(s), ", &mut line, &mut n);
-    n += number(pixels as u64, &mut line[n..]);
-    put(b" pixel(s) composited, ", &mut line, &mut n);
-    n += number(u64::from(rejected), &mut line[n..]);
-    put(b" refused, ", &mut line, &mut n);
-    n += number(u64::from(reaped), &mut line[n..]);
-    put(b" client(s) reaped, ", &mut line, &mut n);
-    n += number(u64::from(routed), &mut line[n..]);
-    put(b" input event(s) routed, ", &mut line, &mut n);
-    n += number(u64::from(dropped), &mut line[n..]);
-    put(b" dropped for want of a window\n", &mut line, &mut n);
-    // SAFETY: `DebugWrite` reads `n` bytes from a buffer we own.
-    unsafe {
-        let _ = syscall2(SYS_DEBUG_WRITE, line.as_ptr() as u64, n as u64);
+    }
+
+    fn num(&mut self, value: u64) {
+        self.n += number(value, &mut self.buf[self.n..]);
+    }
+
+    fn flush(&mut self) {
+        // SAFETY: `DebugWrite` reads `n` bytes from a buffer we own.
+        unsafe {
+            let _ = syscall2(SYS_DEBUG_WRITE, self.buf.as_ptr() as u64, self.n as u64);
+        }
+        self.n = 0;
     }
 }
 

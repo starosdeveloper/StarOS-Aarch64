@@ -3,6 +3,8 @@
 #include <QtGui/qwindow.h>
 #include <qpa/qwindowsysteminterface.h>
 
+#include <cstdio>
+
 QStarosWindow::QStarosWindow(QWindow *window, QStarosScreen *screen)
     : QPlatformWindow(window), m_screen(screen)
 {
@@ -16,6 +18,7 @@ QStarosWindow::QStarosWindow(QWindow *window, QStarosScreen *screen)
 
 QStarosWindow::~QStarosWindow()
 {
+    reportProfile();
     release();
 }
 
@@ -113,11 +116,15 @@ void QStarosWindow::present(const QRegion &region)
     if (damage.isEmpty())
         return;
 
+    m_clock.start();
+
     // Hand over the buffer just painted and make the other one current. The server
     // swaps it in before compositing, so what is on screen is never the buffer Qt
     // is about to draw into next.
     m_screen->connection()->commit(m_surface, damage, m_caps[m_back]);
     m_back = 1 - m_back;
+
+    const qint64 committed = m_clock.nsecsElapsed();
 
     // The new back buffer holds the frame before last. Qt's backing store repaints
     // only the damaged region, so everything outside it has to already be there —
@@ -131,4 +138,37 @@ void QStarosWindow::present(const QRegion &region)
         memcpy(to + y * stride + damage.left() * 4, from + y * stride + damage.left() * 4,
                size_t(damage.width()) * 4);
     }
+
+    const qint64 restored = m_clock.nsecsElapsed() - committed;
+    m_profile.frames++;
+    m_profile.pixels += qint64(damage.width()) * qint64(damage.height());
+    m_profile.commitNs += committed;
+    m_profile.restoreNs += restored;
+    m_profile.worstCommitNs = qMax(m_profile.worstCommitNs, committed);
+    m_profile.worstRestoreNs = qMax(m_profile.worstRestoreNs, restored);
+}
+
+void QStarosWindow::reportProfile() const
+{
+    if (m_profile.frames == 0)
+        return;
+    // Printed when the window goes away rather than every frame. A line per frame
+    // would go out over the same UART the compositor reports on, at a cost per
+    // character that is a substantial fraction of a frame here — the profile would
+    // then be dominated by the printing of the profile.
+    //
+    // The pixel count is the damage rectangle Qt asked for, which is what makes the
+    // per-pixel figure comparable with the display server's: both sides are counting
+    // the same rectangle, from opposite ends of the wire.
+    std::printf("[qstaros] present: %lld frame(s), %lld px - commit %lld us/frame "
+                "(worst %lld us), restore %lld us/frame (worst %lld us), %lld ns/px committed\n",
+                static_cast<long long>(m_profile.frames),
+                static_cast<long long>(m_profile.pixels),
+                static_cast<long long>(m_profile.commitNs / m_profile.frames / 1000),
+                static_cast<long long>(m_profile.worstCommitNs / 1000),
+                static_cast<long long>(m_profile.restoreNs / m_profile.frames / 1000),
+                static_cast<long long>(m_profile.worstRestoreNs / 1000),
+                static_cast<long long>(m_profile.pixels > 0 ? m_profile.commitNs / m_profile.pixels
+                                                            : 0));
+    std::fflush(stdout);
 }

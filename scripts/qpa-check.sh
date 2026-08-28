@@ -42,8 +42,54 @@ CXX_TGT="$(ls -d /usr/include/c++/*/x86_64*/ /usr/include/c++/*/aarch64*/ 2>/dev
 
 echo "  Qt $QT_VER, libstdc++ from $CXX_INC"
 
+# The meta-object compiler, and why this script has to run it.
+#
+# `main.cpp` ends with `#include "main.moc"` — the file `moc` generates from its own
+# `Q_OBJECT`. Without it the translation unit does not exist at all, and this script
+# quietly checked seven files out of eight while reporting on the plugin as a whole.
+# That is the failure mode a compile check is supposed to prevent, not have.
+#
+# The generated sources are checked too, not just used. `moc_qstarosinput.cpp` is a
+# real translation unit in the CMake build, it is written by a tool whose version is
+# whatever the host has, and it is the one file in the plugin nobody reads before it
+# fails. Generating into a temporary directory rather than the tree keeps the build's
+# own artefacts out of a check that must not depend on a previous build.
+MOC="$(command -v moc || true)"
+[ -x "$MOC" ] || MOC="$(ls /usr/lib/qt6/moc /usr/lib64/qt6/moc 2>/dev/null | head -1)"
+[ -x "$MOC" ] || { echo "qpa-check: no moc — skipping"; exit 0; }
+
+MOC_DIR="$(mktemp -d /tmp/qpa-moc-XXXXXX)"
+trap 'rm -rf "$MOC_DIR"' EXIT
+
+# moc runs its own preprocessor, so it needs the Qt include path as well as the
+# plugin's: `Q_PLUGIN_METADATA(IID QPlatformIntegrationFactoryInterface_iid ...)`
+# names a macro that lives in `qpa/qplatformintegrationplugin.h`, and moc that cannot
+# expand it stops at `Parse error at "IID"`. The plugin directory is what lets it
+# find `staros.json`; a missing metadata file is an error there too, and a plugin
+# built without its metadata loads nowhere.
+MOC_INC=(
+    -I "$PLUGIN"
+    -I "$QT_INC"
+    -I "$QT_INC/QtCore" -I "$QT_INC/QtCore/$QT_VER" -I "$QT_INC/QtCore/$QT_VER/QtCore"
+    -I "$QT_INC/QtGui" -I "$QT_INC/QtGui/$QT_VER" -I "$QT_INC/QtGui/$QT_VER/QtGui"
+)
+if ! "$MOC" "${MOC_INC[@]}""$PLUGIN/main.cpp" -o "$MOC_DIR/main.moc" 2>"$MOC_DIR/err"; then
+    echo "  ✗ moc main.cpp"
+    sed 's/^/      /' "$MOC_DIR/err"
+    echo "qpa-check: FAIL — moc did not run"
+    exit 1
+fi
+if ! "$MOC" "${MOC_INC[@]}""$PLUGIN/qstarosinput.h" -o "$MOC_DIR/moc_qstarosinput.cpp" \
+        2>"$MOC_DIR/err"; then
+    echo "  ✗ moc qstarosinput.h"
+    sed 's/^/      /' "$MOC_DIR/err"
+    echo "qpa-check: FAIL — moc did not run"
+    exit 1
+fi
+echo "  moc: main.moc, moc_qstarosinput.cpp"
+
 fail=0
-for src in "$PLUGIN"/*.cpp; do
+for src in "$PLUGIN"/*.cpp "$MOC_DIR"/moc_qstarosinput.cpp; do
     out="$(clang++ --target=aarch64-unknown-none -nostdlibinc -std=c++17 \
         -fno-exceptions -fno-rtti -fno-omit-frame-pointer -fno-stack-protector -fno-pie \
         -D__linux__=1 -D__unix__=1 -DQT_NO_OPENGL=1 -DQT_NO_EXCEPTIONS=1 \
@@ -54,7 +100,7 @@ for src in "$PLUGIN"/*.cpp; do
         -isystem "$QT_INC/QtCore/$QT_VER/QtCore" \
         -isystem "$QT_INC/QtGui" -isystem "$QT_INC/QtGui/$QT_VER" \
         -isystem "$QT_INC/QtGui/$QT_VER/QtGui" \
-        -I "$PLUGIN" -I "$PLUGIN/mkspec" \
+        -I "$PLUGIN" -I "$PLUGIN/mkspec" -I "$MOC_DIR" \
         -fsyntax-only "$src" 2>&1)"
     if [ -n "$out" ]; then
         echo "  ✗ $(basename "$src")"
@@ -75,8 +121,7 @@ done
 # to find a missing header — QV4 pulled in <cwctype>, which named nineteen
 # functions nobody had written, and libstdc++'s locale machinery reached past
 # ctype.h for glibc's classification table.
-QML_PROBE="$(mktemp /tmp/qpa-qml-XXXXXX.cpp)"
-trap 'rm -f "$QML_PROBE"' EXIT
+QML_PROBE="$MOC_DIR/qml-probe.cpp"
 cat >"$QML_PROBE" <<'PROBE'
 #include <QtGui/qguiapplication.h>
 #include <QtQml/qqmlengine.h>

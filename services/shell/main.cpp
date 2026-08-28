@@ -181,7 +181,59 @@ int main(int argc, char **argv)
     // never flushed.
     int frames = 0;
     QElapsedTimer since;
-    QObject::connect(&view, &QQuickWindow::frameSwapped, &app, [&frames] { ++frames; });
+
+    // Where a frame's time goes, split by the three things a frame is.
+    //
+    // The software render loop does them in one call, in this order, and emits a
+    // signal at each boundary — so the split costs nothing but a clock read and is
+    // not a guess about what Qt is doing:
+    //
+    //   beforeFrameBegin -> afterSynchronizing   the scene graph catching up with
+    //                                            the QML property values animation
+    //                                            has just changed
+    //   afterSynchronizing -> afterRendering     QPainter rasterising that graph
+    //                                            into the shared buffer
+    //   afterRendering -> frameSwapped           the backing store's flush: the
+    //                                            plugin's `present()`, the commit
+    //                                            round trip, and the display
+    //                                            server compositing inside it
+    //
+    // Three stages and not one number, because they have nothing in common. The
+    // first is the JavaScript interpreter and the binding graph, the second is
+    // software rasterisation, the third is IPC and somebody else's memcpy — and
+    // "the frame took 8 ms" tells you which to work on only by accident.
+    struct Stages
+    {
+        qint64 sync = 0;
+        qint64 raster = 0;
+        qint64 present = 0;
+        qint64 worst = 0;
+        qint64 counted = 0;
+    } stages;
+    QElapsedTimer frame;
+    qint64 synced = 0;
+    qint64 rendered = 0;
+    QObject::connect(&view, &QQuickWindow::beforeFrameBegin, &app, [&] { frame.start(); });
+    QObject::connect(&view, &QQuickWindow::afterSynchronizing, &app,
+                     [&] { synced = frame.nsecsElapsed(); });
+    QObject::connect(&view, &QQuickWindow::afterRendering, &app,
+                     [&] { rendered = frame.nsecsElapsed(); });
+    QObject::connect(&view, &QQuickWindow::frameSwapped, &app, [&] {
+        ++frames;
+        // A frame that never synchronised is a frame this timer knows nothing about
+        // — the loop can swap without a full pass — and folding a zero into the
+        // means would report a rendering stage that got faster the more often it was
+        // skipped.
+        if (!frame.isValid() || synced == 0 || rendered == 0)
+            return;
+        const qint64 swapped = frame.nsecsElapsed();
+        stages.sync += synced;
+        stages.raster += rendered - synced;
+        stages.present += swapped - rendered;
+        stages.worst = qMax(stages.worst, swapped);
+        stages.counted++;
+        synced = rendered = 0;
+    });
 
     view.setSource(QUrl::fromLocalFile(QLatin1String(SCENE_PATH)));
 
@@ -250,6 +302,19 @@ int main(int argc, char **argv)
         const qint64 elapsed = since.elapsed();
         const double lastX = runner->property("x").toDouble();
         std::printf("[shell] %d frame(s) in %lld ms\n", frames, elapsed);
+        if (stages.counted > 0) {
+            const qint64 n = stages.counted;
+            std::printf("[shell] frame profile over %lld frame(s): sync %lld us, "
+                        "raster %lld us, present %lld us per frame; worst frame %lld us\n",
+                        static_cast<long long>(n),
+                        static_cast<long long>(stages.sync / n / 1000),
+                        static_cast<long long>(stages.raster / n / 1000),
+                        static_cast<long long>(stages.present / n / 1000),
+                        static_cast<long long>(stages.worst / 1000));
+        } else {
+            std::printf("[shell] frame profile: no frame carried all three stages; "
+                        "nothing measured\n");
+        }
         std::printf("[shell] the animated rectangle moved from x=%.1f to x=%.1f\n",
                     firstX, lastX);
         // What arrived from the outside world. Printed as counts because the colour
