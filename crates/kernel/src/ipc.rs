@@ -19,7 +19,8 @@
 //! syscalls (see [`crate::syscall`]) adapt the user ABI onto these two functions.
 
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use staros_abi::error::KError;
 use staros_arch_aarch64::boot;
@@ -43,41 +44,77 @@ use crate::sync::SpinLock;
 /// other's answer, and the symptom is a program that acts on a reply to a question
 /// it never asked.
 ///
-/// The ids are a *shared numbering* between this table and whoever creates the
-/// objects in `main`, which is exactly the kind of seam that bites: giving the
-/// display endpoint id 4 put its traffic into [`STORM_EP`], and the display server
-/// spent its life rejecting storm messages it had no business seeing.
-/// Thirty-three, and the number moves whenever `main` mints another pair.
+/// Ids used to be a *shared numbering* between this table and whoever minted the
+/// objects in `main`, and that seam bit twice.
 ///
-/// It was thirty-one when the QML program was given a file server of its own, whose
-/// pair is ids 31 and 32. Nothing refused the ids: `obj::create` made the objects,
-/// the capabilities were installed, the server started, printed the line about the
-/// archive being its own — and then `Recv` returned `InvalidArgument` on an endpoint
-/// that had no slot in this table. The console said `[fssrv] receive failed`, which
-/// names neither the endpoint nor the id nor this constant.
+/// Once by collision: giving the display endpoint id 4 put its traffic into the
+/// contention test's endpoint, and the display server spent its life rejecting
+/// storm messages it had no business seeing. Once by overrun: when the QML program
+/// was given a file server of its own, its pair landed past the end of a
+/// fixed-size table. Nothing refused the ids — `obj::create` made the objects, the
+/// capabilities were installed, the server started and announced itself — and then
+/// `Recv` returned `InvalidArgument` on an endpoint with no slot. The console said
+/// `[fssrv] receive failed`, naming neither the endpoint, nor the id, nor the
+/// constant that was too small.
 ///
-/// [`endpoint_exists`] is what closes that gap, and this comment is why it exists.
-const NUM_ENDPOINTS: usize = 33;
-
-/// Whether `id` names a slot in this table.
+/// Both are gone because **nobody picks a number any more**. [`allocate`] hands one
+/// out, the table grows to fit, and a caller cannot name an endpoint that does not
+/// exist or one that belongs to somebody else. The comment above is kept because
+/// the two failures are the reason this is not a fixed array.
+/// Whether `id` names a live endpoint.
 ///
-/// The ids are a shared numbering between this file and `main`, and the seam is
-/// exactly where a mismatch is invisible: an endpoint object with an id past the end
-/// is a perfectly good object that no send or receive can ever use. `obj::create`
-/// asks this before making one, so the failure lands on the line in `main` that
-/// wrote the number.
+/// Still checked, and not only for tidiness: an endpoint object outlives the slot
+/// numbering only if something hands `Object::Endpoint` an id it did not get from
+/// [`allocate`], and this is where that would be caught rather than at a `Recv` in
+/// a service that has no idea what an id is.
 #[must_use]
-pub const fn endpoint_exists(id: usize) -> bool {
-    id < NUM_ENDPOINTS
+pub fn endpoint_exists(id: usize) -> bool {
+    IPC.lock().get(id).is_some_and(|e| e.allocated)
 }
 
-/// The endpoint the IPC contention test uses (see [`storm_stats`]).
+/// Take a free endpoint slot and return its id, growing the table if needed.
+///
+/// This is the whole of the fix: an id comes from here or it does not exist. Slots
+/// are reused once freed, and the table only ever grows to the high-water mark of
+/// endpoints alive at once.
+pub fn allocate() -> Option<usize> {
+    let mut table = IPC.lock();
+    if let Some(id) = table.iter().position(|e| !e.allocated) {
+        table[id] = Endpoint::new();
+        table[id].allocated = true;
+        return Some(id);
+    }
+    if table.try_reserve(1).is_err() {
+        return None;
+    }
+    let mut endpoint = Endpoint::new();
+    endpoint.allocated = true;
+    table.push(endpoint);
+    Some(table.len() - 1)
+}
+
+/// Which endpoint the IPC contention test uses (see [`storm_stats`]), once it has
+/// been allocated one.
 ///
 /// Two things are special about it, both for the same reason — it is hammered
 /// hundreds of times by several tasks at once, where the others carry a handful of
 /// messages each. It does not log blocked sends (that would bury the console), and
 /// it is the only endpoint whose traffic is counted per core.
-pub const STORM_EP: usize = 4;
+///
+/// A variable rather than a constant now, because the id is whatever [`allocate`]
+/// gave: hard-coding it here is exactly the shared numbering this file no longer
+/// has. `usize::MAX` means "no storm endpoint", which no allocated id can be.
+static STORM_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Name `id` as the contention test's endpoint. Called once, by whoever creates it.
+pub fn set_storm_endpoint(id: usize) {
+    STORM_EP.store(id, Ordering::Relaxed);
+}
+
+/// Whether `ep` is the contention test's endpoint.
+fn is_storm(ep: usize) -> bool {
+    STORM_EP.load(Ordering::Relaxed) == ep
+}
 /// Capacity of an endpoint's pending-message ring. Deliberately tiny so the
 /// blocking-send path is exercised (the demo client sends three requests into a
 /// two-slot ring) rather than hidden behind a large buffer.
@@ -109,6 +146,10 @@ impl KMessage {
 /// A rendezvous point: a bounded message ring plus queues of blocked receivers
 /// and blocked senders (the latter carrying the message they could not deposit).
 struct Endpoint {
+    /// Whether this slot has been handed out by [`allocate`]. A slot that has not
+    /// is not an endpoint with no messages — it is not an endpoint, and a send to it
+    /// must fail rather than sit in a ring nobody will ever read.
+    allocated: bool,
     ring: [KMessage; RING_CAP],
     head: usize,
     len: usize,
@@ -124,6 +165,7 @@ struct Endpoint {
 impl Endpoint {
     const fn new() -> Self {
         Self {
+            allocated: false,
             ring: [KMessage::empty(); RING_CAP],
             head: 0,
             len: 0,
@@ -203,8 +245,10 @@ impl Endpoint {
 /// held across `block_current` would leave the lock owned by a task that is no
 /// longer running, and the next core to want an endpoint would wait for it
 /// forever.
-static IPC: SpinLock<[Endpoint; NUM_ENDPOINTS]> =
-    SpinLock::new([const { Endpoint::new() }; NUM_ENDPOINTS]);
+/// It grows on demand rather than being a fixed array, for the same reason the
+/// object table does: how many endpoints a system needs is a property of what runs
+/// on it, and a table sized here would refuse the first thing that needed one more.
+static IPC: SpinLock<Vec<Endpoint>> = SpinLock::new(Vec::new());
 
 /// Sends and receives on [`STORM_EP`], counted by the core that executed them.
 ///
@@ -260,11 +304,11 @@ pub fn send_nowait(ep: usize, km: KMessage) -> isize {
 }
 
 fn send_inner(ep: usize, km: KMessage, may_block: bool) -> isize {
-    if ep >= NUM_ENDPOINTS {
+    if !endpoint_exists(ep) {
         return KError::InvalidArgument.as_raw();
     }
     let me = sched::current_id();
-    if ep == STORM_EP {
+    if is_storm(ep) {
         // Count on the core that is *entering* the send: after a blocking send the
         // task may resume elsewhere, and the question this answers is which core
         // ran the operation, not which one finished it.
@@ -324,11 +368,11 @@ fn send_inner(ep: usize, km: KMessage, may_block: bool) -> isize {
             // The storm endpoint blocks hundreds of times by design; logging each
             // one would drown every other line in the boot output. Its evidence is
             // the per-core tally, not a narrative.
-            if ep != STORM_EP {
+            if !is_storm(ep) {
                 log(format_args!("[ipc] task {me} send blocked: ep{ep} ring full"));
             }
             sched::block_current();
-            if ep != STORM_EP {
+            if !is_storm(ep) {
                 log(format_args!("[ipc] task {me} send resumed"));
             }
             0
@@ -345,11 +389,11 @@ fn send_inner(ep: usize, km: KMessage, may_block: bool) -> isize {
 /// arrives. Draining a slot wakes a blocked sender (moving its message into the
 /// freed slot). Returns the [`KMessage`] or a negative [`KError`].
 pub fn recv(ep: usize) -> Result<KMessage, KError> {
-    if ep >= NUM_ENDPOINTS {
+    if !endpoint_exists(ep) {
         return Err(KError::InvalidArgument);
     }
     let me = sched::current_id();
-    if ep == STORM_EP {
+    if is_storm(ep) {
         count(&STORM_RECVS);
     }
 

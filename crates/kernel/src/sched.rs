@@ -1464,7 +1464,7 @@ pub fn map_device_current(obj: crate::obj::ObjectRef, dev_phys: u64) -> isize {
 /// Map the shared buffer (`pages` frames at `phys`) into the *current* task's
 /// address space and return the resulting user virtual address (or a negative
 /// [`KError`] if the caller is not a user task). Backs the `MapShared` syscall.
-pub fn map_shared_current(obj: crate::obj::ObjectRef, phys: u64, pages: u32) -> isize {
+pub fn map_shared_current(obj: crate::obj::ObjectRef, shm_id: usize, pages: u32) -> isize {
     // Decide the address under the lock, map outside it: the walk may allocate a
     // table frame, and the frame pool must never be entered holding this lock.
     let (space, base, already) = {
@@ -1486,10 +1486,20 @@ pub fn map_shared_current(obj: crate::obj::ObjectRef, phys: u64, pages: u32) -> 
     }
     match space {
         Some(s) => {
-            // SAFETY: at EL1 with the task's tables reachable through the linear
-            // map; the frames belong to a shared object the kernel allocated. The
-            // walk may need a frame for a missing table.
-            let va = crate::mem::with(|frames| unsafe { s.map_shared(frames, base, phys, pages) });
+            // The run is read under `shm`'s lock and mapped inside that borrow. The
+            // mapping takes the frame pool, which is a different lock and always
+            // taken second — every other path that holds both does the same, and the
+            // one that did not would be found by a machine that stops rather than by
+            // a test.
+            let va = crate::shm::with_frames(shm_id, |run| {
+                crate::mem::with(|frames| {
+                    // SAFETY: at EL1 with the task's tables reachable through the
+                    // linear map; the frames belong to a shared object the kernel
+                    // allocated. The walk may need a frame for a missing table.
+                    unsafe { s.map_shared(frames, base, run) }
+                })
+            })
+            .flatten();
             va.map_or(KError::OutOfResources.as_raw(), |v| v as isize)
         }
         None => KError::InvalidArgument.as_raw(),

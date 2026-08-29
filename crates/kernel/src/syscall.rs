@@ -485,8 +485,8 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // same physical page.
         Some(Syscall::MapShared) => match sched::resolve_cap(req.args[0] as u32) {
             Some(Cap::Shared { obj }) => match obj::get(obj) {
-                Some(Object::SharedMemory { phys, pages }) => {
-                    sched::map_shared_current(obj, phys, pages)
+                Some(Object::SharedMemory { id, pages }) => {
+                    sched::map_shared_current(obj, id, pages)
                 }
                 _ => KError::BadHandle.as_raw(),
             },
@@ -597,14 +597,13 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
 /// or an error if the request is out of range or memory is exhausted (unwinding
 /// whatever it already took so nothing leaks).
 ///
-/// The run is physically contiguous, like a DMA buffer and unlike anonymous
-/// memory — but for a different reason. Nothing here has to be contiguous for the
-/// *hardware*; it has to be contiguous because a shared object is described by one
-/// `(phys, pages)` pair and mapped into each holder from that description. A
-/// scattered buffer would need the object to carry a frame list, which is a
-/// bigger change than this pays for. The visible consequence is the ceiling below:
-/// contiguous allocation rounds up to a power of two, so a large request can fail
-/// on merely fragmented memory.
+/// The frames need **not** be physically contiguous, and taking them one at a time
+/// is the point. They used to be one run, because the object was one `(phys, pages)`
+/// pair — and contiguous allocation comes out of a buddy tree, so a pool with sixty
+/// megabytes free in scattered pieces refused eight. Nothing about two processes
+/// reading the same pages through their own tables needs contiguity; only DMA does,
+/// where a device walks physical addresses with no tables of its own. The frame list
+/// now lives in [`crate::shm`].
 fn create_shared(pages: usize) -> isize {
     /// One 1080p frame of xRGB8888, which is what a full-screen backing store is.
     ///
@@ -614,41 +613,32 @@ fn create_shared(pages: usize) -> isize {
     /// window sized to the screen would have met `InvalidArgument` and had no idea
     /// why, because the number was wrong rather than the request.
     ///
-    /// The real constraint is not the size, it is that these frames are
-    /// **physically contiguous** — `Object::SharedMemory` holds one address — so a
-    /// pool with 60 MiB free in scattered pieces can still refuse 8 MiB. Nothing
-    /// here needs contiguity; only DMA does. Until that changes, a full-screen
-    /// buffer is a request that can fail for reasons the caller cannot see, and the
-    /// honest answer is `OutOfResources` rather than a smaller buffer it did not
-    /// ask for.
+    /// The ceiling is now about size alone. It used to be about *shape*: because the
+    /// frames had to be one contiguous run, a full-screen buffer was a request that
+    /// could fail for a reason the caller could not see, on a machine that plainly
+    /// had the memory. That is fixed rather than documented — see [`crate::shm`].
     const MAX_SHARED_PAGES: usize = 2048;
     // Zero is a caller's arithmetic going wrong, not a request for nothing.
     if pages == 0 || pages > MAX_SHARED_PAGES {
         return KError::InvalidArgument.as_raw();
     }
-    let Some(phys) = crate::mem::with(|f| f.alloc_pages(pages)) else {
+    // Frames one at a time, zeroed as they are taken: memory handed to two tasks
+    // must start clean rather than carrying what a previous owner left, and every
+    // page matters, not just the first — the page nothing routinely reads is exactly
+    // where a stale secret survives.
+    let Some(id) = crate::shm::create(pages) else {
         return KError::OutOfResources.as_raw();
     };
-    // Memory handed to two tasks must start clean, not carrying whatever a
-    // previous owner left in the frames. Every page, not just the first: the
-    // second page of a buffer is exactly where a stale secret would survive
-    // unnoticed, because nothing routinely reads it.
-    // SAFETY: the run is in the kernel's linear map and uniquely ours until we
-    // publish it; zeroing `pages` pages at its linear-map address is sound.
-    unsafe {
-        let va = staros_arch_aarch64::mmu::phys_to_virt(phys.0 as u64) as *mut u8;
-        core::ptr::write_bytes(va, 0, pages * PAGE_SIZE);
-    }
-    let obj = Object::SharedMemory { phys: phys.0 as u64, pages: pages as u32 };
+    let obj = Object::SharedMemory { id, pages: pages as u32 };
     let Some(obj_ref) = obj::create(obj) else {
-        crate::mem::with(|f| f.free_pages(phys));
+        crate::shm::free(id);
         return KError::OutOfResources.as_raw();
     };
     match sched::install_cap_current(Cap::Shared { obj: obj_ref }) {
         Some(handle) => handle as isize,
         None => {
             obj::revoke(obj_ref);
-            crate::mem::with(|f| f.free_pages(phys));
+            crate::shm::free(id);
             KError::OutOfResources.as_raw()
         }
     }

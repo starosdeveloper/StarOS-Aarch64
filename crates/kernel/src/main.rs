@@ -99,6 +99,7 @@ mod mem;
 mod notify;
 mod obj;
 mod sched;
+mod shm;
 mod smp;
 mod sync;
 mod syscall;
@@ -1248,23 +1249,47 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         "scheduler: capability delegation (client + server) + user-space IRQ driver"
     );
 
+    /// Mint one endpoint object on a slot the IPC table just handed out.
+    ///
+    /// No number appears at the call sites any more, and that is the point. The ids
+    /// used to be written here and matched by hand against a fixed table in
+    /// `crate::ipc`, which failed in both directions: a duplicate put the display
+    /// server's traffic into the contention test's endpoint, and an overrun gave a
+    /// file server an id with no slot behind it — an object that existed, resolved,
+    /// installed, and then refused every `Recv` with `InvalidArgument`.
+    ///
+    /// Panicking is right here and would not be inside a syscall. This runs once, at
+    /// boot, building the fixed set of channels the demo is made of; a machine that
+    /// cannot allocate them has nothing to run, and continuing would mean handing out
+    /// capabilities to endpoints that are not there.
+    fn new_endpoint() -> obj::ObjectRef {
+        let id = ipc::allocate().expect("endpoint slot");
+        obj::create(obj::Object::Endpoint { id }).expect("endpoint object")
+    }
+
     // Endpoints carry all the IPC in the demo. ep0/ep1 are the client<->server
     // request and reply; ep2/ep3 carry the device manager's grants to the driver
     // and the server respectively.
-    let ep0 = obj::create(obj::Object::Endpoint { id: 0 }).expect("ep0 object");
-    let ep1 = obj::create(obj::Object::Endpoint { id: 1 }).expect("ep1 object");
-    let ep_drv = obj::create(obj::Object::Endpoint { id: 2 }).expect("ep_drv object");
-    let ep_srv = obj::create(obj::Object::Endpoint { id: 3 }).expect("ep_srv object");
+    let ep0 = new_endpoint();
+    let ep1 = new_endpoint();
+    let ep_drv = new_endpoint();
+    let ep_srv = new_endpoint();
     // The contention endpoint: three senders and one receiver, all on it at once.
-    let ep_storm = obj::create(obj::Object::Endpoint { id: ipc::STORM_EP }).expect("ep_storm object");
+    // It is named to `ipc` after the fact rather than picked in advance — that is
+    // the whole difference between an id and a *number*, and the display endpoint
+    // that once collided with this one is why.
+    let ep_storm = new_endpoint();
+    if let Some(obj::Object::Endpoint { id }) = obj::get(ep_storm) {
+        ipc::set_storm_endpoint(id);
+    }
     // The display protocol: a client's commit request and the server's reply.
-    let ep_fb = obj::create(obj::Object::Endpoint { id: 5 }).expect("ep_fb object");
-    let ep_fb_reply = obj::create(obj::Object::Endpoint { id: 6 }).expect("ep_fb_reply object");
+    let ep_fb = new_endpoint();
+    let ep_fb_reply = new_endpoint();
     // The device manager's grants to the input driver.
-    let ep_input = obj::create(obj::Object::Endpoint { id: 7 }).expect("ep_input object");
+    let ep_input = new_endpoint();
     // The file protocol: a client's request and the server's reply.
-    let ep_fs = obj::create(obj::Object::Endpoint { id: 8 }).expect("ep_fs object");
-    let ep_fs_reply = obj::create(obj::Object::Endpoint { id: 9 }).expect("ep_fs_reply object");
+    let ep_fs = new_endpoint();
+    let ep_fs_reply = new_endpoint();
     // A second pair, and below a second file server on it, for the C program.
     //
     // Not because two servers are wanted, but because a *reply* endpoint cannot be
@@ -1280,32 +1305,32 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // toolkit's event loop reads: the driver holds send rights, whoever consumes
     // input holds receive rights, and `staros_endpoint_fd` turns the second half
     // into a descriptor `poll` can wait on beside every other source.
-    let ep_events = obj::create(obj::Object::Endpoint { id: 12 }).expect("ep_events object");
+    let ep_events = new_endpoint();
     // The display server's second client. Its own request *and* reply endpoint: the
     // reply must not be shared, or either client may take the other's answer, and
     // the request is separate so the server can tell whose it was without a client
     // id in the message that a client could get wrong.
-    let ep_fb2 = obj::create(obj::Object::Endpoint { id: 13 }).expect("ep_fb2 object");
-    let ep_fb2_reply = obj::create(obj::Object::Endpoint { id: 14 }).expect("ep_fb2_reply object");
+    let ep_fb2 = new_endpoint();
+    let ep_fb2_reply = new_endpoint();
     // Two more pairs, held only by the server. A shell and an application is two
     // clients before anything else opens a window, and a display server that has to
     // be rebuilt to accept a third is a display server that will be rebuilt at the
     // worst moment. The server discovers how many it has from its own capability
     // table, so these cost four endpoints and no code.
-    let ep_fb3 = obj::create(obj::Object::Endpoint { id: 15 }).expect("ep_fb3 object");
-    let ep_fb3_reply = obj::create(obj::Object::Endpoint { id: 16 }).expect("ep_fb3_reply object");
-    let ep_fb4 = obj::create(obj::Object::Endpoint { id: 17 }).expect("ep_fb4 object");
-    let ep_fb4_reply = obj::create(obj::Object::Endpoint { id: 18 }).expect("ep_fb4_reply object");
+    let ep_fb3 = new_endpoint();
+    let ep_fb3_reply = new_endpoint();
+    let ep_fb4 = new_endpoint();
+    let ep_fb4_reply = new_endpoint();
     // And two more, because four was not enough on the day it mattered. The four
     // above are taken by this tree's own demonstrations — the framebuffer client,
     // the C program, the client that crashes on purpose, and the one that receives
     // input — so the first real application, `services/qt-hello`, arrived to find
     // every slot occupied. The paragraph above predicted exactly that; the fix is
     // the same two lines it would have been then.
-    let ep_fb5 = obj::create(obj::Object::Endpoint { id: 23 }).expect("ep_fb5 object");
-    let ep_fb5_reply = obj::create(obj::Object::Endpoint { id: 24 }).expect("ep_fb5_reply object");
-    let ep_fb6 = obj::create(obj::Object::Endpoint { id: 25 }).expect("ep_fb6 object");
-    let ep_fb6_reply = obj::create(obj::Object::Endpoint { id: 26 }).expect("ep_fb6_reply object");
+    let ep_fb5 = new_endpoint();
+    let ep_fb5_reply = new_endpoint();
+    let ep_fb6 = new_endpoint();
+    let ep_fb6_reply = new_endpoint();
     // Input events, per display client. The driver publishes to one endpoint and the
     // *display server* decides who hears it, which is where that decision belongs: it
     // is the only process that knows which window is in front. A driver routing input
@@ -1320,26 +1345,19 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // the same number in two places — `displaysrv` computes `EV_BASE` from its own
     // `MAX_CLIENTS`, and a mismatch here would point it at the wrong endpoint
     // rather than at nothing.
-    let ep_ev: [obj::ObjectRef; 6] = [
-        obj::create(obj::Object::Endpoint { id: 19 }).expect("ep_ev1 object"),
-        obj::create(obj::Object::Endpoint { id: 20 }).expect("ep_ev2 object"),
-        obj::create(obj::Object::Endpoint { id: 21 }).expect("ep_ev3 object"),
-        obj::create(obj::Object::Endpoint { id: 22 }).expect("ep_ev4 object"),
-        obj::create(obj::Object::Endpoint { id: 27 }).expect("ep_ev5 object"),
-        obj::create(obj::Object::Endpoint { id: 28 }).expect("ep_ev6 object"),
-    ];
-    let ep_fs2 = obj::create(obj::Object::Endpoint { id: 10 }).expect("ep_fs2 object");
-    let ep_fs2_reply = obj::create(obj::Object::Endpoint { id: 11 }).expect("ep_fs2_reply object");
+    let ep_ev: [obj::ObjectRef; 6] = core::array::from_fn(|_| new_endpoint());
+    let ep_fs2 = new_endpoint();
+    let ep_fs2_reply = new_endpoint();
     // A third file-server pair, for the Qt program. Qt reads the filesystem before
     // it draws anything: `QFreeTypeFontDatabase` looks for font files, and a Qt with
     // no fonts renders every string as nothing at all — which looks like a broken
     // paint path rather than a missing service.
-    let ep_fs3 = obj::create(obj::Object::Endpoint { id: 29 }).expect("ep_fs3 object");
-    let ep_fs3_reply = obj::create(obj::Object::Endpoint { id: 30 }).expect("ep_fs3_reply object");
+    let ep_fs3 = new_endpoint();
+    let ep_fs3_reply = new_endpoint();
     // A fourth, for the QML program. It reads more than the one above, not less: the
     // same font family, and the scene description on top of it.
-    let ep_fs4 = obj::create(obj::Object::Endpoint { id: 31 }).expect("ep_fs4 object");
-    let ep_fs4_reply = obj::create(obj::Object::Endpoint { id: 32 }).expect("ep_fs4_reply object");
+    let ep_fs4 = new_endpoint();
+    let ep_fs4_reply = new_endpoint();
 
     // The *only* device policy the kernel still holds: the authority to mint. It
     // pre-mints no UART objects at all now — the device manager (id 7) reads the
@@ -1984,6 +2002,87 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         "ipc storm: {total_sends} sends / {total_recvs} recvs on one endpoint —{spread} \
          ({send_cores} core(s) sending, {recv_cores} receiving) — {verdict}",
     );
+
+    // A shared buffer, built here rather than by a client, to say out loud what its
+    // frames look like.
+    //
+    // These used to have to be one physically contiguous run, because the object was
+    // a `(phys, pages)` pair. Nothing about two processes reading the same pages
+    // through their own tables needs that — only DMA does — and the cost was a
+    // refusal with no visible cause: contiguous allocation comes out of a buddy tree,
+    // so a pool with sixty megabytes free in scattered pieces would still turn down
+    // eight.
+    //
+    // The interesting number is how many *breaks* the run has. One means the frames
+    // happened to be next to each other and this boot proves nothing beyond working;
+    // more than one means the buffer is genuinely discontiguous and the old
+    // arrangement could not have produced it at all. Printed either way, because a
+    // check that only speaks when it likes the answer is not a check.
+    // The pool is nearly empty by now, so a buffer asked for here comes back in one
+    // piece and proves nothing. The holes have to be made on purpose: take sixteen
+    // frames, give back every other one, and ask for eight pages. There is no run of
+    // eight among what was returned — only eight separate frames — so the answer is
+    // discontiguous or there is no answer at all, which is exactly the request the
+    // old `(phys, pages)` object had to refuse.
+    let mut held = [PhysAddr(0); 16];
+    let mut taken = 0;
+    while taken < held.len() {
+        match mem::alloc_frame() {
+            Some(frame) => {
+                held[taken] = frame;
+                taken += 1;
+            }
+            None => break,
+        }
+    }
+    if taken == held.len() {
+        for (i, &frame) in held.iter().enumerate() {
+            if i % 2 == 1 {
+                mem::with(|frames| frames.free(frame));
+            }
+        }
+        if let Some(id) = shm::create(8) {
+            let breaks = shm::with_frames(id, |run| {
+                run.windows(2).filter(|w| w[1] != w[0] + PAGE_SIZE as u64).count() + 1
+            })
+            .unwrap_or(0);
+            // More than one run is the assertion, not a curiosity. The holes are
+            // the eight frames just returned and no two of them are adjacent, so a
+            // buffer built out of them *must* be discontiguous. One run means the
+            // frames came from somewhere else in one piece — which is what the old
+            // contiguous allocation does, and it is why the failing branch below is
+            // not "allocation refused": on a pool with a hundred megabytes free it
+            // does not refuse, it simply ignores the holes, and only the shape of
+            // what it returns tells the two apart.
+            if breaks > 1 {
+                let _ = writeln!(
+                    console,
+                    "shared memory: an 8-page buffer assembled from {breaks} run(s) of frames out \
+                     of a pool holed on purpose — contiguity is no longer required, only DMA needs it"
+                );
+            } else {
+                let _ = writeln!(
+                    console,
+                    "shared memory: SHARED MEMORY WRONG - an 8-page buffer came back in one run \
+                     from a pool whose free frames are not adjacent"
+                );
+            }
+            shm::free(id);
+        } else {
+            let _ = writeln!(
+                console,
+                "shared memory: SHARED ALLOC FAILED on a holed pool - the frames are back to \
+                 needing one contiguous run"
+            );
+        }
+        // And the even frames go back, so the whole-pool check below still means
+        // what it says.
+        for (i, &frame) in held.iter().enumerate() {
+            if i % 2 == 0 {
+                mem::with(|frames| frames.free(frame));
+            }
+        }
+    }
 
     // Every address space has been torn down. Two questions, and the second is the
     // one that matters.

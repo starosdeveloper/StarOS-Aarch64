@@ -938,9 +938,17 @@ impl AddressSpace {
         }
     }
 
-    /// Map a shared-memory buffer (`pages` contiguous frames at physical `phys`)
-    /// into this space at `base`, read/write and EL0-accessible, and return that
-    /// virtual address.
+    /// Map a shared-memory buffer — the frames listed in `frames`, in order — into
+    /// this space at `base`, read/write and EL0-accessible, and return that virtual
+    /// address.
+    ///
+    /// A list rather than a base and a count, because these frames need not be
+    /// physically contiguous and used to have to be. `Object::SharedMemory` once
+    /// held a single `(phys, pages)` pair, so every buffer came out of one
+    /// contiguous run, and a pool with sixty megabytes free in scattered pieces
+    /// refused eight — a failure with no visible cause for the caller, on a request
+    /// nothing about the hardware required. Only DMA needs contiguity; a buffer two
+    /// processes read through their own page tables needs none.
     ///
     /// The address is a parameter rather than [`USER_SHARED_VA`] because a display
     /// server holds one buffer per surface and needs them all reachable at once. A
@@ -960,20 +968,19 @@ impl AddressSpace {
     ///
     /// # Safety
     /// Must run at EL1 with this space's tables writable through the linear map.
-    /// `[phys, phys + pages*4KiB)` must be frames the kernel allocated for this
-    /// shared object.
+    /// Every entry of `frames` must be a frame the kernel allocated for this shared
+    /// object.
     pub unsafe fn map_shared<A: FrameAllocator>(
         &self,
         alloc: &mut A,
         base: u64,
-        phys: u64,
-        pages: u32,
+        frames: &[u64],
     ) -> Option<u64> {
-        for i in 0..u64::from(pages) {
-            let va = base + i * PAGE_4K;
+        for (i, &frame) in frames.iter().enumerate() {
+            let va = base + i as u64 * PAGE_4K;
             // SAFETY: forwarded from this function's contract; a table frame may be
             // allocated for the walk, and the page is Normal RW EL0.
-            if !unsafe { self.map_page(alloc, va, user_data_page(phys + i * PAGE_4K)) } {
+            if !unsafe { self.map_page(alloc, va, user_data_page(frame)) } {
                 return None;
             }
         }

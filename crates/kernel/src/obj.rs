@@ -49,14 +49,20 @@ pub enum Object {
     /// stops every holder from minting further, without touching devices already
     /// granted.
     DeviceAuthority,
-    /// A shared-memory buffer: one or more physical frames the kernel allocated,
-    /// which any holder may map read/write. Unlike a [`Device`](Object::Device),
-    /// these frames are RAM the kernel owns and must reclaim — they are freed when
-    /// the object table is swept at shutdown (see [`free_reclaimable`]).
+    /// A shared-memory buffer: frames the kernel allocated, which any holder may
+    /// map read/write. Unlike a [`Device`](Object::Device), these frames are RAM the
+    /// kernel owns and must reclaim — they are freed when the object table is swept
+    /// at shutdown (see [`free_reclaimable`]).
+    ///
+    /// The frames themselves live in [`crate::shm`], and this holds only their id.
+    /// They used to be a `(phys, pages)` pair, which required every buffer to be one
+    /// physically contiguous run — something no part of this arrangement needs, and
+    /// which made a large request fail on merely fragmented memory. `Object` is
+    /// `Copy` and sits in a fixed slot, so the list has to live somewhere else.
     SharedMemory {
-        /// Physical base of the shared frames.
-        phys: u64,
-        /// How many contiguous 4 KiB frames the buffer spans.
+        /// Index of the frame run in [`crate::shm`].
+        id: usize,
+        /// How many 4 KiB frames the buffer spans.
         pages: u32,
     },
     /// A DMA buffer: physically contiguous frames the kernel allocated for a
@@ -195,18 +201,30 @@ pub fn revoke(r: ObjectRef) -> bool {
 /// can still hold a mapping — is what keeps the post-teardown "every frame
 /// returned" check honest for shared and DMA buffers.
 ///
-/// Both kinds were allocated as one contiguous run (a shared page is a run of
-/// one), so `free_pages` on the base reclaims each whole — the allocator recovers
-/// the block's size from the tree that owns it.
+/// The two kinds are freed differently, because they are allocated differently. A
+/// DMA buffer is one contiguous run, so `free_pages` on its base reclaims the whole
+/// block — the allocator recovers its size from the tree that owns it. A shared
+/// buffer is a *list* of frames that need not be next to each other, so its run is
+/// handed back frame by frame by [`crate::shm::free`].
 pub fn free_reclaimable(frames: &mut FramePool) {
-    let mut slots = OBJECTS.lock();
-    for slot in slots.iter_mut() {
-        let base = match slot.object {
-            Some(Object::SharedMemory { phys, .. }) | Some(Object::DmaBuffer { phys, .. }) => phys,
-            _ => continue,
-        };
-        frames.free_pages(PhysAddr(base as usize));
-        slot.object = None;
-        slot.generation = slot.generation.wrapping_add(1);
+    // Shared runs are collected under the object lock and freed after it is
+    // dropped: `shm::free` takes the frame pool, and a second lock taken while
+    // holding this one — in an order nothing else follows — is how a kernel
+    // deadlocks on a path that runs once a boot and is never exercised again.
+    let mut shared = alloc::vec::Vec::new();
+    {
+        let mut slots = OBJECTS.lock();
+        for slot in slots.iter_mut() {
+            match slot.object {
+                Some(Object::SharedMemory { id, .. }) => shared.push(id),
+                Some(Object::DmaBuffer { phys, .. }) => frames.free_pages(PhysAddr(phys as usize)),
+                _ => continue,
+            }
+            slot.object = None;
+            slot.generation = slot.generation.wrapping_add(1);
+        }
+    }
+    for id in shared {
+        crate::shm::free_with(id, frames);
     }
 }

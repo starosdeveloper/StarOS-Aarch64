@@ -938,6 +938,49 @@ Done:
   unmaps one page and reads the same address again — the fault is the only evidence
   from EL0 that the TLB entry went with the descriptor.
 
+- **Shared memory is a list of frames, not a run (`crates/kernel/src/shm.rs`).**
+  `Object::SharedMemory` was a `(phys, pages)` pair, which asserted something no part
+  of the arrangement needs: that every shared buffer is one physically contiguous
+  run. Only DMA needs contiguity, where a device walks physical addresses with no
+  tables of its own; two processes reading the same pages through their own tables
+  need none.
+
+  The cost was a refusal with no visible cause. Contiguous allocation comes out of a
+  buddy tree, so it rounds up to a power of two and wants an unbroken block: a pool
+  with sixty megabytes free in scattered pieces would still turn down eight, and a
+  full-screen backing store is exactly the size where that starts. "Sometimes the
+  window will not open" is the worst shape a defect can take.
+
+  Frames are now taken one at a time and kept as a list; the object holds its id.
+  The indirection is forced twice over — `Object` is `Copy` in a fixed slot, so a
+  `Vec` cannot live inside it, and the frames outlive the capability: revocation
+  stops a reference resolving, while the memory is reclaimed once, at shutdown, when
+  nothing can still be mapping it.
+
+  Proved by shape rather than by success: the boot takes sixteen frames, returns
+  every other one, and asks for eight pages. No two free frames are adjacent, so a
+  buffer built from them must be discontiguous — the check asserts *more than one
+  run* and says `SHARED MEMORY WRONG` otherwise. Contiguous allocation does not fail
+  that test on a large pool, it simply ignores the holes and answers with one run,
+  which is why the assertion is about the shape and not about a refusal.
+
+- **Endpoint ids are allocated, not chosen (`ipc::allocate`).** The ids were a shared
+  numbering between the IPC table and the boot code that minted the objects, and the
+  seam bit in both directions. By collision: the display endpoint was given the
+  contention test's id, and the display server spent its life rejecting storm
+  messages. By overrun: a new file server's pair landed past the end of a fixed-size
+  table — the objects were made, the capabilities installed, the server announced
+  itself, and then every `Recv` returned `InvalidArgument` from an endpoint with no
+  slot, reported as `[fssrv] receive failed`, which names neither the endpoint nor
+  the id nor the constant that was too small.
+
+  Nobody picks a number now. The table is a `Vec` that grows to the high-water mark,
+  slots are handed out and reused, and the contention endpoint is *named* after it is
+  allocated rather than chosen in advance. Falsified by never marking a slot taken:
+  the boot panics at the line that asked for the id, which is the point — the failure
+  lands where the number is issued instead of in a service that has no idea what an
+  id is.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not
