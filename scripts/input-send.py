@@ -7,9 +7,18 @@ raises its interrupt. Nothing about the path is faked on the guest side, which i
 the whole point — the driver in EL0 either decodes a real device's event or it
 does not.
 
-The key is sent repeatedly because there is no way from here to know when the
-guest's driver has finished arming its queue; a press that arrives before then is
-simply dropped by the device, and the next one lands.
+The key is sent repeatedly because a press that arrives before the guest's driver
+has armed its queue is dropped by the device and never seen again. Repetition alone
+is not enough, though, and this is what the script used to get wrong: sixty presses
+a quarter of a second apart is a *fifteen second* window measured from the moment
+QEMU answers QMP, and when the boot ahead of the driver grew past that, every press
+landed before the queue existed. The check then reported no decoded key — which was
+true, and had nothing to do with the driver.
+
+So the window is now started by an event rather than by the clock: given the serial
+log the guest is writing, this waits for the driver to say its queues are armed and
+only then presses anything. The fallback — no log, sweep blindly — is kept for
+calling it by hand, and it is the shape that fails on a slow host.
 
 The pointer is moved and clicked in the same loop, over a handful of screen
 positions where this boot is known to put windows. It sweeps rather than aiming
@@ -20,16 +29,45 @@ virtqueue, being normalised by a driver that does not know the screen size, and
 being turned back into pixels and hit-tested by a compositor that does not know the
 tablet's range.
 
-Usage: input-send.py <qmp-socket>
+Usage: input-send.py <qmp-socket> [serial-log]
 """
 import json
 import socket
 import sys
 import time
 
+# What the driver prints once its virtqueues are armed and it is waiting for the
+# device. The wait keys on the prefix rather than the whole sentence: the wording
+# names how many devices were found and that number is not this script's business.
+READY = "[inputsrv] virtio-input driver up in EL0"
+
+# How long to wait for it. Generous, because it is a fuse and not a schedule — the
+# guest reaching this point takes ten seconds on an idle host and several times that
+# on a loaded one, and a fuse that fires before the thing it guards is just a second
+# way to fail.
+READY_TIMEOUT_S = 120.0
+
+
+def wait_for_driver(log_path):
+    """Block until the guest says its input queues are armed. True if it did."""
+    deadline = time.monotonic() + READY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            # Bytes, not text: the serial log carries whatever the guest wrote, and
+            # a partial UTF-8 sequence at the end of a still-growing file is not a
+            # reason to stop waiting.
+            with open(log_path, "rb") as log:
+                if READY.encode() in log.read():
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.1)
+    return False
+
 
 def main():
     sock_path = sys.argv[1]
+    log_path = sys.argv[2] if len(sys.argv) > 2 else None
     s = None
     for _ in range(200):
         try:
@@ -88,6 +126,10 @@ def main():
             {"type": "btn", "data": {"down": True, "button": "left"}}]}})
         cmd({"execute": "input-send-event", "arguments": {"events": [
             {"type": "btn", "data": {"down": False, "button": "left"}}]}})
+
+    if log_path is not None and not wait_for_driver(log_path):
+        print(f"input-send: the guest never said '{READY}' — nothing was sent")
+        sys.exit(3)
 
     sent = 0
     clicked = 0

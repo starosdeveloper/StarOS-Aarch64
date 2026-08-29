@@ -59,6 +59,34 @@ public:
     // than as a frame rate.
     quint64 commit(quint64 surface, const QRect &damage, unsigned int bufferCap = 0);
 
+    // The same commit, sent without waiting for the answer.
+    //
+    // A frame's round trip was measured at 3 762 us against 1 060 us of compositing
+    // inside it (G8.1): two thirds of it is the client parked in `poll` while the
+    // scheduler runs the server and comes back. None of that waiting has to happen
+    // inside a frame — the answer is only needed before the *next* frame is painted,
+    // because that is when the buffer the server is reading gets written to again.
+    //
+    // What the answer means is therefore a release: "the server is no longer looking
+    // at the buffer you gave me before this one". `collectCommit` is where that is
+    // waited for, and `QStarosWindow` calls it at the top of a paint rather than at
+    // the bottom of a present.
+    //
+    // At most one commit is ever outstanding. The reply endpoint is a queue, so two
+    // unanswered requests would mean the next `call()` reading somebody else's
+    // answer — every request in this protocol replies, and a plugin that lost track
+    // of which reply belonged to which question would act on a surface id that came
+    // back from a `Screen`.
+    bool postCommit(quint64 surface, const QRect &damage, unsigned int bufferCap = 0);
+
+    // Wait for an outstanding `postCommit`, and return the pixels the server wrote.
+    //
+    // Zero when there was nothing outstanding, which is not an error and is how the
+    // first frame of a window behaves. A refused commit also gives zero, one frame
+    // later than a synchronous one would — that is the price of the asynchrony, and
+    // it is paid in a diagnostic's timing rather than in a pixel.
+    quint64 collectCommit();
+
     bool raise(quint64 surface);
     bool destroy(quint64 surface);
 
@@ -82,6 +110,10 @@ private:
     int m_requestFd = -1;
     int m_replyFd = -1;
     int m_eventFd = -1;
+    // Whether a commit is out there with its answer still unread. One bit and not a
+    // count, because the invariant is that there is never more than one; see
+    // `postCommit`.
+    bool m_commitPending = false;
     bool m_valid = false;
     QSize m_screenSize;
     int m_screenDepth = 32;

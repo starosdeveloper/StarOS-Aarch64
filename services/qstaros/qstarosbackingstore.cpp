@@ -32,6 +32,21 @@ void QStarosBackingStore::resize(const QSize &size, const QRegion &)
                      QImage::Format_RGB32);
 }
 
+void QStarosBackingStore::beginPaint(const QRegion &)
+{
+    // The last moment before Qt writes into the back buffer, and therefore the place
+    // the previous frame's commit is waited for: the answer means the server has let
+    // go of the buffer whose partner is about to be painted, and the restore that
+    // depends on it happens here too.
+    //
+    // Not in `flush()`, where it used to be. Everything between a flush and the next
+    // paint — the event loop, animation, the polish pass — is time the server can
+    // composite in, and waiting at the bottom of the flush threw all of it away.
+    QStarosWindow *w = platformWindow();
+    if (w != nullptr)
+        w->settle();
+}
+
 void QStarosBackingStore::flush(QWindow *, const QRegion &region, const QPoint &offset)
 {
     QStarosWindow *w = platformWindow();

@@ -436,5 +436,19 @@ cause of a slow frame, is **2.9 %** of it. The numbers are TCG numbers and do no
 transfer to a board; the proportions held across three runs, and they are what
 reordered the rest of the phase.
 
+That measurement named the one number in a frame that was ours, and it has since been
+acted on. The commit is no longer waited for inside the frame: the plugin posts it and
+collects the answer at the top of the next paint, where the answer means the display
+server has let go of the buffer about to be painted. The flush fell from **15.8 % of a
+frame to 3.1 %**, a round trip from 5 112 µs to 981, and the server now spends longer
+compositing than the client spends in the whole round trip — which is the overlap,
+stated as a number. Waiting was not removed; it stopped being in the frame.
+
+Two of the checks turned out to be measuring the host rather than the system, and both
+are fixed: `input-check.sh` pressed its keys on a fifteen-second timer that the boot
+outgrew, and now waits for the driver to say its queues are armed; `qml-verify` asked
+whether an animated bar was wide in the one frame where an unrelated card was fullest,
+and now asks every frame.
+
 Design rationale, the SMP/IPC/IOMMU write-ups, and an honest "not yet
 implemented" list live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

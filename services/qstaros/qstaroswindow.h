@@ -36,7 +36,24 @@ public:
     QSize bufferSize() const { return m_bufferSize; }
 
     // Hand the painted buffer to the server and make the other one current.
+    //
+    // The commit is *posted*: it does not wait for the server's answer. What is
+    // owed afterwards is finished by `settle()`.
     void present(const QRegion &region);
+
+    // Finish what the last `present()` left owed: wait for the commit's answer and
+    // restore the damage rectangle into the new back buffer.
+    //
+    // Called from the backing store at the top of a paint, which is the last moment
+    // it can happen and the best one: everything between the two — the event loop,
+    // animation, Qt's polish pass — runs while the server composites, and on every
+    // frame measured so far the answer is already there by the time it is asked for.
+    //
+    // Waiting is not optional and not a nicety. The answer means the server has let
+    // go of the buffer this call writes into; without it, the copy below races the
+    // compositor over shared pages with no fence between them, and the failure is a
+    // window that tears under load and nowhere else.
+    void settle();
 
     bool isValid() const { return m_surface != 0; }
 
@@ -45,21 +62,26 @@ private:
     void release();
     void reportProfile() const;
 
-    // What one `present()` costs this side of the wire.
+    // What one frame costs this side of the wire, in the three parts that are three
+    // different things to fix.
     //
-    // Two numbers and not one, because they are two different things to fix. The
-    // round trip is the display server's compositing plus the kernel's IPC — the
-    // server prints its own half, and the difference is what the endpoints cost. The
-    // restore is this plugin's own memcpy, the price of double buffering with damage
-    // tracking, and it is the only part of a frame this file could make faster on
-    // its own.
+    // `post` is the send: the message into the endpoint and back, with no server in
+    // it. `await` is what is left of the round trip after the frame stopped waiting
+    // inside itself — the compositing the client did not manage to overlap, and the
+    // number that says whether posting early bought anything. `restore` is this
+    // plugin's own memcpy, the price of double buffering with damage tracking.
+    //
+    // `post + await` is comparable with the round trip the synchronous version
+    // measured, which is what makes the two profiles readable against each other.
     struct Profile
     {
         qint64 frames = 0;
         qint64 pixels = 0;
-        qint64 commitNs = 0;
+        qint64 postNs = 0;
+        qint64 awaitNs = 0;
         qint64 restoreNs = 0;
-        qint64 worstCommitNs = 0;
+        qint64 worstPostNs = 0;
+        qint64 worstAwaitNs = 0;
         qint64 worstRestoreNs = 0;
     };
 
@@ -68,6 +90,11 @@ private:
     unsigned int m_caps[2] = { 0, 0 };
     unsigned char *m_pixels[2] = { nullptr, nullptr };
     int m_back = 0;
+    // The damage rectangle a posted commit still owes a restore for; empty when
+    // nothing is owed. It doubles as the record of whether a commit is outstanding,
+    // because the two are set and cleared together and a second flag would be a
+    // second thing to get wrong.
+    QRect m_pendingRestore;
     QSize m_bufferSize;
     bool m_visible = false;
     Profile m_profile;

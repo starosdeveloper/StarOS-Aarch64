@@ -85,6 +85,13 @@ QStarosConnection::~QStarosConnection()
 
 bool QStarosConnection::call(struct staros_message *msg)
 {
+    // Anything outstanding is collected first. The reply endpoint is a queue and
+    // every request in this protocol answers, so a `Raise` sent while a commit's
+    // answer was still in flight would read the commit's reply as its own — and the
+    // symptom of that is not an error but a plausible wrong number: a `createSurface`
+    // returning the pixel count of the last frame as a surface id.
+    collectCommit();
+
     if (staros_msg_send(m_requestFd, msg) != 0)
         return false;
 
@@ -118,20 +125,70 @@ quint64 QStarosConnection::createSurface(unsigned int bufferCap, const QSize &si
     return msg.words[0];
 }
 
+// Fill in a `Commit` message. One place, because the two senders below differ only
+// in whether they wait for the answer, and a packing written twice is a packing that
+// is fixed once.
+static void packCommit(struct staros_message *msg, quint64 surface, const QRect &damage,
+                       unsigned int bufferCap)
+{
+    memset(msg, 0, sizeof *msg);
+    msg->tag = STAROS_DISPLAY_COMMIT;
+    msg->words[0] = surface;
+    // Damage is packed two 32-bit values to a word because a message has four words
+    // and a rectangle plus a surface id needs five.
+    msg->words[1] = (unsigned long long)(unsigned)damage.x()
+                    | ((unsigned long long)(unsigned)damage.y() << 32);
+    msg->words[2] = (unsigned long long)(unsigned)damage.width()
+                    | ((unsigned long long)(unsigned)damage.height() << 32);
+    msg->cap = bufferCap;
+}
+
 quint64 QStarosConnection::commit(quint64 surface, const QRect &damage, unsigned int bufferCap)
 {
     struct staros_message msg;
-    memset(&msg, 0, sizeof msg);
-    msg.tag = STAROS_DISPLAY_COMMIT;
-    msg.words[0] = surface;
-    // Damage is packed two 32-bit values to a word because a message has four words
-    // and a rectangle plus a surface id needs five.
-    msg.words[1] = (unsigned long long)(unsigned)damage.x()
-                   | ((unsigned long long)(unsigned)damage.y() << 32);
-    msg.words[2] = (unsigned long long)(unsigned)damage.width()
-                   | ((unsigned long long)(unsigned)damage.height() << 32);
-    msg.cap = bufferCap;
+    packCommit(&msg, surface, damage, bufferCap);
     if (!call(&msg))
+        return 0;
+    return msg.words[0];
+}
+
+bool QStarosConnection::postCommit(quint64 surface, const QRect &damage, unsigned int bufferCap)
+{
+    // The previous one is collected before this one goes out, so that the invariant
+    // of one outstanding commit holds at the send rather than being checked after
+    // the fact. In the ordinary frame there is nothing to collect here — the window
+    // collected it before it painted — and this costs one branch.
+    collectCommit();
+
+    struct staros_message msg;
+    packCommit(&msg, surface, damage, bufferCap);
+    if (staros_msg_send(m_requestFd, &msg) != 0)
+        return false;
+    m_commitPending = true;
+    return true;
+}
+
+quint64 QStarosConnection::collectCommit()
+{
+    if (!m_commitPending)
+        return 0;
+    // Cleared before the wait, not after it. A timed-out reply is a reply that may
+    // still arrive, and this connection has no way to tell that one from the answer
+    // to the next question — so the endpoint is treated as poisoned for commits and
+    // this window stops posting rather than reading answers one behind for ever.
+    m_commitPending = false;
+
+    struct pollfd wait_reply;
+    wait_reply.fd = m_replyFd;
+    wait_reply.events = POLLIN;
+    wait_reply.revents = 0;
+    if (poll(&wait_reply, 1, ReplyTimeoutMs) != 1)
+        return 0;
+
+    struct staros_message msg;
+    if (staros_msg_recv(m_replyFd, &msg) != 0)
+        return 0;
+    if (msg.tag != STAROS_DISPLAY_OK)
         return 0;
     return msg.words[0];
 }

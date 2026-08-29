@@ -19,6 +19,11 @@ public:
     explicit QStarosBackingStore(QWindow *window);
 
     QPaintDevice *paintDevice() override { return &m_image; }
+    // Where the previous frame's commit is waited for. See `QStarosWindow::settle`:
+    // the commit is posted from `flush` and its answer collected here, so that the
+    // event loop between the two runs while the server composites instead of after
+    // it.
+    void beginPaint(const QRegion &region) override;
     void resize(const QSize &size, const QRegion &staticContents) override;
     void flush(QWindow *window, const QRegion &region, const QPoint &offset) override;
     QImage toImage() const override { return m_image; }

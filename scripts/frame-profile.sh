@@ -14,9 +14,15 @@
 #                per pixel
 #
 # Three sources and not one, because no single process can see a whole frame. The
-# interesting numbers are the *differences* — the commit round trip minus the
-# compositing inside it is what the kernel's IPC costs, and nothing measures that
-# directly.
+# interesting numbers are the *differences* — with a synchronous commit, the round
+# trip minus the compositing inside it is what the kernel's IPC costs, and nothing
+# measures that directly.
+#
+# Since the commit became asynchronous the same subtraction answers a different
+# question: the server's compositing is now *larger* than the client's round trip,
+# and the excess is the part of it that happened while the client was drawing. The
+# script prints whichever of the two the numbers support rather than assuming the
+# round trip contains the compositing, which stopped being true.
 #
 # It asserts that all three lines are there. A profile that silently reports two of
 # three stages is how "rasterisation is free" gets believed.
@@ -88,9 +94,16 @@ awk '
 /^\[qstaros\] present:/ {
     if ($3 + 0 > qt_frames) {
         qt_frames = $3 + 0
+        qt_commit = ""; qt_post = ""; qt_await = ""; qt_restore = ""
+        # First occurrence of each key, because the line names the worst frame with
+        # the same words: "post 12 us ... worst post 900 us". Taking the first is a
+        # rule that stays true if a fourth figure is added; matching "worst" is a
+        # rule that has to be revisited every time the wording moves.
         for (i = 1; i <= NF; i++) {
-            if ($i == "commit")  qt_commit  = $(i + 1)
-            if ($i == "restore") qt_restore = $(i + 1)
+            if ($i == "commit"  && qt_commit  == "") qt_commit  = $(i + 1)
+            if ($i == "post"    && qt_post    == "") qt_post    = $(i + 1)
+            if ($i == "await"   && qt_await   == "") qt_await   = $(i + 1)
+            if ($i == "restore" && qt_restore == "") qt_restore = $(i + 1)
         }
         have_qt = 1
     }
@@ -126,8 +139,26 @@ END {
 
     printf "\ninside present:\n\n"
     printf "  %-34s %8d us\n", "commit round trip",  qt_commit
-    printf "  %-34s %8d us   over %d frame(s)\n", "of which compositing", ds_frame, ds_frames
-    printf "  %-34s %8d us   kernel IPC and scheduling\n", "of which everything else", qt_commit - ds_frame
+    if (qt_post != "" && qt_await != "") {
+        # The split the asynchronous commit made visible: the send is inside the
+        # frame, the wait is what the frame failed to overlap with the server. A
+        # small `await` against a large `compositing` is the whole claim — the
+        # server did the work while the client was doing something else.
+        printf "  %-34s %8d us   the send, no server in it\n", "  posted in the frame", qt_post
+        printf "  %-34s %8d us   what the frame did not overlap\n", "  awaited before the next paint", qt_await
+    }
+    printf "  %-34s %8d us   over %d frame(s)\n", "compositing, on the server", ds_frame, ds_frames
+    if (ds_frame > qt_commit) {
+        # The server spends longer compositing than the client spends in the whole
+        # round trip. That is not an inconsistency, it is the asynchrony working:
+        # the commit is posted and the answer collected a paint later, so most of
+        # the compositing happens while the client is busy elsewhere. Subtracting
+        # one from the other here would print a negative "IPC cost", which is how a
+        # profile starts lying the moment the thing it measures gets faster.
+        printf "  %-34s %8d us   done while the client was drawing\n", "  of it overlapped", ds_frame - qt_commit
+    } else {
+        printf "  %-34s %8d us   kernel IPC and scheduling\n", "of which everything else", qt_commit - ds_frame
+    }
     printf "  %-34s %8d us   the back-buffer restore\n", "restore", qt_restore
     printf "\n  compositing costs %s ns per pixel written.\n", ds_px
 }

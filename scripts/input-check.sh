@@ -34,10 +34,16 @@ objcopy="$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-objcopy 2>/dev/n
 
 rm -f "$QMP"
 echo "booting with a virtio keyboard and pressing a key…"
-python3 scripts/input-send.py "$QMP" >"$TMP/send.out" 2>&1 &
+# The serial log is handed over so the presses wait for the driver instead of for a
+# stopwatch. Without it this check measured how fast the host booted the guest: the
+# presses all landed in the first fifteen seconds, and once the boot ahead of the
+# driver grew past that they were dropped by a device whose queue did not exist yet.
+python3 scripts/input-send.py "$QMP" "$TMP/serial.log" >"$TMP/send.out" 2>&1 &
 SEND=$!
 
-printf '\n' | timeout -k 5 60 qemu-system-aarch64 \
+# The timeout is a fuse, not a schedule. It has to outlast the boot on a host that
+# is doing something else at the time, which the sixty seconds it used to be did not.
+printf '\n' | timeout -k 5 180 qemu-system-aarch64 \
     -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M \
     -display none -device ramfb -device virtio-keyboard-device \
     -device virtio-tablet-device \

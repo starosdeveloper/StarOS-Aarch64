@@ -243,6 +243,22 @@ def main():
     button_pixels = 0
     green_after = 0
     clicked = False
+    # The animated items, over *every* frame rather than over the one with the most
+    # red in it.
+    #
+    # The pulsing bar is an animation: its whole purpose is to not be the same size
+    # in every frame. Asking for a hundred yellow pixels in the frame that happened
+    # to have the most red is asking two unrelated questions and reporting the answer
+    # to the second — it fails when the shot with the best card caught the bar at the
+    # thin end of its pulse, which is a fact about when the screenshot was taken and
+    # nothing about the renderer. One run in four failed this way, with the bar at 44
+    # pixels in the chosen frame and 404 in the run before it.
+    #
+    # The card and its text stay on the single best frame, and that is not an
+    # inconsistency: a border and glyphs that were never on screen *together* would
+    # be a real defect, so those two have to be one moment.
+    blue_seen = 0
+    yellow_seen = 0
     for i in range(220):
         frame = os.path.join(tmpdir, f"qml{i:03d}.ppm")
         try:
@@ -258,6 +274,8 @@ def main():
                 seen = examine(width, height, rows)
                 if best is None or seen["red"] > best["red"]:
                     best, best_frame = seen, frame
+                blue_seen = max(blue_seen, seen["blue"])
+                yellow_seen = max(yellow_seen, seen["yellow"])
 
                 if not clicked:
                     box = bounds_of(rows, BUTTON_IDLE)
@@ -302,6 +320,8 @@ def main():
     print(f"qml-verify: best frame {width}x{height}: {best['red']} red pixel(s), "
           f"longest run {best['run']} at {best['run_at']}, "
           f"{best['white']} white inside it, {best['blue']} blue, {best['yellow']} yellow")
+    print(f"qml-verify: across every frame: {blue_seen} blue, {yellow_seen} yellow "
+          "at their fullest — the animated items are asked about here, not in one frame")
 
     failures = []
     if best["red"] < MIN_RED_PIXELS:
@@ -312,10 +332,10 @@ def main():
     if best["white"] < 200:
         failures.append(f"only {best['white']} white pixels inside the card: the border and the"
                         " text are what FreeType and the border draw, and neither appeared")
-    if best["blue"] < 200:
-        failures.append(f"only {best['blue']} blue pixels: the animated circle is missing")
-    if best["yellow"] < 100:
-        failures.append(f"only {best['yellow']} yellow pixels: the pulsing bar is missing")
+    if blue_seen < 200:
+        failures.append(f"only {blue_seen} blue pixels in any frame: the animated circle is missing")
+    if yellow_seen < 100:
+        failures.append(f"only {yellow_seen} yellow pixels in any frame: the pulsing bar is missing")
 
     print(f"qml-verify: the button was {button_pixels} orange pixel(s) before the click"
           f" and {green_after} green pixel(s) in the same rectangle after it")
