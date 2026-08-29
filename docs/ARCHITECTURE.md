@@ -981,6 +981,69 @@ Done:
   lands where the number is issued instead of in a service that has no idea what an
   id is.
 
+- **A receive with a deadline (`RecvUntil`).** `Recv` waited for ever, so a client
+  waiting for an answer that might never come had to bind a notification to the
+  endpoint and use `WaitAny` — three syscalls and a notification per endpoint to say
+  "wait, but not forever", which is an ordinary thing to want and not an advanced
+  one. The deadline is absolute for the reason `SleepUntil`'s is: a duration is
+  measured from whenever the call gets to run, so a caller preempted between working
+  it out and asking waits longer than it meant to and cannot tell.
+
+  Two things make it correct rather than merely present. The timeout path removes
+  the task from the endpoint's receiver queue — a waiter left behind is where the
+  next message goes, and it goes nowhere, taken by nobody. And what decides between
+  "delivered" and "timed out" is the mailbox, not the clock: the message is placed
+  there before the task is made runnable, so a sender delivering a microsecond
+  before an already-passed deadline is still a delivery. Asking the clock would drop
+  that message in the very call that received it.
+
+- **One capability table per address space, not per task.** A thread used to get a
+  *copy* of its creator's table, and the consequence was written down and lived
+  with: a capability minted after the thread started was invisible to it. That holds
+  until a program does something ordinary — a worker thread that opens a file, a Qt
+  thread handed an endpoint — and then a handle the kernel has just returned is a bad
+  handle in the thread that has to use it, which reads as memory corruption rather
+  than as a missing share. The table is now `Arc<SpinLock<CapTable>>`; the handle is
+  taken under the scheduler lock and the table locked after it is dropped, because
+  growing it allocates.
+
+  The check is ordered so that it fails on the old kernel: the worker blocks first,
+  the main thread mints afterwards, and only then is the worker released. It asks
+  the kernel for the buffer's size, which is answered out of the *caller's* table.
+
+- **`SpawnImage` streams segments instead of copying the image.** The loader used to
+  copy the whole ELF into the kernel heap to parse it — the parser wants a contiguous
+  slice, and EL1 cannot dereference EL0 memory under PAN — and paid with a 256 KiB
+  cap on any program started that way, on a system whose own QML program is 21 MiB.
+  The cap did not describe what a process may be; it described how much of one the
+  kernel would hold at once.
+
+  Only the headers are copied now (64 KiB, bounded, and the only part that has to be
+  contiguous). `AddressSpace::map_segment_with` fills each page straight from the
+  caller's memory into the frame that will hold it, and every segment's file range is
+  checked against the image length *before* it is read — a segment reaching past the
+  end would otherwise make the kernel read whatever the caller mapped after its
+  buffer, at the caller's request, which is the shape of an exploit rather than of a
+  mistake.
+
+- **The console scroll: measured, and it is not where the time goes.** The scroll was
+  recorded as the longest uninterruptible section in the system, at 427 ms. It is
+  now instrumented — nanoseconds and bytes, reported at shutdown — and the answer is
+  `200 byte(s) painted, 0 timed`: the kernel writes its own boot log straight to the
+  UART, and the screen goes to `displaysrv` about thirty lines in, so the mirror
+  barely runs and the scroll is not in any hot path. The 427 ms belongs to a
+  configuration that no longer exists; what remains is the panic path and early boot,
+  and those got faster anyway — clearing the exposed rows was a `put_pixel` per
+  pixel, re-deriving the offset and re-encoding the colour ten thousand times per
+  scroll, and is now one encode and a row-wise fill.
+
+- **Load balancing: there is nothing to balance.** The notes below said tasks stay
+  where they are picked and there is no work stealing. The ready set is a single
+  array every core scans, so any core picks any runnable task and there is no queue
+  to steal from — but that is an argument, and the measurement it needed now prints:
+  `scheduling: 1946 context switch(es) over 4 core(s) — cpu0=464 cpu1=577 cpu2=523
+  cpu3=382`. Even spread, no core starved. A total alone could not have shown it.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not
@@ -990,8 +1053,12 @@ Not yet implemented:
   first thing to look for when "the kernel booted and then died". The one thing
   already in place is linking with `--fix-cortex-a53-843419`, the default for
   `aarch64-unknown-none`.
-- No load balancing: tasks stay where they are picked, and there is no work
-  stealing. Cross-core TLB shootdown for unmapping uses the broadcast `tlbi ...is`
-  variants (hardware agrees), which is enough for what unmaps today.
+- No *affinity* and no per-core run queues: every core scans one shared ready set,
+  which is why there is nothing to steal and why the switch spread comes out even
+  (see above). What is genuinely absent is any notion of keeping a task near the
+  core whose caches are warm for it — on a board with asymmetric cores that will
+  matter, and here it does not. Cross-core TLB shootdown for unmapping uses the
+  broadcast `tlbi ...is` variants (hardware agrees), which is enough for what
+  unmaps today.
 - The ECAM enumerator is bus-0, single-function, no bridges.
 - A second arch backend to validate the HAL boundary.

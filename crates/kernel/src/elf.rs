@@ -42,6 +42,27 @@ pub struct Segment<'a> {
     pub flags: u32,
 }
 
+/// One loadable segment as the *headers* describe it, with no reference to the
+/// bytes.
+///
+/// This is what a streaming loader needs: where the segment is in the file and how
+/// big it is, so it can fetch the bytes itself, from memory the kernel never has to
+/// hold. [`Segment`] is the same thing for a caller that already has the whole
+/// image in a slice.
+#[derive(Clone, Copy)]
+pub struct SegmentHeader {
+    /// Byte offset of the segment's file image within the ELF (`p_offset`).
+    pub offset: usize,
+    /// EL0 virtual address it must be mapped at (`p_vaddr`).
+    pub vaddr: u64,
+    /// Bytes of file image (`p_filesz`).
+    pub filesz: usize,
+    /// Total in-memory size (`p_memsz`), ≥ `filesz`; the difference is `.bss`.
+    pub memsz: usize,
+    /// Permission bits (`p_flags`): bit 0 = X, bit 1 = W, bit 2 = R.
+    pub flags: u32,
+}
+
 /// Read a little-endian `u16`/`u32`/`u64` at `off`, or `None` if out of range.
 fn read_u16(b: &[u8], off: usize) -> Option<u16> {
     b.get(off..off + 2)?.try_into().ok().map(u16::from_le_bytes)
@@ -78,6 +99,43 @@ impl<'a> Elf<'a> {
     #[must_use]
     pub fn entry(&self) -> u64 {
         self.entry
+    }
+
+    /// Visit every `PT_LOAD` segment's *header*, in program-header order, stopping
+    /// early if `f` returns `false`.
+    ///
+    /// Returns `false` if a header is truncated or `f` refused; `true` once all are
+    /// visited. Unlike [`for_each_load`](Elf::for_each_load) it never looks at the
+    /// segment bytes, so it works when only the headers were copied in — which is
+    /// the whole point: the bytes are the size, and the kernel should not have to
+    /// hold them to find out where they go.
+    pub fn for_each_load_header(&self, mut f: impl FnMut(SegmentHeader) -> bool) -> bool {
+        for i in 0..self.phnum {
+            let ph = self.phoff + i * self.phentsize;
+            let (Some(p_type), Some(p_flags)) =
+                (read_u32(self.image, ph), read_u32(self.image, ph + 4))
+            else {
+                return false;
+            };
+            if p_type != PT_LOAD {
+                continue;
+            }
+            let (Some(offset), Some(vaddr), Some(filesz), Some(memsz)) = (
+                read_u64(self.image, ph + 8).map(|v| v as usize),
+                read_u64(self.image, ph + 16),
+                read_u64(self.image, ph + 32).map(|v| v as usize),
+                read_u64(self.image, ph + 40).map(|v| v as usize),
+            ) else {
+                return false;
+            };
+            if filesz > memsz {
+                return false;
+            }
+            if !f(SegmentHeader { offset, vaddr, filesz, memsz, flags: p_flags }) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Visit every `PT_LOAD` segment in program-header order, passing each to `f`.

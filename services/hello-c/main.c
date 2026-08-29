@@ -1337,6 +1337,62 @@ static void check_threads(void)
            WORKERS, BUMPS, shared_counter, staros_threads_live());
 }
 
+/* A capability minted after a thread started must be usable *by that thread*.
+ *
+ * The kernel used to give each thread a copy of its creator's capability table, so
+ * a handle the kernel had just returned resolved in the thread that asked for it
+ * and was a bad handle in the thread that had to use it. Nothing in this program
+ * noticed, because every capability it held was minted before any thread existed —
+ * which is exactly the shape of a defect that waits for real software.
+ *
+ * The check is deliberately in that order: the worker blocks first, the main thread
+ * mints afterwards, and only then is the worker released. A test that minted first
+ * would pass on both kernels. */
+/* Zero-initialised, like `go_lock` above: this library's mutex and condition
+ * variable start usable at all-zero, which is what a static gives them. */
+static pthread_mutex_t late_lock;
+static pthread_cond_t late_signal;
+static int late_ready;
+static unsigned int late_cap;
+static size_t late_bytes_seen;
+
+static void *late_cap_worker(void *unused)
+{
+    (void)unused;
+    pthread_mutex_lock(&late_lock);
+    while (!late_ready)
+        pthread_cond_wait(&late_signal, &late_lock);
+    unsigned int cap = late_cap;
+    pthread_mutex_unlock(&late_lock);
+    /* The kernel answers this out of the caller's own table, so a size means the
+     * handle resolved here and not merely in the thread that created it. */
+    late_bytes_seen = staros_shared_bytes(cap);
+    return 0;
+}
+
+static void check_late_capability(void)
+{
+    pthread_t worker_id;
+    check(pthread_create(&worker_id, 0, late_cap_worker, 0) == 0,
+          "a thread that waits before any capability exists");
+
+    unsigned int cap = staros_shared_create(2 * 4096);
+    check(cap != 0, "a shared buffer minted after the thread was already running");
+
+    pthread_mutex_lock(&late_lock);
+    late_cap = cap;
+    late_ready = 1;
+    pthread_cond_broadcast(&late_signal);
+    pthread_mutex_unlock(&late_lock);
+    check(pthread_join(worker_id, 0) == 0, "the late-capability worker joined");
+
+    check(late_bytes_seen == 2 * 4096,
+          "a capability minted after a thread started resolves inside that thread");
+    printf("[hello-c] capabilities: a handle minted after a thread was running resolved "
+           "inside it, %lu bytes - one table per address space, not per task\n",
+           (unsigned long)late_bytes_seen);
+}
+
 /* Layer 6: descriptors you can wait on.
  *
  * This is the shape of an event loop — block in poll until something happens, with
@@ -1555,13 +1611,30 @@ static void check_endpoint(void)
     struct pollfd watch_request = { request, POLLIN, 0 };
     check(poll(&watch_request, 1, 10) == 0, "a send-only endpoint never becomes readable");
 
+    /* And the bounded receive, which is the same question without an event loop.
+     *
+     * The reply endpoint is empty and nobody is going to send to it, so this must
+     * come back — on time, with EAGAIN, and with the clock agreeing that it waited.
+     * The failure this catches is not "it returned the wrong number": it is a
+     * receive that never returns at all, which looks like a hung program and is
+     * reported as one. */
+    struct timespec t0, t1;
+    clock_gettime(0, &t0);
+    int timed = staros_msg_recv_timeout(reply, &msg, 20);
+    clock_gettime(0, &t1);
+    long long bounded = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL
+                        + (t1.tv_nsec - t0.tv_nsec);
+    check(timed == -11, "a timed receive on an empty endpoint returns EAGAIN");
+    check(bounded >= 20000000LL, "and it waited at least the timeout it was given");
+
     long long waited = (long long)(after.tv_sec - before.tv_sec) * 1000000000LL
                        + (after.tv_nsec - before.tv_nsec);
     close(loop_event);
     close(request);
     close(reply);
-    printf("[hello-c] endpoint in poll: a message from another process woke the loop in %lld ns\n",
-           waited);
+    printf("[hello-c] endpoint in poll: a message from another process woke the loop in %lld ns, "
+           "and a 20 ms bounded receive on an empty one gave up after %lld ns\n",
+           waited, bounded);
 }
 
 /* Shared buffers, from C.
@@ -2164,6 +2237,7 @@ int main(void)
     check_transfer();
     check_process();
     check_threads();
+    check_late_capability();
     check_poll();
     check_endpoint();
     check_shared();

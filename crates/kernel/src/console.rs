@@ -32,7 +32,7 @@
 //! bare `DebugPutc` can do is interleave whole glyphs, not tear the cursor.
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use staros_arch_aarch64::uart::Pl011;
 use staros_framebuffer::Console as FbConsole;
@@ -121,12 +121,49 @@ pub fn write_bytes(bytes: &[u8]) {
         console.write_byte(byte);
     }
     if mirroring() {
+        // Timed, because this is the longest uninterruptible stretch the kernel
+        // has: the whole screen is copied up whenever a line reaches the bottom,
+        // under this lock with interrupts masked. G3.2 measured the effect from the
+        // outside — a 20 ms sleep overshooting by hundreds of milliseconds — and an
+        // effect measured from the outside cannot say whether a change to the code
+        // helped. This can.
+        let started = staros_arch_aarch64::timer::monotonic_ns();
         if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
             for &byte in bytes {
                 fb.write_byte(byte);
             }
         }
+        // Bytes always, nanoseconds only when there is a clock. The console runs
+        // long before `init_monotonic` — the boot log's first lines are printed by
+        // a kernel that cannot yet tell the time — and counting bytes only when it
+        // can would report a mirror that painted nothing for the whole early boot.
+        MIRROR_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if let (Some(a), Some(b)) = (started, staros_arch_aarch64::timer::monotonic_ns()) {
+            MIRROR_NS.fetch_add(b.saturating_sub(a), Ordering::Relaxed);
+            MIRROR_TIMED.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
     }
+}
+
+/// Nanoseconds spent painting the framebuffer mirror, and bytes put through it.
+///
+/// Only the mirror: the UART is a byte at a time into a device register and is the
+/// same cost whoever owns the screen. What this measures is the part that scrolls.
+static MIRROR_NS: AtomicU64 = AtomicU64::new(0);
+static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Of those bytes, the ones painted while a clock existed — the only ones
+/// `MIRROR_NS` describes. Reporting a rate over *all* bytes would divide a real
+/// time by a count that includes the early boot it never measured.
+static MIRROR_TIMED: AtomicU64 = AtomicU64::new(0);
+
+/// `(nanoseconds, bytes painted, bytes actually timed)` for the framebuffer mirror.
+#[must_use]
+pub fn mirror_cost() -> (u64, u64, u64) {
+    (
+        MIRROR_NS.load(Ordering::Relaxed),
+        MIRROR_BYTES.load(Ordering::Relaxed),
+        MIRROR_TIMED.load(Ordering::Relaxed),
+    )
 }
 
 /// Write `args` followed by a newline, as one uninterruptible message.
@@ -137,9 +174,22 @@ pub fn println(args: core::fmt::Arguments) {
     let _ = console.write_fmt(args);
     console.write_str("\n");
     if mirroring() {
+        // Timed like `write_bytes`, because most of the boot log comes through
+        // here: instrumenting only the other path measured the mirror on the lines
+        // user space prints and none of the ones the kernel does, which is most of
+        // the scrolling.
+        let started = staros_arch_aarch64::timer::monotonic_ns();
+        let mut painted = 0u64;
         if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
+            let before = fb.written();
             let _ = fb.write_fmt(args);
             fb.write_byte(b'\n');
+            painted = fb.written() - before;
+        }
+        MIRROR_BYTES.fetch_add(painted, Ordering::Relaxed);
+        if let (Some(a), Some(b)) = (started, staros_arch_aarch64::timer::monotonic_ns()) {
+            MIRROR_NS.fetch_add(b.saturating_sub(a), Ordering::Relaxed);
+            MIRROR_TIMED.fetch_add(painted, Ordering::Relaxed);
         }
     }
 }

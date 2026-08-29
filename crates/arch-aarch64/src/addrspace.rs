@@ -450,7 +450,44 @@ impl AddressSpace {
         memsz: usize,
         flags: u32,
     ) -> bool {
-        if !vaddr.is_multiple_of(PAGE_4K) {
+        // SAFETY: forwarded from this function's contract; the filler only copies
+        // out of a slice the caller owns.
+        unsafe {
+            self.map_segment_with(alloc, vaddr, file.len(), memsz, flags, |at, dst| {
+                dst.copy_from_slice(&file[at..at + dst.len()]);
+                true
+            })
+        }
+    }
+
+    /// As [`map_segment`](AddressSpace::map_segment), but the segment's bytes are
+    /// produced a page at a time by `fill(offset_in_segment, dst)` instead of being
+    /// handed over as one slice.
+    ///
+    /// This is what makes loading an image bigger than the kernel heap possible. The
+    /// loader used to copy the whole ELF into kernel memory before parsing it, for
+    /// two honest reasons — the parser wants a contiguous slice, and EL1 cannot
+    /// dereference EL0 memory under PAN — and paid for it with a cap on the size of
+    /// a program: 256 KiB, against a Qt binary of twenty-one megabytes. With a
+    /// filler, only the headers need copying; every segment page is filled straight
+    /// into its frame from wherever the bytes actually live.
+    ///
+    /// `fill` returns `false` to abort the load — a source that cannot supply the
+    /// bytes must not leave a half-loaded program that starts and then executes
+    /// zeroes.
+    ///
+    /// # Safety
+    /// Same preconditions as [`map_segment`](AddressSpace::map_segment).
+    pub unsafe fn map_segment_with<A: FrameAllocator>(
+        &mut self,
+        alloc: &mut A,
+        vaddr: u64,
+        filesz: usize,
+        memsz: usize,
+        flags: u32,
+        mut fill: impl FnMut(usize, &mut [u8]) -> bool,
+    ) -> bool {
+        if !vaddr.is_multiple_of(PAGE_4K) || filesz > memsz {
             return false;
         }
         let pages = (memsz as u64).div_ceil(PAGE_4K);
@@ -467,19 +504,21 @@ impl AddressSpace {
             };
             let frame = frame.0 as u64;
             // SAFETY: fresh, uniquely-owned frame, reachable through the linear
-            // map. Zero it, then overlay whatever slice of the file image falls in
-            // this page; bytes past `file` stay zero, giving the `.bss` tail for
-            // free.
-            unsafe {
-                zero_frame(frame);
-                let start = (i * PAGE_4K) as usize;
-                if start < file.len() {
-                    let n = core::cmp::min(PAGE_4K as usize, file.len() - start);
-                    core::ptr::copy_nonoverlapping(
-                        file.as_ptr().add(start),
-                        mmu::phys_to_virt(frame) as *mut u8,
-                        n,
-                    );
+            // map. Zero it first, then let the filler overlay whatever part of the
+            // file image falls in this page; bytes past `filesz` stay zero, which
+            // is the `.bss` tail for free.
+            unsafe { zero_frame(frame) };
+            let start = (i * PAGE_4K) as usize;
+            if start < filesz {
+                let n = core::cmp::min(PAGE_4K as usize, filesz - start);
+                // SAFETY: the frame is fresh and uniquely ours until it is mapped
+                // below, and its linear-map address is writable at EL1.
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut(mmu::phys_to_virt(frame) as *mut u8, n)
+                };
+                if !fill(start, dst) {
+                    alloc.free(PhysAddr(frame as usize));
+                    return false;
                 }
             }
             let desc = if flags & PF_X != 0 {

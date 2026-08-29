@@ -131,7 +131,16 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // Receive a message: `x0` = endpoint *handle*, `x1` = pointer to a user
         // `Message` to fill. A transferred capability is installed into the
         // receiver's table and its new handle written into `Message.cap`.
-        Some(Syscall::Recv) => {
+        // `Recv` and `RecvUntil` differ in one argument and nothing else, so they
+        // share the body: a deadline of zero is "no deadline", the same reading
+        // `WaitAny` gives it, because a deadline at time zero is always already
+        // past and honouring it literally would make every such call a poll that
+        // never waits.
+        Some(kind @ (Syscall::Recv | Syscall::RecvUntil)) => {
+            let deadline = match kind {
+                Syscall::RecvUntil => (req.args[2] != 0).then_some(req.args[2]),
+                _ => None,
+            };
             let id = match sched::resolve_cap(req.args[0] as u32) {
                 Some(Cap::Endpoint { obj, recv: true, .. }) => match obj::get(obj) {
                     Some(Object::Endpoint { id }) => id,
@@ -140,7 +149,7 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
                 Some(_) => return KError::PermissionDenied.as_raw(),
                 None => return KError::BadHandle.as_raw(),
             };
-            let km = match ipc::recv(id) {
+            let km = match ipc::recv_until(id, deadline) {
                 Ok(km) => km,
                 Err(e) => return e.as_raw(),
             };
@@ -283,12 +292,16 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // bytes came from — giving it a path would mean giving it an archive
         // parser, and that lives in user space here.
         Some(Syscall::SpawnImage) => {
-            /// Ceiling on an image handed over in one call. The bytes are copied
-            /// into the kernel heap to be parsed, so this is a real limit on kernel
-            /// memory, not a policy: a bigger program needs the loader to stream
-            /// segments straight from the caller's pages instead, which is work for
-            /// the phase that has a program that big.
-            const MAX_IMAGE_BYTES: usize = 256 * 1024;
+            /// Ceiling on an image handed over in one call.
+            ///
+            /// It was 256 KiB, and that was a limit on *kernel heap*: the whole
+            /// image was copied in to be parsed. The loader now copies only the
+            /// headers and fills each segment page straight from the caller's pages,
+            /// so what is left to bound is the caller's own mapping — 64 MiB, which
+            /// is larger than any program this tree builds (the QML one is 21 MiB)
+            /// and small enough that a nonsense length is still refused rather than
+            /// walked.
+            const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
             let ptr = req.args[0];
             let len = req.args[1] as usize;
             if len == 0 || len > MAX_IMAGE_BYTES {

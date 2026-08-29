@@ -56,6 +56,19 @@ int staros_msg_send(int fd, const struct staros_message *msg);
  * might wait on already is. Returns 0 or -errno. */
 int staros_msg_recv(int fd, struct staros_message *msg);
 
+/* Receive one message, giving up after `timeout_ms` milliseconds. Returns 0 on
+ * delivery, -EAGAIN if the time passed with nothing to take, or another -errno.
+ *
+ * `poll` is still the right answer when several sources are in play — that is what
+ * an event loop is — but a client waiting for the answer to one request does not
+ * need a loop, and until this existed the only bounded wait was a notification
+ * bound to the endpoint plus `poll`: three calls to say "wait, but not forever".
+ *
+ * The bound is honest under preemption: milliseconds here become an absolute
+ * deadline at the syscall, so a caller descheduled between asking and waiting does
+ * not quietly wait longer than it meant to. */
+int staros_msg_recv_timeout(int fd, struct staros_message *msg, int timeout_ms);
+
 /* ---- Shared buffers ----------------------------------------------------- */
 
 /* Allocate `bytes` of memory that can be shared with another process, rounded up

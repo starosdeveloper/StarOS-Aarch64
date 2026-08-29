@@ -1971,6 +1971,24 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     }
     let _ = writeln!(console, "preemption: timer ticks per core —{ticks}");
 
+    // Where the work actually ran. The architecture notes called the absence of a
+    // load balancer a limitation; the ready set is one array every core scans, so
+    // there is no queue to balance and nobody to steal from — but that is an
+    // argument, and this is the measurement it needed.
+    let (switches, busy_cores) = sched::switch_spread();
+    let mut spread = alloc::string::String::new();
+    let mut total = 0;
+    for (cpu, &n) in switches.iter().enumerate() {
+        total += n;
+        if n > 0 {
+            let _ = core::fmt::Write::write_fmt(&mut spread, format_args!(" cpu{cpu}={n}"));
+        }
+    }
+    let _ = writeln!(
+        console,
+        "scheduling: {total} context switch(es) over {busy_cores} core(s) —{spread}",
+    );
+
     // The IPC contention test's other half. The receiver already reported that the
     // *arithmetic* held (no message lost or duplicated); this says the traffic was
     // genuinely spread across cores rather than serialised on one — the difference
@@ -2001,6 +2019,22 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         console,
         "ipc storm: {total_sends} sends / {total_recvs} recvs on one endpoint —{spread} \
          ({send_cores} core(s) sending, {recv_cores} receiving) — {verdict}",
+    );
+
+    // What the console cost while it still owned the screen.
+    //
+    // The scroll is the longest uninterruptible section in this kernel: every line
+    // that reaches the bottom copies the whole screen up, under the console lock
+    // with interrupts masked. It was measured from the outside in G3.2 — a 20 ms
+    // sleep overshooting by hundreds of milliseconds — and that number cannot say
+    // whether a change to the code helped, because it moves with everything else.
+    let (mirror_ns, mirror_bytes, mirror_timed) = console::mirror_cost();
+    let per_byte = mirror_ns.checked_div(mirror_timed).unwrap_or(0);
+    let _ = writeln!(
+        console,
+        "console mirror: {mirror_bytes} byte(s) painted, {mirror_timed} timed at {} us \
+         ({per_byte} ns/byte, scroll included)",
+        mirror_ns / 1_000,
     );
 
     // A shared buffer, built here rather than by a client, to say out loud what its
@@ -2185,34 +2219,50 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
 /// off a network, or from a compiler that just finished — and the kernel still has
 /// no idea what an archive or a filesystem is.
 ///
-/// The image is copied into the kernel heap before it is parsed, which is the
-/// honest reason for the size cap at the syscall. Two things force the copy: the
-/// ELF parser wants a contiguous slice, and reading EL0 memory directly from EL1
-/// faults under PAN on real hardware. Streaming each segment through a page-sized
-/// bounce buffer would lift the cap; nothing yet needs it.
+/// Only the **headers** are copied into the kernel. Each segment is then filled a
+/// page at a time straight from the caller's memory into the frame that will hold
+/// it, so kernel memory does not scale with the size of the program.
+///
+/// It used to copy the whole image, for two honest reasons — the ELF parser wants a
+/// contiguous slice, and EL1 cannot dereference EL0 memory under PAN — and the
+/// price was a 256 KiB cap on any program started this way. That is a strange limit
+/// for a system whose own QML program is twenty-one megabytes: the cap did not
+/// describe what a process may be, it described how much of one the kernel was
+/// willing to hold in its heap at once.
 ///
 /// A capability-less child, exactly like [`spawn_child`]: it earns authority only
 /// by being sent it.
 pub fn spawn_image(ptr: u64, len: usize, id: u8) -> isize {
-    let mut bytes = alloc::vec::Vec::new();
-    if bytes.try_reserve_exact(len).is_err() {
+    /// How much of the front of the image is copied in to be parsed: the ELF header
+    /// and the program-header table.
+    ///
+    /// Sixty-four kilobytes is far more than either needs — a program header is 56
+    /// bytes and a static binary has a handful — and it is bounded, which the image
+    /// is not. The headers are the only part that has to be a contiguous slice,
+    /// because that is what the parser reads; the segments do not, and they are all
+    /// of the size.
+    const HEADER_BYTES: usize = 64 * 1024;
+
+    let header_len = core::cmp::min(len, HEADER_BYTES);
+    let mut headers = alloc::vec::Vec::new();
+    if headers.try_reserve_exact(header_len).is_err() {
         return KError::OutOfResources.as_raw();
     }
-    bytes.resize(len, 0);
+    headers.resize(header_len, 0);
     // SAFETY: the caller's address space is active and the syscall layer confirmed
     // every byte of `[ptr, ptr + len)` is mapped EL0-readable in its own tables;
-    // `bytes` is exactly `len` long. `copy_from_user` uses unprivileged loads, so
-    // this is sound under PAN.
-    unsafe { staros_arch_aarch64::usercopy::copy_from_user(&mut bytes, ptr) };
+    // `headers` is exactly `header_len` long and `header_len <= len`.
+    // `copy_from_user` uses unprivileged loads, so this is sound under PAN.
+    unsafe { staros_arch_aarch64::usercopy::copy_from_user(&mut headers, ptr) };
 
-    let Some(image) = elf::Elf::parse(&bytes) else {
+    let Some(image) = elf::Elf::parse(&headers) else {
         return KError::InvalidArgument.as_raw();
     };
     // SAFETY: as `spawn_child` — the MMU is on with the frame pool identity-mapped
     // and writable, and every frame allocated here is uniquely owned.
     let space = mem::with(|frames| unsafe {
         let mut s = AddressSpace::new(frames)?;
-        if !load_segments(&mut s, frames, &image) {
+        if !load_segments_streamed(&mut s, frames, &image, ptr, len) {
             s.destroy(frames);
             return None;
         }
@@ -2524,6 +2574,53 @@ extern "C" fn user_task_entry() {
 /// # Safety
 /// As [`AddressSpace::map_segment`]: the RAM frame pool must be identity-mapped
 /// and writable so each freshly allocated frame is writable here at VA == PA.
+/// Load every `PT_LOAD` segment of `image` by copying its bytes **out of the
+/// caller's own memory**, a page at a time, into the frames that will hold them.
+///
+/// `user_base`/`user_len` describe the whole ELF as it sits in EL0. Nothing but the
+/// headers was ever copied into the kernel, so this is where the size of a program
+/// stops being the kernel's problem: a twenty-one megabyte binary costs twenty-one
+/// megabytes of *the child's* frames and one page-sized copy at a time in between.
+///
+/// Every source range is checked against the image's own length before it is read.
+/// A segment whose `p_offset`/`p_filesz` reach past the end of the file is a
+/// malformed ELF, and reading it would be reading whatever the caller happens to
+/// have mapped after its buffer — the caller's memory, at the caller's request,
+/// which is the shape of an exploit rather than of a mistake.
+///
+/// # Safety
+/// Same preconditions as [`load_segments`]; additionally the caller's address space
+/// must be the active one, and `[user_base, user_base + user_len)` must have been
+/// confirmed EL0-readable in it.
+unsafe fn load_segments_streamed<A: FrameAllocator>(
+    space: &mut AddressSpace,
+    frames: &mut A,
+    image: &elf::Elf,
+    user_base: u64,
+    user_len: usize,
+) -> bool {
+    image.for_each_load_header(|seg| {
+        let Some(end) = seg.offset.checked_add(seg.filesz) else {
+            return false;
+        };
+        if end > user_len {
+            return false;
+        }
+        // SAFETY: preconditions forwarded; the filler reads only inside the range
+        // the syscall layer checked, using unprivileged loads.
+        unsafe {
+            space.map_segment_with(frames, seg.vaddr, seg.filesz, seg.memsz, seg.flags, |at, dst| {
+                // `[from, from + dst.len())` lies inside the checked image range,
+                // and `copy_from_user` uses unprivileged loads, so it is sound
+                // under PAN.
+                let from = user_base + (seg.offset + at) as u64;
+                staros_arch_aarch64::usercopy::copy_from_user(dst, from);
+                true
+            })
+        }
+    })
+}
+
 unsafe fn load_segments<A: FrameAllocator>(
     space: &mut AddressSpace,
     frames: &mut A,

@@ -346,6 +346,26 @@ pub enum Syscall {
     /// frames that are megabytes each, and the day a program walks to the end of the
     /// region is the day that changes.
     Unmap = 34,
+
+    /// Receive from the endpoint `x0` names into the message at `x1`, giving up
+    /// when the monotonic clock reaches the absolute deadline in `x2`. Zero means
+    /// no deadline, which is exactly [`Recv`](Syscall::Recv).
+    ///
+    /// Returns 0 on delivery, or [`WouldBlock`] when the deadline passed with
+    /// nothing to take — the same answer [`WaitAny`](Syscall::WaitAny) gives for
+    /// the same situation, because it is the same situation.
+    ///
+    /// Absolute, for the reason `SleepUntil` is: a duration is measured from
+    /// whenever the call gets to run, so a caller preempted between working it out
+    /// and asking waits longer than it meant to and cannot tell.
+    ///
+    /// Until this existed, waiting with a bound meant binding a notification to the
+    /// endpoint and using `WaitAny` — three syscalls and a notification per
+    /// endpoint to say "wait, but not forever". A client waiting for an answer that
+    /// may never come is an ordinary thing to be, not an advanced one.
+    ///
+    /// [`WouldBlock`]: crate::error::KError::WouldBlock
+    RecvUntil = 35,
 }
 
 impl Syscall {
@@ -388,6 +408,7 @@ impl Syscall {
             32 => Some(Syscall::NotifyOnExit),
             33 => Some(Syscall::SendNoWait),
             34 => Some(Syscall::Unmap),
+            35 => Some(Syscall::RecvUntil),
             _ => None,
         }
     }
@@ -399,11 +420,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=34 {
+        for n in 0..=35 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(35), None);
+        assert_eq!(Syscall::from_raw(36), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

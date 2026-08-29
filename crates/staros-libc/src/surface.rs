@@ -219,6 +219,62 @@ pub mod exports {
             -EMSGSIZE
         }
     }
+
+    /// Receive one message, giving up after `timeout_ms` milliseconds. Returns 0 on
+    /// delivery, `-EAGAIN` when the timeout passed with nothing to take, or another
+    /// negated errno.
+    ///
+    /// Milliseconds here and an absolute deadline at the syscall, because the two
+    /// layers answer to different callers: C code counts a timeout from now, like
+    /// `poll` does, and the kernel must be told a point in time so that a caller
+    /// preempted between working it out and asking does not silently wait longer
+    /// than it meant to.
+    ///
+    /// Waiting with a bound used to cost a notification bound to the endpoint plus
+    /// `poll` — three syscalls to express "wait, but not forever", which is an
+    /// ordinary thing for a client to want and not an advanced one.
+    ///
+    /// # Safety
+    /// C ABI: `msg` points to a [`StarosMessage`] this call fills in.
+    #[no_mangle]
+    pub unsafe extern "C" fn staros_msg_recv_timeout(
+        fd: c_int,
+        msg: *mut StarosMessage,
+        timeout_ms: c_int,
+    ) -> c_int {
+        const EAGAIN: c_int = 11;
+        if msg.is_null() || timeout_ms < 0 {
+            return -EINVAL;
+        }
+        let Some(crate::fd::Kind::Endpoint { cap, .. }) = crate::fd::get(fd) else {
+            return -EBADF;
+        };
+        // No clock is not "wait forever": a caller that asked for a bound and got an
+        // unbounded wait has no way to notice, and the whole point of the call is
+        // the bound.
+        let Some(now) = sys::clock_now() else {
+            return -EINVAL;
+        };
+        let deadline = now.saturating_add((timeout_ms as u64).saturating_mul(1_000_000));
+        match sys::recv_until(u64::from(cap), deadline) {
+            Ok(received) => {
+                // SAFETY: forwarded from the caller; one whole message, and the
+                // layouts are the same type under two names.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::from_ref(&received).cast::<u8>(),
+                        msg.cast::<u8>(),
+                        size_of::<StarosMessage>(),
+                    );
+                }
+                0
+            }
+            // -5 is `WouldBlock`, which for a timed receive means the timeout, and
+            // `EAGAIN` is the errno C callers already test for after a timed wait.
+            Err(-5) => -EAGAIN,
+            Err(_) => -EMSGSIZE,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -466,7 +466,14 @@ req "no increments lost"
 # its typeface from — and until this config carried an archive there was no machine
 # in the matrix where the whole stack could run. The font assertion below is the one
 # that could not exist without it.
-run ramfb-el2-smp4 90 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M -device ramfb ${INITRAMFS:+-initrd "$INITRAMFS"}
+# 240 seconds, not the 90 every other config gets. This is the only one that runs
+# the whole stack — a Qt program, then a QML scene for its full fifteen seconds,
+# then a C program that cycles 64 MiB through the frame pool — and the fuse was set
+# when it did none of that. It blew on a loaded host and reported the config as
+# failed, which is a true statement about the stopwatch and a false one about the
+# kernel: the log ends mid-run with `terminating on signal 15 (timeout)` and every
+# assertion up to that point had passed. A timeout is a fuse, not a schedule.
+run ramfb-el2-smp4 240 -- -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M -device ramfb ${INITRAMFS:+-initrd "$INITRAMFS"}
 req "framebuffer: ramfb 640x480 online"
 # The screen leaves the kernel: a process is handed the pixels, and a second
 # process with nothing but two endpoint capabilities gets its surface onto a

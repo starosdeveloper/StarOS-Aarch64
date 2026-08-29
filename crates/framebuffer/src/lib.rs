@@ -206,11 +206,7 @@ impl<'a> Framebuffer<'a> {
 
     /// Fill the whole framebuffer with one colour.
     pub fn clear(&mut self, color: Rgb) {
-        for y in 0..self.height {
-            for x in 0..self.width {
-                self.put_pixel(x, y, color);
-            }
-        }
+        self.fill_rows(0, self.height, color);
     }
 
     /// Draw one 8x8 glyph with its top-left at pixel `(ox, oy)`. Set bits get
@@ -239,9 +235,31 @@ impl<'a> Framebuffer<'a> {
         // Move rows [rows, height) up to [0, height-rows).
         self.buf.copy_within(shift..end, 0);
         // Clear the newly exposed rows at the bottom.
-        for y in (self.height - rows)..self.height {
-            for x in 0..self.width {
-                self.put_pixel(x, y, bg);
+        //
+        // A row at a time, not a pixel at a time. This is the console's hot path —
+        // every line of a boot log that reaches the bottom of the screen runs it —
+        // and `put_pixel` re-derives the byte offset, re-encodes the colour and
+        // bounds-checks twice for each of ten thousand pixels. The colour is one
+        // value for the whole fill, so it is encoded once and written as bytes.
+        self.fill_rows(self.height - rows, rows, bg);
+    }
+
+    /// Paint `count` whole rows starting at `top` in one colour.
+    ///
+    /// Byte-wise and pattern-based rather than per pixel: the encoded colour is the
+    /// same for every pixel of the fill, so the only work that has to happen per
+    /// pixel is the store itself.
+    pub fn fill_rows(&mut self, top: usize, count: usize, color: Rgb) {
+        let bpp = self.format.bytes_per_pixel as usize;
+        let word = self.format.encode(color.r, color.g, color.b).to_le_bytes();
+        let span = self.width * bpp;
+        for y in top..core::cmp::min(top + count, self.height) {
+            let off = y * self.pitch;
+            let Some(row) = self.buf.get_mut(off..off + span) else {
+                return;
+            };
+            for px in row.chunks_exact_mut(bpp) {
+                px.copy_from_slice(&word[..bpp]);
             }
         }
     }
@@ -262,6 +280,13 @@ pub struct Console<'a> {
     row: usize,
     fg: Rgb,
     bg: Rgb,
+    /// Bytes written since this console was made.
+    ///
+    /// Here rather than in the caller because the caller does not always know: a
+    /// formatted line is handed to `write_fmt` as arguments, and how many bytes
+    /// that turns into is decided in here. A profile that guessed the length would
+    /// be reporting a rate per byte it never counted.
+    written: u64,
 }
 
 impl<'a> Console<'a> {
@@ -279,7 +304,16 @@ impl<'a> Console<'a> {
             row: 0,
             fg,
             bg,
+            written: 0,
         }
+    }
+
+    /// Bytes this console has written since it was made. See [`Console::written`]
+    /// on the field: the count belongs here because formatted output decides its
+    /// own length inside this type.
+    #[must_use]
+    pub const fn written(&self) -> u64 {
+        self.written
     }
 
     /// Columns (character cells across).
@@ -316,6 +350,7 @@ impl<'a> Console<'a> {
 
     /// Write one byte, interpreting the control codes a console needs.
     pub fn write_byte(&mut self, byte: u8) {
+        self.written += 1;
         match byte {
             b'\n' => self.newline(),
             b'\r' => self.col = 0,

@@ -262,6 +262,27 @@ pub(crate) fn recv(endpoint: u64) -> Option<Message> {
     (rc >= 0).then_some(msg)
 }
 
+/// As [`recv`], but give up at the absolute monotonic `deadline_ns`. `Err(rc)`
+/// carries the kernel's negative result, which is `WouldBlock` when the deadline
+/// passed with nothing to take.
+pub(crate) fn recv_until(endpoint: u64, deadline_ns: u64) -> Result<Message, isize> {
+    let mut msg = Message::new();
+    // SAFETY: `RecvUntil` writes one `Message` through this pointer.
+    let rc = unsafe {
+        syscall3(
+            Syscall::RecvUntil,
+            endpoint,
+            core::ptr::from_mut(&mut msg) as u64,
+            deadline_ns,
+        )
+    };
+    if rc >= 0 {
+        Ok(msg)
+    } else {
+        Err(rc)
+    }
+}
+
 /// Ask the kernel to signal `notification` whenever a message arrives at
 /// `endpoint`. Returns the raw result: `0` when bound, and otherwise a negative
 /// `KError` the caller has to tell apart — `PermissionDenied` means a send-only

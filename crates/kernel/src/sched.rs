@@ -44,6 +44,7 @@
 //! could deadlock in a cycle.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -118,7 +119,22 @@ struct Task {
     /// device mapping to the *caller's* space.
     space: Option<AddressSpace>,
     /// This task's capability table: the objects it may act on, named by handle.
-    caps: CapTable,
+    /// The capability table, **shared by every task in the same address space**.
+    ///
+    /// A thread used to get a *copy* of its creator's, and the consequence was
+    /// written down and lived with: a capability minted after the thread started
+    /// was invisible to it. That is fine until a program does the ordinary thing —
+    /// a worker thread that opens a file, or a Qt thread handed an endpoint — and
+    /// then the handle the kernel returned resolves in one thread and is a bad
+    /// handle in the next, which reads as memory corruption rather than as a
+    /// missing share.
+    ///
+    /// `Arc<SpinLock<_>>` rather than the table inline: the tasks are separate
+    /// `Box`es in a scheduler array, so there is nowhere for one owner to live, and
+    /// the lock is what makes two threads installing at once safe. It is a leaf —
+    /// taken briefly, never across a context switch, and nothing under it reaches
+    /// back into the scheduler.
+    caps: Arc<SpinLock<CapTable>>,
     /// Where this task enters EL0, if it is not simply the program's ELF entry on
     /// the standard stack: `(entry, stack top, argument)`.
     ///
@@ -526,10 +542,13 @@ fn post_switch() {
 ///   anonymous memory — allocated here, fixed-size, with no demand growth.
 /// - **The thread pointer.** `tls` rides in the saved context (see
 ///   [`CpuContext::set_tls`]), because it must change on every switch.
-/// - **The capability table.** The thread gets a *copy* of its creator's. Not a
-///   share: the tables are per-task arrays, and making them shared is a larger
-///   change than this needs. The consequence is honest and worth knowing — a
-///   capability minted *after* the thread starts is not visible to it.
+/// - **The capability table.** Shared with the creator, not copied. It used to be
+///   a copy, and the consequence was recorded rather than fixed: a capability
+///   minted after the thread started was invisible to it. That holds until a
+///   program does something ordinary — a worker thread that opens a file, a Qt
+///   thread handed an endpoint — and then a handle the kernel has just returned is
+///   a bad handle in the thread that has to use it. Sharing is what a thread is
+///   for every other resource here, and there was no reason for this one to differ.
 pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
     let cpu = me();
     let (cur, _old_space, caps, pid, shared, devices) = {
@@ -539,7 +558,7 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
             Some(s) => (
                 cur,
                 s,
-                sched.tasks[cur].caps.clone(),
+                Arc::clone(&sched.tasks[cur].caps),
                 sched.tasks[cur].pid,
                 sched.tasks[cur].shared,
                 sched.tasks[cur].devices,
@@ -661,6 +680,8 @@ fn me() -> usize {
 ///
 /// Returns the new task's id, or `None` if it could not be allocated.
 pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -> Option<u64> {
+    // A fresh process gets a table of its own; threads of it will share this one.
+    let caps = Arc::new(SpinLock::new(caps));
     // Build the whole task *before* taking the lock. Partly to keep the lock
     // short, but mainly to keep the lock order a straight line: allocating takes
     // the heap's lock, and doing that underneath the scheduler's would nest two
@@ -874,6 +895,14 @@ fn reschedule() {
         sched.tasks[next].state = State::Running;
         sched.tasks[next].on_cpu.store(true, Ordering::Relaxed);
         sched.current[cpu] = next;
+        // Counted per core, because "there is no load balancing" was written down
+        // as a limitation and is not one: the ready set is a single array every
+        // core scans, so any core picks any runnable task and there is nobody to
+        // steal from. Whether that actually spreads work is a question about
+        // behaviour, and a claim about behaviour needs a number.
+        if cpu < boot::MAX_CPUS {
+            SWITCHES[cpu].fetch_add(1, Ordering::Relaxed);
+        }
         // Hand `prev` to our successor: it clears `prev.on_cpu` once the switch
         // below has saved `prev`'s context. Until then `prev` is `Ready` but not
         // `pickable`, so no core loads it stale.
@@ -1179,6 +1208,38 @@ pub fn block_for_message() -> KMessage {
     sched.tasks[me].mailbox.take().expect("woken without a message")
 }
 
+/// Context switches performed by each core.
+static SWITCHES: [AtomicU64; boot::MAX_CPUS] = [const { AtomicU64::new(0) }; boot::MAX_CPUS];
+
+/// How many context switches each core performed, and how many cores did any.
+///
+/// The pair is what makes the number readable: eight hundred switches on one core
+/// out of four is a scheduler that never spread, and the same eight hundred across
+/// four is one that did, and the totals alone cannot tell them apart.
+#[must_use]
+pub fn switch_spread() -> ([u64; boot::MAX_CPUS], u32) {
+    let mut per_cpu = [0u64; boot::MAX_CPUS];
+    let mut busy = 0;
+    for cpu in 0..boot::MAX_CPUS {
+        per_cpu[cpu] = SWITCHES[cpu].load(Ordering::Relaxed);
+        busy += u32::from(per_cpu[cpu] > 0);
+    }
+    (per_cpu, busy)
+}
+
+/// Take the message a sender left for this task, if there is one.
+///
+/// The mailbox is filled *before* the task is made runnable, so after a wait that
+/// could end two ways — a delivery or a deadline — this is what says which
+/// happened. Reading the clock instead would race: a sender can deliver in the
+/// microsecond before a deadline the clock has already passed, and the message
+/// would then be dropped by the very call that received it.
+pub fn take_mailbox() -> Option<KMessage> {
+    let mut sched = SCHED.lock();
+    let me = sched.current[me()];
+    sched.tasks[me].mailbox.take()
+}
+
 /// Block the current task until a peer unblocks it. Called from the `Send` path
 /// when the endpoint ring is full; the receiver that drains it wakes us.
 pub fn block_current() {
@@ -1391,14 +1452,17 @@ pub fn deliver(task: usize, km: KMessage) {
 /// returning the new handle (or `None` if the table is full). This is how a
 /// received capability becomes usable — dynamic, per-task capability allocation.
 pub fn install_cap_current(cap: Cap) -> Option<u32> {
-    let mut sched = SCHED.lock();
-    let me = sched.current[me()];
-    // Growing the table allocates, so this takes the heap's lock under the
-    // scheduler's. That order is safe because the heap is a leaf — nothing under
-    // it reaches back into the scheduler — and it is the same direction as the
-    // scheduler-then-frames nesting in `map_anon_current`. The reverse never
-    // happens.
-    cap::install(&mut sched.tasks[me].caps, cap)
+    // The handle to the table is taken under the scheduler lock and the table
+    // itself is locked after that lock is dropped. Not tidiness: growing the table
+    // allocates, and holding the scheduler across a heap that another core may be
+    // waiting on turns a short critical section into a queue behind it.
+    let caps = {
+        let sched = SCHED.lock();
+        let me = sched.current[me()];
+        Arc::clone(&sched.tasks[me].caps)
+    };
+    let mut table = caps.lock();
+    cap::install(&mut table, cap)
 }
 
 /// Resolve `handle` against the *current* task's capability table, returning the
@@ -1409,12 +1473,16 @@ pub fn resolve_cap(handle: u32) -> Option<Cap> {
     if handle == 0 {
         return None;
     }
-    let sched = SCHED.lock();
-    let cur = sched.current[me()];
-    // `get` rather than an index: the table is per-task and sized to what that
-    // task was granted, so a handle past its end is an ordinary "no such
-    // capability" and must not be a panic.
-    sched.tasks[cur].caps.get(handle as usize).copied().flatten()
+    let caps = {
+        let sched = SCHED.lock();
+        let cur = sched.current[me()];
+        Arc::clone(&sched.tasks[cur].caps)
+    };
+    // `get` rather than an index: the table is sized to what the address space was
+    // granted, so a handle past its end is an ordinary "no such capability" and
+    // must not be a panic.
+    let table = caps.lock();
+    table.get(handle as usize).copied().flatten()
 }
 
 /// Map the device page at physical `dev_phys` into the *current* task's address

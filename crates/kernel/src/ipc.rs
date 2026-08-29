@@ -388,7 +388,27 @@ fn send_inner(ep: usize, km: KMessage, may_block: bool) -> isize {
 /// Receive from endpoint `ep`: return a buffered message, or block until one
 /// arrives. Draining a slot wakes a blocked sender (moving its message into the
 /// freed slot). Returns the [`KMessage`] or a negative [`KError`].
-pub fn recv(ep: usize) -> Result<KMessage, KError> {
+/// Receive from endpoint `ep`: return a buffered message, or wait for one until
+/// `deadline_ns` on the monotonic clock. Draining a slot wakes a blocked sender
+/// (moving its message into the freed slot).
+///
+/// `None` waits for ever, which is what a server that has nothing else to do
+/// should do. A deadline is for the callers that do: a client waiting for an
+/// answer that may never come, and a service that must notice a peer went away.
+/// Without this the only way to wait with a bound was to bind a notification to
+/// the endpoint and use `WaitAny`, which is three syscalls and a notification per
+/// endpoint to express "wait, but not forever".
+///
+/// Absolute, like `SleepUntil` and `WaitAny`, and for the same reason: a duration
+/// is measured from whenever the call happens to run, so a caller preempted
+/// between computing it and asking for it waits longer than it asked, and cannot
+/// tell.
+///
+/// The timeout path has to **remove this task from the endpoint's receiver queue**.
+/// A waiter left behind is worse than a leak: the next sender delivers straight to
+/// it, `unblock` finds a task that is not waiting for anything, and the message is
+/// gone — taken by nobody, from a queue nobody can see.
+pub fn recv_until(ep: usize, deadline_ns: Option<u64>) -> Result<KMessage, KError> {
     if !endpoint_exists(ep) {
         return Err(KError::InvalidArgument);
     }
@@ -434,8 +454,40 @@ pub fn recv(ep: usize) -> Result<KMessage, KError> {
             sched::unblock(tid);
             Ok(km)
         }
-        Action::Block => Ok(sched::block_for_message()),
+        Action::Block => match deadline_ns {
+            None => Ok(sched::block_for_message()),
+            Some(deadline) => {
+                sched::block_until(Some(deadline));
+                // Woken by a sender, or by the clock. The mailbox is the only
+                // honest way to tell: a message was put there *before* this task
+                // was made runnable, so its presence means delivery happened and
+                // its absence means the deadline won. Asking the clock instead
+                // would race — a sender can deliver a microsecond before the
+                // deadline the clock has already passed.
+                match sched::take_mailbox() {
+                    Some(km) => Ok(km),
+                    None => {
+                        cancel_recv_waiter(ep, me);
+                        Err(KError::WouldBlock)
+                    }
+                }
+            }
+        },
         Action::Full => Err(KError::OutOfResources),
+    }
+}
+
+/// Take `task` out of `ep`'s queue of blocked receivers, if it is there.
+///
+/// Only the timeout path needs this, and it needs it absolutely: a receiver that
+/// stopped waiting but stayed in the queue is where the next message goes, and it
+/// goes nowhere.
+fn cancel_recv_waiter(ep: usize, task: usize) {
+    let mut table = IPC.lock();
+    let Some(e) = table.get_mut(ep) else { return };
+    if let Some(at) = e.recv_waiters[..e.n_recv].iter().position(|&t| t == task) {
+        e.recv_waiters.copy_within(at + 1..e.n_recv, at);
+        e.n_recv -= 1;
     }
 }
 
