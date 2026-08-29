@@ -324,6 +324,28 @@ pub enum Syscall {
     /// [`Send`]: Syscall::Send
     /// [`WouldBlock`]: crate::error::KError::WouldBlock
     SendNoWait = 33,
+
+    /// Unmap `x1` pages at `x0` from the caller's address space, returning how many
+    /// were mapped and are now not. Frames the space privately owns go back to the
+    /// pool; shared, DMA and device pages are only unmapped, their frames belonging
+    /// to an object or to hardware.
+    ///
+    /// Until this existed, **nothing in this system ever gave memory back short of
+    /// dying.** `munmap` in the C library was a counter — `staros_mmap_retained()`
+    /// reported what had leaked, which made the hole a number instead of a rumour,
+    /// and that is all it could do. The cost is ordinary rather than exotic: a
+    /// window that resizes allocates two buffers and abandons two, so dragging one
+    /// edge of it leaks megabytes a second.
+    ///
+    /// Addresses that map nothing are skipped, not refused: unmapping a partly-free
+    /// range is what an allocator does while it coalesces, and the count says what
+    /// actually happened.
+    ///
+    /// What this does **not** return is address space. The heap cursor moves forward
+    /// only, so freed addresses are not handed out again — 47 bits of window against
+    /// frames that are megabytes each, and the day a program walks to the end of the
+    /// region is the day that changes.
+    Unmap = 34,
 }
 
 impl Syscall {
@@ -365,6 +387,7 @@ impl Syscall {
             31 => Some(Syscall::EndpointPending),
             32 => Some(Syscall::NotifyOnExit),
             33 => Some(Syscall::SendNoWait),
+            34 => Some(Syscall::Unmap),
             _ => None,
         }
     }
@@ -376,11 +399,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=33 {
+        for n in 0..=34 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(34), None);
+        assert_eq!(Syscall::from_raw(35), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

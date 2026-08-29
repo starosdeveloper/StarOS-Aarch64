@@ -714,6 +714,39 @@ extern "C" fn _start() -> ! {
         // Only reached if every page above checked out.
         "adr x2, 3f",
         "bl .Lputs",
+        // (d) Give a page back, then touch it.
+        //
+        // Everything above proves memory can be *had*. This proves it can be given
+        // back, and it is the only check here that a counter cannot fake: the page
+        // is mapped, written, unmapped, and then read again — and the read must take
+        // a fault. A kernel that cleared the descriptor but left the TLB entry
+        // standing would let this load succeed, and there is no other way to see
+        // that from EL0: the stale translation works perfectly, right up until the
+        // frame is handed to somebody else.
+        //
+        // It runs after the final report on purpose. The fault ends this task, and
+        // the reports above are what the smoke matrix reads.
+        "mov x0, #1",
+        "mov x8, #10",               // Syscall::MapAnon(1)
+        "svc #0",
+        "cmp x0, #0",
+        "b.lt .Lmt_exit",
+        "mov x26, x0",               // x26 = the page
+        "mov x1, #0x55",
+        "str x1, [x26]",             // write it, so the mapping is certainly live
+        "mov x0, x26",
+        "mov x1, #1",
+        "mov x8, #34",               // Syscall::Unmap(va, 1)
+        "svc #0",
+        "cmp x0, #1",                // exactly one page removed, no more, no fewer
+        "b.eq .Lmt_unmapped",
+        "adr x2, 35f",
+        "bl .Lputs",
+        "b .Lmt_exit",
+        ".Lmt_unmapped:",
+        "adr x2, 34f",
+        "bl .Lputs",
+        "ldr x1, [x26]",             // and this must fault
         ".Lmt_exit:",
         "mov x8, #4",                // Syscall::Exit
         "svc #0",
@@ -1466,6 +1499,10 @@ extern "C" fn _start() -> ! {
         ".asciz \"[dyingclient] a 32x32 window on screen, the server watching me, and now I crash\\n\"",
         "33:",
         ".asciz \"[dyingclient] WINDOW WRONG - the buffer, the death notification or the server refused\\n\"",
+        "34:",
+        ".asciz \"[memtest] unmapped one page and kept its address; touching it must fault\\n\"",
+        "35:",
+        ".asciz \"[memtest] UNMAP WRONG - the kernel did not report exactly one page removed\\n\"",
         marker = sym DATA_MARKER,
         scratch = sym BSS_SCRATCH,
         big = sym BIG_BSS,

@@ -5,8 +5,9 @@
 //! resource blobs, and every allocator larger than ours asks for memory this way.
 //!
 //! ## What this layer can and cannot do, exactly
-//! The kernel has one memory syscall for user space, `MapAnon`, and it only ever
-//! *adds* pages to an address space. There is no unmap and no protection change, so:
+//! The kernel has two memory syscalls for user space: `MapAnon`, which adds pages,
+//! and `Unmap`, which takes them away and returns the frames to the pool. There is
+//! no protection change.
 //!
 //! * **`mmap`** of anonymous memory is real.
 //! * **`mmap` of a file** is refused with `ENODEV`. Faulting a file in on demand
@@ -14,12 +15,19 @@
 //!   its own; a version that read the whole file into anonymous memory would work
 //!   until something wrote to a `MAP_SHARED` mapping and expected the file to
 //!   change.
-//! * **`munmap`** succeeds and the pages stay mapped. This is the one place in this
-//!   library where the answer is not the whole truth, so it is measured rather than
-//!   hidden: [`exports::staros_mmap_retained`] reports how many bytes have been
-//!   "unmapped" and are still there. A program whose working set is bounded never
-//!   notices; one that maps and unmaps in a loop will, and the counter is how it
-//!   finds out.
+//! * **`munmap`** is real: the pages go, and the frames behind them go back to the
+//!   allocator. It was not, for most of this library's life — it succeeded and left
+//!   everything mapped — and rather than hide that,
+//!   [`exports::staros_mmap_retained`] counted the bytes it had failed to release.
+//!   The counter stays, now reading zero on the ordinary path and rising only when
+//!   the kernel refuses a range or the range was already gone. A number that has
+//!   always been the honest measure of a hole is worth keeping the day the hole is
+//!   filled: it is what says so.
+//!
+//!   What is *not* returned is address space. The kernel's heap cursor moves forward
+//!   only, so a freed address is never handed out twice, and a program that maps and
+//!   unmaps forever walks to the end of its region eventually — 47 bits of it,
+//!   against frames of megabytes.
 //! * **`mprotect`** succeeds for anything that does not ask for `PROT_EXEC`, and
 //!   refuses that with `EPERM`. The refusal is deliberate and load-bearing: the
 //!   loader gives EL0 no way to make a page executable at run time, so a JIT — QML's
@@ -56,8 +64,13 @@ pub mod exports {
     const EPERM: c_int = 1;
     const ENODEV: c_int = 19;
 
-    /// Bytes that were handed to `munmap` and are still mapped. See the module
-    /// comment: this is the price of a kernel with no unmap, made visible.
+    /// Bytes that were handed to `munmap` or `mremap` and are still mapped.
+    ///
+    /// Zero on the ordinary path now that `Unmap` exists. It rises when the kernel
+    /// refuses a range, and when a caller frees something that was already gone —
+    /// the second leaks nothing, and the two cannot be told apart from here, so the
+    /// count reads high rather than low. A leak counter that guesses in the
+    /// optimistic direction is a leak counter nobody can use.
     static mut RETAINED: usize = 0;
 
     /// # Safety
@@ -120,10 +133,31 @@ pub mod exports {
         if addr.is_null() || length == 0 {
             return fail(EINVAL, -1);
         }
-        // SAFETY: a single word, incremented under the same single-threaded
-        // assumption as `errno`; it is a diagnostic, not a decision.
-        unsafe { RETAINED += pages_for(length) * 4096 };
-        0
+        let pages = pages_for(length);
+        match sys::unmap(addr.cast::<u8>(), pages) {
+            // The kernel returns how many pages it actually removed. Anything it did
+            // not remove is either a page that was already gone — which leaks
+            // nothing — or one it refused to touch, and only the second is worth
+            // counting. They cannot be told apart from here, so the count is kept as
+            // the conservative reading: pages asked about, minus pages removed.
+            //
+            // In the ordinary case that is zero, and `staros_mmap_retained()` reads
+            // zero for the first time in this library's life.
+            Some(removed) => {
+                // SAFETY: a single word, under the same single-threaded assumption
+                // as `errno`; it is a diagnostic, not a decision.
+                unsafe { RETAINED += pages.saturating_sub(removed) * 4096 };
+                0
+            }
+            // A refusal is not a reason to lie about it. The pages are still there,
+            // the counter says so, and `munmap` returning success on a range the
+            // kernel would not take is how a leak becomes invisible again.
+            None => {
+                // SAFETY: as above.
+                unsafe { RETAINED += pages * 4096 };
+                fail(EINVAL, -1)
+            }
+        }
     }
 
     /// # Safety
@@ -171,11 +205,20 @@ pub mod exports {
             return fail(ENOMEM, MAP_FAILED);
         };
         let copy = old_len.min(new_len);
+        // The old mapping is given back after the copy, not before it — the bytes
+        // are still being read out of it.
         // SAFETY: `old` is a mapping of `old_len` bytes by the caller's contract, and
         // `p` is a fresh mapping of at least `new_len`; the two cannot overlap.
         unsafe { core::ptr::copy_nonoverlapping(old.cast::<u8>(), p, copy) };
-        // SAFETY: as in `munmap` — the old pages stay, and the count says so.
-        unsafe { RETAINED += pages_for(old_len) * 4096 };
+        let old_pages = pages_for(old_len);
+        match sys::unmap(old.cast::<u8>(), old_pages) {
+            // SAFETY: as in `munmap`.
+            Some(removed) => unsafe { RETAINED += old_pages.saturating_sub(removed) * 4096 },
+            // SAFETY: as above. The new mapping is still good, so this returns it
+            // and records what the old one cost rather than failing a call that
+            // succeeded.
+            None => unsafe { RETAINED += old_pages * 4096 },
+        }
         p.cast::<c_void>()
     }
 

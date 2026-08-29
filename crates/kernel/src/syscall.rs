@@ -11,6 +11,7 @@ use core::mem::size_of;
 use staros_abi::error::KError;
 use staros_abi::syscall::Syscall;
 use staros_abi::Handle;
+use staros_arch_aarch64::addrspace::{USER_BASE, USER_WINDOW_END};
 use staros_arch_aarch64::exceptions::SyscallRequest;
 use staros_arch_aarch64::timer;
 use staros_ipc::Message;
@@ -407,6 +408,36 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
                 return KError::InvalidArgument.as_raw();
             }
             sched::map_anon_current(pages)
+        }
+
+        // Give memory back: `x0` = page-aligned address, `x1` = pages. Returns how
+        // many pages were mapped and are now not.
+        //
+        // The range is checked against the EL0 window before anything is touched.
+        // Not because a process unmapping its own code would hurt anyone else — it
+        // would fault and die, isolated, which is its right — but because a *kernel*
+        // address arriving here must not be walked as if it were user space. The
+        // check is on the address, not on the region: the window is sparse, and
+        // saying which of its regions a page belongs to is what the tables are for.
+        //
+        // The count is the return value rather than a success flag, because a range
+        // that was partly free is normal — an allocator coalescing does exactly
+        // that — and "how much did I actually give back" is the only question the
+        // caller cannot answer for itself.
+        Some(Syscall::Unmap) => {
+            const MAX_UNMAP_PAGES: u64 = 4096;
+            let va = req.args[0];
+            let pages = req.args[1];
+            if pages == 0 || pages > MAX_UNMAP_PAGES || !va.is_multiple_of(PAGE_SIZE as u64) {
+                return KError::InvalidArgument.as_raw();
+            }
+            let Some(end) = va.checked_add(pages * PAGE_SIZE as u64) else {
+                return KError::InvalidArgument.as_raw();
+            };
+            if va < USER_BASE || end > USER_WINDOW_END {
+                return KError::InvalidArgument.as_raw();
+            }
+            sched::unmap_current(va, pages)
         }
 
         // Create a child EL0 process from the init image, seeded with the id in

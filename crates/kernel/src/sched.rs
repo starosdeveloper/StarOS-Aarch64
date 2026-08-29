@@ -1620,6 +1620,60 @@ pub fn map_anon_current(pages: u64) -> isize {
 ///
 /// The whole read-modify-write happens under the scheduler lock, which is what
 /// makes concurrent reservations disjoint. Mapping the pages is left outside it.
+/// Unmap `pages` at `va` from the current task's space; returns how many pages were
+/// mapped and are now not.
+///
+/// Chunked with interrupt windows for the same reason
+/// [`map_anon_current`](map_anon_current) is: a syscall runs with IRQs masked, and a
+/// call that freed four thousand pages — a descriptor cleared, a TLB entry
+/// broadcast-invalidated and a frame returned each — would hold the timer off for
+/// the whole of it. Unmapping is the same shape of work as mapping and gets the same
+/// treatment; the chunk size is the one that measurement already picked.
+///
+/// The space handle is a *copy*, and that is safe here in a way it would not be for
+/// mapping: this call changes the page tables, which are shared through `ttbr0` and
+/// therefore seen by every task in the space, and it does not touch the heap cursor,
+/// which is the only thing the copies disagree about.
+pub fn unmap_current(va: u64, pages: u64) -> isize {
+    let cpu = me();
+    let space = {
+        let sched = SCHED.lock();
+        let Some(task) = sched.tasks.get(sched.current[cpu]) else {
+            return KError::InvalidArgument.as_raw();
+        };
+        match task.space {
+            Some(space) => space,
+            // A kernel thread has no user space to unmap from. It cannot have called
+            // this — there is no EL0 to call from — but the answer is an error and
+            // not a panic, because "the caller has no address space" is a fact about
+            // the caller.
+            None => return KError::InvalidArgument.as_raw(),
+        }
+    };
+
+    const CHUNK: u64 = 16;
+    let mut done = 0;
+    let mut removed = 0u64;
+    while done < pages {
+        let chunk = CHUNK.min(pages - done);
+        let at = va + done * PAGE_SIZE as u64;
+        // SAFETY: at EL1 with this (active) space's tables reachable through the
+        // linear map; the range was checked by the caller to lie in the EL0 window,
+        // and the frame lock makes the return of frames atomic against other cores.
+        removed += crate::mem::with(|frames| unsafe { space.unmap(frames, at, chunk) });
+        done += chunk;
+        if done < pages {
+            // SAFETY: at EL1 with vectors and the GIC up; the mask is restored
+            // immediately, so the caller's masked section resumes unchanged.
+            unsafe {
+                exceptions::enable_irqs();
+                exceptions::disable_irqs();
+            }
+        }
+    }
+    removed as isize
+}
+
 fn reserve_anon_shared(cur: usize, pages: u64) -> Option<(AddressSpace, u64)> {
     let mut sched = SCHED.lock();
     let ttbr0 = sched.tasks.get(cur)?.ttbr0;

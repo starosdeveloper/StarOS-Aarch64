@@ -583,11 +583,59 @@ static void check_mmap(void)
 
     size_t before = staros_mmap_retained();
     check(munmap(p, len) == 0, "munmap");
-    /* And the price of a kernel with no unmap, counted rather than hidden. */
-    check(staros_mmap_retained() == before + 4 * 4096, "munmap accounted for the pages it kept");
+    /* Nothing retained: the pages are gone and their frames are back in the pool.
+     * For most of this library's life this counter went *up* here, because there was
+     * no unmap and the honest thing was to count what stayed. It is the same check,
+     * with the expected value that a working `Unmap` produces. */
+    check(staros_mmap_retained() == before, "munmap gave the pages back, retaining nothing");
 
-    printf("[hello-c] mmap: %lu bytes mapped and returned, %lu retained by the kernel\n",
-           (unsigned long)len, (unsigned long)staros_mmap_retained());
+    /* And the claim that matters, which no accounting can make: the frames really
+     * returned to the allocator.
+     *
+     * Sixteen runs of 4 MiB is 64 MiB, and the smallest machine in the matrix has a
+     * 60 MiB frame pool. If unmapping did not free anything this loop cannot finish
+     * — not "would be slower", cannot — so a pass is proof by exhaustion rather than
+     * by a counter agreeing with itself. Each run is written and read at both ends,
+     * because a frame handed back and handed out again is exactly where a page that
+     * is mapped twice would show up.
+     *
+     * Four runs of 16 MiB — the same 64 MiB in the fewest calls the ceiling allows —
+     * was tried and abandoned, because it buys nothing: 9.15 s against 9.07 s. The
+     * price here is 16 384 frames zeroed on the way out and invalidated on the way
+     * back, and how many syscalls wrap them does not matter. Under TCG this is the
+     * longest single gap in the boot log, which is worth knowing before wondering
+     * where a minute went.
+     *
+     * The count and the run size are written as one product below for a reason: when
+     * they were two independent numbers, changing the pair left `16 *` behind and the
+     * check compared 64 MiB against 256 MiB. It failed, the line beside it printed
+     * "64 MiB cycled", and the two together read as a kernel refusing a large
+     * mapping. It was arithmetic in the check. */
+    const int runs = 16;
+    const size_t run_bytes = 4u * 1024 * 1024;
+    const size_t expected = (size_t)runs * run_bytes;
+    size_t reused = 0;
+    for (int i = 0; i < runs; i++) {
+        char *q = mmap(0, run_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (q == MAP_FAILED) {
+            break;
+        }
+        q[0] = (char)i;
+        q[run_bytes - 1] = (char)(i + 1);
+        if (q[0] != (char)i || q[run_bytes - 1] != (char)(i + 1)) {
+            break;
+        }
+        if (munmap(q, run_bytes) != 0) {
+            break;
+        }
+        reused += run_bytes;
+    }
+    check(reused == expected, "64 MiB mapped and freed through a pool that holds less");
+
+    printf("[hello-c] mmap: %lu bytes mapped and returned, %lu retained by the kernel, "
+           "%lu MiB cycled through a smaller pool\n",
+           (unsigned long)len, (unsigned long)staros_mmap_retained(),
+           (unsigned long)(reused / (1024 * 1024)));
 }
 
 /* Layer 3's other half: the calendar. */

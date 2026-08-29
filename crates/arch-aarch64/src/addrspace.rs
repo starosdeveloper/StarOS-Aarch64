@@ -95,6 +95,16 @@ pub const USER_INITRD_VA: u64 = 0x9_0000_0000;
 /// shared-memory object.
 pub const USER_FB_VA: u64 = 0xA_0000_0000;
 
+/// One past the highest address any user region occupies.
+///
+/// The regions above are fixed and far apart, and the highest of them is the
+/// framebuffer at `0xA_0000_0000` plus a few megabytes of pixels; this leaves room
+/// above it and stops well short of the 48-bit `TTBR0` ceiling. It exists so that a
+/// syscall taking an address from EL0 can reject a *kernel* one without pretending
+/// to know which region the address belongs to — that is what the tables are for,
+/// and asking them is `lookup`.
+pub const USER_WINDOW_END: u64 = 0x10_0000_0000;
+
 /// Top of the user stack (grows down); [`USER_STACK_PAGES`] sit just below it.
 pub const USER_STACK_TOP: u64 = 0x8_0000_0000;
 
@@ -620,6 +630,98 @@ impl AddressSpace {
             page += PAGE_4K;
         }
         true
+    }
+
+    /// The level-3 table that *already* maps `va`, or `None` when no table on the
+    /// way down exists.
+    ///
+    /// [`leaf_table`](AddressSpace::leaf_table) creates what is missing; this one
+    /// refuses to. Unmapping an address nothing maps must not build three tables to
+    /// discover that there was nothing there — which is not a style preference: the
+    /// tables would be built out of the same pool the call is trying to give back
+    /// to, so a program freeing a range it had already freed would consume memory.
+    ///
+    /// # Safety
+    /// Same preconditions as [`new`](AddressSpace::new).
+    unsafe fn existing_leaf_table(&self, va: u64) -> Option<u64> {
+        let mut table = self.root;
+        for level in 0..LEAF_LEVEL {
+            // SAFETY: `table` is a table frame of this space; index is in range.
+            let desc = unsafe { read_entry(table, table_index(va, level)) };
+            if desc & DESC_KIND != DESC_TABLE {
+                return None;
+            }
+            table = desc & ADDR_MASK;
+        }
+        Some(table)
+    }
+
+    /// Unmap `pages` pages starting at `va`, returning how many were actually
+    /// mapped and are now not. Frames the space privately owns go back to `alloc`.
+    ///
+    /// **Ownership decides who gets the frame back, and the tree is the record.**
+    /// Only a leaf carrying [`SW_OWNED`] is handed to the allocator: shared memory,
+    /// DMA buffers, device pages, the initramfs and the framebuffer are all mapped
+    /// without it, because their frames belong to an object or to hardware. Freeing
+    /// those here would hand the frame allocator a page of MMIO, or return one copy
+    /// of a buffer two processes are reading.
+    ///
+    /// **Order matters, and it is the whole safety argument.** The descriptor is
+    /// cleared, then the TLB entry for that VA is invalidated, and only then is the
+    /// frame given back. Freeing first would make the frame available to another
+    /// task while this one still has a live translation to it — memory handed out
+    /// twice, with no fault to say so, which is the worst failure a memory manager
+    /// has.
+    ///
+    /// Addresses that map nothing are skipped rather than refused. Unmapping a range
+    /// that is partly free is what an allocator does while it coalesces, and a call
+    /// that failed on the first hole would force every caller to track holes the
+    /// kernel already knows about. The count says what happened.
+    ///
+    /// The **address space is not reclaimed**, only the memory: `heap_next` moves
+    /// forward and never back, so the freed addresses are not handed out again. That
+    /// is deliberate for now — a 47-bit window against frames that are megabytes
+    /// each — and it is the thing to fix on the day a program maps and unmaps in a
+    /// loop for long enough to walk to the end of the region.
+    ///
+    /// # Safety
+    /// Same preconditions as [`new`](AddressSpace::new). The caller must not be
+    /// executing out of, or holding a reference into, the range being unmapped.
+    pub unsafe fn unmap<A: FrameAllocator>(&self, alloc: &mut A, va: u64, pages: u64) -> u64 {
+        let mut removed = 0;
+        for i in 0..pages {
+            let page = va + i * PAGE_4K;
+            // SAFETY: forwarded from this function's contract.
+            let Some(leaf) = (unsafe { self.existing_leaf_table(page) }) else {
+                continue;
+            };
+            let index = table_index(page, LEAF_LEVEL);
+            // SAFETY: `leaf` is a level-3 table of this space and the index is in
+            // range.
+            let desc = unsafe { read_entry(leaf, index) };
+            if desc & DESC_VALID == 0 {
+                continue;
+            }
+            // SAFETY: as above.
+            unsafe { write_entry(leaf, index, 0) };
+            // SAFETY: `page >> 12` is the page number operand `TLBI VAAE1IS` expects.
+            // Broadcast, because another core may be running this same space.
+            unsafe {
+                asm!(
+                    "dsb ish",
+                    "tlbi vaae1is, {v}",
+                    "dsb ish",
+                    "isb",
+                    v = in(reg) page >> 12,
+                    options(nostack, preserves_flags),
+                );
+            }
+            if desc & SW_OWNED != 0 {
+                alloc.free(PhysAddr((desc & ADDR_MASK) as usize));
+            }
+            removed += 1;
+        }
+        removed
     }
 
     /// Tear the address space down: return every frame it privately owns — its

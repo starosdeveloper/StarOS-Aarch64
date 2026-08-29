@@ -913,6 +913,31 @@ Done:
   register can, so the device manager (which holds the authority) looks, and hands
   the driver only the slot that answered.
 
+- **Memory comes back (`Unmap`).** Until this, nothing in this system ever released
+  memory short of dying: `MapAnon` only added pages, `munmap` in the C library was a
+  counter, and `staros_mmap_retained()` existed to say how much had leaked. The cost
+  was ordinary rather than exotic — a window that resizes allocates two buffers and
+  abandons two.
+
+  `AddressSpace::unmap` clears the descriptor, invalidates that VA across cores, and
+  only then hands the frame back. The order is the whole safety argument: freeing
+  first would make the frame available to another task while this one still holds a
+  live translation to it — memory given out twice with no fault to say so. Who owns
+  the frame is decided by `SW_OWNED` in the descriptor itself, the same bit teardown
+  uses, so shared memory, DMA buffers, device pages, the initramfs and the
+  framebuffer are unmapped without being freed: their frames belong to an object or
+  to hardware.
+
+  Addresses that map nothing are skipped rather than refused — unmapping a partly
+  free range is what an allocator does while it coalesces — and the syscall returns
+  how many pages it actually removed. Address space is *not* reclaimed: the heap
+  cursor moves forward only, which is a 47-bit window against frames of megabytes.
+
+  Proved by exhaustion rather than by accounting: `hello-c` cycles 64 MiB through a
+  pool that holds 60, which cannot finish if frames do not come back, and `memtest`
+  unmaps one page and reads the same address again — the fault is the only evidence
+  from EL0 that the TLB entry went with the descriptor.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not

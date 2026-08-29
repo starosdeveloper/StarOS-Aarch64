@@ -185,7 +185,7 @@ framebuffer: ramfb 640x480 online (mirroring the console to the screen)
 syscall Yield -> 0; syscall 0xdead -> -6
 clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
 interrupt controller: GICv2 online
-clock: one tick interval (6250000 counter ticks) measured 101041 us against an expected 100000 us (agrees with the tick interval)
+clock: one tick interval (6250000 counter ticks) measured 101053 us against an expected 100000 us (agrees with the tick interval)
 smp: 1 core(s) online (PSCI v1.1)
 smp: 1 cores x 20000 locked increments = 20000 (expected 20000) — no increments lost
 smp: single core — no inter-processor interrupt to send
@@ -202,15 +202,13 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
 [fsclient] two endpoint capabilities and one page of my own memory - no archive, no device
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
-[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight
-[hello-c] math: sin(1e15)=0.858273, pow(1.0000001,1e7)=2.718282, hypot(3,4)=5.0
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
 [hello-cpp] a namespace-scope constructor ran before main
 [hello-cpp] a C++ program in EL0: vector, string, thread, and a static with a destructor
 [stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand
 [fault] task 25 killed: EL0 fault at 0x7ffedffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
-[fault]   backtrace (2 frames, x29 chain): 0x8000080c 0x80000804
+[fault]   backtrace (2 frames, x29 chain): 0x8000085c 0x80000854
 [child] hello - I was created at runtime, not by the kernel
 [client] monotonic clock: two ClockNow reads from EL0, the second strictly later - no capability needed
 [driver] user-space UART-RX driver waiting for input
@@ -226,26 +224,23 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [devicemgr] unpacked the initramfs in user space: 21 files, no storage driver
 [devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
 [fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
-[hello-c] mmap: 12305 bytes mapped and returned, 16384 retained by the kernel
-[hello-c] calendar: 2025-08-13 00:00:00 UTC (Wed)
-[hello-c] heap: 103 allocations, 896 bytes live at the end
+[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight
+[hello-c] math: sin(1e15)=0.858273, pow(1.0000001,1e7)=2.718282, hypot(3,4)=5.0
 [loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
-[devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
-[devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
-[hello-c] clock: 529210256 ns across a 20 ms nanosleep
-[qt-hello] starting
-[child] hello - I was created at runtime, not by the kernel
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 #server drove the UART, then revoked it for everyone
-[dyingclient] a 32x32 window on screen, the server watching me, and now I crash
-[fault] task 7 killed: EL0 fault at 0x0 (ec 0x24) — isolated, kernel continues
-[fault]   backtrace (2 frames, x29 chain): 0x80000cf0 0x80000cec
-[displaysrv] a client died; its windows are off the screen
-[shell] starting
-[hello-cpp] backing store: 1200 KiB for a whole 640x480 screen, filled and read back from C++
+[devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
+[devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
+[qt-hello] starting
 [child] hello - I was created at runtime, not by the kernel
 [client] read from shared memory: shared-memory works: written by the server, read by the client
 [client] read the marker from the SECOND page of a 2-page shared buffer
+[dyingclient] a 32x32 window on screen, the server watching me, and now I crash
+[fault] task 7 killed: EL0 fault at 0x0 (ec 0x24) — isolated, kernel continues
+[fault]   backtrace (2 frames, x29 chain): 0x80000d40 0x80000d3c
+[displaysrv] a client died; its windows are off the screen
+[shell] starting
+[hello-cpp] backing store: 1200 KiB for a whole 640x480 screen, filled and read back from C++
 [fsclient] read 'greeting.txt' through fssrv in 2 chunks: hello from the initramfs
 [fsclient] 25 of 25 bytes in 2 reads, the second one from offset 6
 [hello-cpp] a 1920x1080 backing store: 8100 KiB, contiguous, mapped whole
@@ -254,46 +249,54 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [hello-cpp] C++ RUNTIME OK - 68 strings, 600 from three threads
 [hello-cpp] the static local's destructor ran at exit, holding 2 entries
 [client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block
-[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
+[child] hello - I was created at runtime, not by the kernel
 [client] SpawnThread: a thread in this very address space wrote through our page and ran with its own TPIDR_EL0
 [cap] task 0 denied MapMemory(handle 0): no such capability
 [client] kernel refused a syscall pointer into an unmapped page - it walks our tables, not a range
+[parent] spawned 3 children via the Spawn syscall - 15 tasks total, old table held 8
 [fbclient] asked the screen its size (640x480 xRGB8888), then had two 64x64 surfaces composited - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096
 [fsclient] fssrv refused an unopened handle, a missing file, a closed handle and a lied-about length
-[hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: hello from the initramfs
 [fsclient] asked for all 13648 bytes of 'init.elf' into a 4096-byte buffer and got 4096, with 9552 left
 [fsclient] the archive is at 0x900000000 in fssrv; touching it here must fault
 [fault] task 14 killed: EL0 fault at 0x900000000 (ec 0x24) — isolated, kernel continues
 [fault]   backtrace (3 frames, x29 chain): 0x80000014 0x800016c8 0x80000004
 [fssrv] served 12 requests, 4121 bytes of file data, and refused 4 - the archive never left this address space
-[hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell
-[displaysrv] pointer at (101, 119) landed on surface 3 of client 0 - routed by what is under it, not by who has the keyboard
 [ipc-storm] receiver drained every message from 3 concurrent senders, sequence sum exact - no message lost or duplicated
 [qt-hello] QGuiApplication constructed, platform=staros
 [shell] QGuiApplication constructed, platform=staros
-[qt-hello] window shown
-[qt-hello] entering the event loop
-[shell] scene 'qml/Main.qml' is 7704 bytes
-[shell] threads: a QThread with an 8 MiB stack ran and joined, and took a QMutex the main thread was holding: yes
 [memtest] MapAnon(0) refused - a zero-page request is an error, not a page
 [memtest] DMA buffer: 4 physically-contiguous non-cacheable pages, first and last written and read back
+[shell] scene 'qml/Main.qml' is 7704 bytes
 [memtest] 2.5 MiB .bss reaches 2.25 MiB in (past the 2 MiB L2 boundary); grew the heap by 16 MiB in 8 calls of 1024 pages, first and last page of every run zeroed then written and read back, runs handed out back to back
-[hello-c] listed 'docs': 1 file, 1 directory, over a flat archive
-[hello-c] sendfile: from the initramfs
-[hello-c] process 16: uname StarOS 0.2.0, stack limit 1024 KiB, backtrace 3 frames
+[memtest] unmapped one page and kept its address; touching it must fault
+[fault] task 4 killed: EL0 fault at 0x102000000 (ec 0x24) — isolated, kernel continues
+[fault]   backtrace (2 frames, x29 chain): 0x8000070c 0x8000070c
+[qt-hello] window shown
+[qt-hello] entering the event loop
+[shell] threads: a QThread with an 8 MiB stack ran and joined, and took a QMutex the main thread was holding: yes
+[hello-c] mmap: 12305 bytes mapped and returned, 0 retained by the kernel, 64 MiB cycled through a smaller pool
+[hello-c] calendar: 2025-08-13 00:00:00 UTC (Wed)
+[hello-c] heap: 103 allocations, 896 bytes live at the end
+[hello-c] clock: 24929632 ns across a 20 ms nanosleep
+[hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: hello from the initramfs
+[hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell
 [qt-hello] painted 320x240, text in 'IBM Plex Mono' 115 px wide, 20 px tall
 [qt-hello] event loop tick 1
 [qt-hello] quitting
-[qstaros] present: 1 frame(s), 76800 px - commit 108738 us/frame (worst 108738 us), restore 409 us/frame (worst 409 us), 1415 ns/px committed
+[qstaros] present: 1 frame(s), 76800 px - commit 1576 us/frame, post 1576 us/frame, await 0 us/frame, restore 0 us/frame - worst post 1576 us, worst await 0 us, worst restore 0 us, 20 ns/px committed
 [qt-hello] exec returned 0
 [fssrv] served 233 requests, 688420 bytes of file data, and refused 11 - the archive never left this address space
+[hello-c] listed 'docs': 1 file, 1 directory, over a flat archive
+[hello-c] sendfile: from the initramfs
+[hello-c] process 16: uname StarOS 0.2.0, stack limit 1024 KiB, backtrace 3 frames
 [shell] scene loaded, root is a Main_QMLTYPE_0 of 320x300
 [displaysrv] a client died; its windows are off the screen
 [shell] view shown and the keyboard claimed
 [shell] entering the event loop
+[displaysrv] composite: 128 frame(s), 1690872 px in 196716 us - 1536 us/frame, 13209 px/frame, 116 ns/px, worst 16752 us for 96000 px
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
-[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 33281008 ns
-[hello-c] endpoint in poll: a message from another process woke the loop in 40577424 ns
+[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 40669232 ns
+[hello-c] endpoint in poll: a message from another process woke the loop in 41191040 ns
 [hello-c] shared buffers: 16 KiB of surface, mapped at 0x500001000 and 0x500005000
 [hello-c] window: a 48x48 surface on a 640x480 screen, double buffered, from C through staros.h
 [hello-c] font: read 133796 bytes of IBM Plex Mono through fssrv, checksum 6016661948058288260
@@ -301,25 +304,24 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [hello-c] stdlib: qsort, bsearch, rand, strdup and the special functions this sysroot had only promised
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 248 requests, 275941 bytes of file data, and refused 11 - the archive never left this address space
-[displaysrv] composite: 128 frame(s), 1603666 px in 135778 us - 1060 us/frame, 12528 px/frame, 84 ns/px, worst 5906 us for 76800 px
-[displaysrv] composite: 256 frame(s), 3270992 px in 270530 us - 1056 us/frame, 12777 px/frame, 82 ns/px, worst 5906 us for 76800 px
-[displaysrv] composite: 384 frame(s), 4870516 px in 428679 us - 1116 us/frame, 12683 px/frame, 88 ns/px, worst 5906 us for 76800 px
-[shell] 374 frame(s) in 14707 ms
-[shell] frame profile over 374 frame(s): sync 6546 us, raster 19975 us, present 4669 us per frame; worst frame 283637 us
-[shell] the animated rectangle moved from x=77.1 to x=79.3
+[displaysrv] composite: 256 frame(s), 3283172 px in 403641 us - 1576 us/frame, 12824 px/frame, 122 ns/px, worst 16752 us for 96000 px
+[shell] 281 frame(s) in 15186 ms
+[shell] frame profile over 281 frame(s): sync 9351 us, raster 31314 us, present 1226 us per frame; worst frame 505138 us
+[shell] between frames over 280 gap(s): total 11367 us, asleep 9711 us, awake 1656 us, parks 1.00 per gap
+[shell] the animated rectangle moved from x=41.4 to x=140.9
 [shell] input: 0 click(s) reached a MouseArea, 0 key(s) reached the scene, the last was Qt key 0
-[qstaros] present: 374 frame(s), 4776484 px - commit 3788 us/frame (worst 21026 us), restore 96 us/frame (worst 466 us), 296 ns/px committed
+[qstaros] present: 281 frame(s), 3639742 px - commit 935 us/frame, post 408 us/frame, await 526 us/frame, restore 143 us/frame - worst post 1785 us, worst await 23188 us, worst restore 1589 us, 72 ns/px committed
 [shell] exec returned 0
 [displaysrv] composited client surfaces onto a screen no client can touch
-[displaysrv] 4 surface(s) live, 384 commit(s), 5223540 pixel(s) composited, 8 refused, 2 client(s) reaped, 1 input event(s) routed, 17 dropped for want of a window
-[displaysrv] composite: 384 frame(s), 4870516 px in 428679 us - 1116 us/frame, 12683 px/frame, 88 ns/px, worst 5906 us for 76800 px
+[displaysrv] 4 surface(s) live, 291 commit(s), 4086798 pixel(s) composited, 8 refused, 2 client(s) reaped, 0 input event(s) routed, 0 dropped for want of a window
+[displaysrv] composite: 291 frame(s), 3733774 px in 458418 us - 1575 us/frame, 12830 px/frame, 122 ns/px, worst 16752 us for 96000 px
 [fssrv] served 371 requests, 696124 bytes of file data, and refused 23 - the archive never left this address space
-clock: the demo took 32628 ms on the monotonic clock, during which core 0 took 1011 tick(s)
-sleep: 6 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 441 clock wake-up(s), worst overshoot 120752 us
-scheduler: all tasks finished after 1011 timer ticks; task table grew to 42 (old fixed max 8)
+clock: the demo took 48303 ms on the monotonic clock, during which core 0 took 855 tick(s)
+sleep: 6 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 287 clock wake-up(s), worst overshoot 131447 us
+scheduler: all tasks finished after 855 timer ticks; task table grew to 42 (old fixed max 8)
 task teardown: reaped 39 dead-task kernel stacks (1248 KiB returned to the heap)
 user stacks: 65 page(s) mapped on demand (260 KiB), 1 mapped up front per task, limit 1024 KiB
-preemption: timer ticks per core — cpu0=1011
+preemption: timer ticks per core — cpu0=855
 ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) sending, 1 receiving) — endpoint exercised on one core
 frame reclaim: post-teardown alloc 0x48440000 (exited client's root was 0x48440000)
 frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned

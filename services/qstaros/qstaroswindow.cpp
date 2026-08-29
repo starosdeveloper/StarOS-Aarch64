@@ -55,11 +55,13 @@ void QStarosWindow::release()
         m_screen->connection()->destroy(m_surface);
         m_surface = 0;
     }
-    // The buffers themselves stay mapped. This system has no unmap — the pages a
-    // process takes are its own until it exits — so pretending to release them
-    // would be a lie with a leak behind it. `staros_mmap_retained()` is where that
-    // shows up as a number, and a window that resizes in a loop is where it
-    // eventually matters.
+    // The buffers themselves stay mapped, and that is now a shortcoming of this file
+    // rather than of the kernel: `Unmap` exists and gives frames back. What is
+    // missing here is the other half — these pages belong to a shared-memory
+    // *object* the display server may still hold a capability to, so unmapping them
+    // from this side takes the address away without releasing the frames, and the
+    // object has to go first. Until that is written, a window that resizes in a loop
+    // leaks two buffers each time.
     m_pixels[0] = m_pixels[1] = nullptr;
     m_caps[0] = m_caps[1] = 0;
     m_bufferSize = QSize();

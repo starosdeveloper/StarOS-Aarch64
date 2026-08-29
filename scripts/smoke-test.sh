@@ -316,7 +316,10 @@ if [ -n "$INITRAMFS" ]; then
     req "[hello-c] calendar: 2025-08-13 00:00:00 UTC (Wed)"
     # Pages rather than bytes, including the count of what munmap could not give
     # back — the kernel has no unmap syscall and this is where that shows.
-    req "[hello-c] mmap: 12305 bytes mapped and returned, 16384 retained by the kernel"
+    # Zero retained, and 64 MiB cycled through a pool that does not hold 64 MiB. The
+    # second number is the one that cannot be faked by accounting: without frames
+    # actually returning to the allocator the loop runs out and the count is short.
+    req "[hello-c] mmap: 12305 bytes mapped and returned, 0 retained by the kernel, 64 MiB cycled through a smaller pool"
     # The C program reaches the same file through the same server as fsclient, but
     # through open/read/lseek rather than raw IPC.
     req "[hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: $GREETING"

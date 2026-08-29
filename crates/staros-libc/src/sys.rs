@@ -112,6 +112,19 @@ pub(crate) fn map_anon(pages: usize) -> Option<*mut u8> {
     (rc > 0).then(|| rc as usize as *mut u8)
 }
 
+/// Give `pages` at `addr` back to the kernel. Returns how many pages were mapped
+/// and are now not, or `None` if the call was refused.
+///
+/// A count and not a bool: a range that was partly free is an ordinary thing for an
+/// allocator to hand over, and the difference between "freed four pages" and "freed
+/// none, they were already gone" is exactly what a leak counter needs to know.
+pub(crate) fn unmap(addr: *mut u8, pages: usize) -> Option<usize> {
+    // SAFETY: `Unmap` reads no memory through the pointer; it walks our own tables
+    // and clears entries.
+    let rc = unsafe { syscall2(Syscall::Unmap, addr as u64, pages as u64) };
+    (rc >= 0).then_some(rc as usize)
+}
+
 /// Nanoseconds since boot on the monotonic clock, or `None` if the kernel has no
 /// clock yet.
 pub(crate) fn clock_now() -> Option<u64> {
