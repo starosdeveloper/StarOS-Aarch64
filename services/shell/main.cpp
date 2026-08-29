@@ -52,6 +52,11 @@
 
 #include <cstdio>
 
+// For `staros_poll_wait`. The gap between two frames is a fifth of the wall clock
+// here, and no timer inside Qt can say whether it is sleep or work — the C library
+// is where the parking happens, so it is where the question is answered.
+#include <staros.h>
+
 Q_IMPORT_PLUGIN(QStarosIntegrationPlugin)
 
 // The QML modules, each one a static archive whose type registrations are pulled in
@@ -202,6 +207,21 @@ int main(int argc, char **argv)
     // first is the JavaScript interpreter and the binding graph, the second is
     // software rasterisation, the third is IPC and somebody else's memcpy — and
     // "the frame took 8 ms" tells you which to work on only by accident.
+    // And the fourth thing a frame is: the part that is not a frame at all.
+    //
+    // The three stages above add up to less than the wall-clock interval between
+    // frames — by a fifth of it, measured — and "polish, animation and the event
+    // loop" was a guess about the difference. `gap` measures it directly, from
+    // `frameSwapped` to the next `beforeFrameBegin`, and `asleep` splits it into the
+    // only two things it can be.
+    //
+    // Sleep and work are opposite findings, and this is the whole reason the split is
+    // worth the two counters. A loop that spends the gap parked is waiting for its
+    // next animation tick and is behaving exactly as designed — the frame rate is
+    // then a property of the timer, not of anything anybody could optimise. A loop
+    // *busy* for the same milliseconds is a defect with somewhere to look. From
+    // inside Qt the two are indistinguishable: both are "the dispatcher has not come
+    // back yet".
     struct Stages
     {
         qint64 sync = 0;
@@ -209,11 +229,33 @@ int main(int argc, char **argv)
         qint64 present = 0;
         qint64 worst = 0;
         qint64 counted = 0;
+        qint64 gap = 0;
+        qint64 gapAsleep = 0;
+        qint64 gapParks = 0;
+        qint64 gapCounted = 0;
     } stages;
     QElapsedTimer frame;
     qint64 synced = 0;
     qint64 rendered = 0;
-    QObject::connect(&view, &QQuickWindow::beforeFrameBegin, &app, [&] { frame.start(); });
+    // The gap: a timer started when the last frame ended, and the sleep counters as
+    // they stood at that moment. Both are needed — the elapsed time says how long the
+    // gap was, the counters say how much of it was spent not running.
+    QElapsedTimer gap;
+    unsigned long long asleepAtSwap = 0;
+    unsigned long long parksAtSwap = 0;
+    QObject::connect(&view, &QQuickWindow::beforeFrameBegin, &app, [&] {
+        if (gap.isValid()) {
+            unsigned long long asleep = 0;
+            unsigned long long parks = 0;
+            staros_poll_wait(&asleep, &parks);
+            stages.gap += gap.nsecsElapsed();
+            stages.gapAsleep += qint64(asleep - asleepAtSwap);
+            stages.gapParks += qint64(parks - parksAtSwap);
+            stages.gapCounted++;
+            gap.invalidate();
+        }
+        frame.start();
+    });
     QObject::connect(&view, &QQuickWindow::afterSynchronizing, &app,
                      [&] { synced = frame.nsecsElapsed(); });
     QObject::connect(&view, &QQuickWindow::afterRendering, &app,
@@ -233,6 +275,10 @@ int main(int argc, char **argv)
         stages.worst = qMax(stages.worst, swapped);
         stages.counted++;
         synced = rendered = 0;
+        // The gap starts here, and its sleep is measured from here: anything parked
+        // between this frame and the next one is time this program was not running.
+        staros_poll_wait(&asleepAtSwap, &parksAtSwap);
+        gap.start();
     });
 
     view.setSource(QUrl::fromLocalFile(QLatin1String(SCENE_PATH)));
@@ -311,6 +357,21 @@ int main(int argc, char **argv)
                         static_cast<long long>(stages.raster / n / 1000),
                         static_cast<long long>(stages.present / n / 1000),
                         static_cast<long long>(stages.worst / 1000));
+            if (stages.gapCounted > 0) {
+                const qint64 g = stages.gapCounted;
+                // Key word first, value after it, every key appearing once — the same
+                // shape as the plugin's line, and for the same reason: the awk in
+                // `scripts/frame-profile.sh` reads these by taking the token after a
+                // name, and a line that puts the number first parses to whatever
+                // came before it.
+                std::printf("[shell] between frames over %lld gap(s): total %lld us, "
+                            "asleep %lld us, awake %lld us, parks %.2f per gap\n",
+                            static_cast<long long>(g),
+                            static_cast<long long>(stages.gap / g / 1000),
+                            static_cast<long long>(stages.gapAsleep / g / 1000),
+                            static_cast<long long>((stages.gap - stages.gapAsleep) / g / 1000),
+                            double(stages.gapParks) / double(g));
+            }
         } else {
             std::printf("[shell] frame profile: no frame carried all three stages; "
                         "nothing measured\n");

@@ -134,6 +134,37 @@ pub mod exports {
         handle
     }
 
+    /// How long this process has been asleep inside `poll`, in nanoseconds, and how
+    /// many times it parked there. Either pointer may be null.
+    ///
+    /// It exists for one question the frame profile could not answer: the gap
+    /// between one frame and the next is a fifth of the wall clock, and "polish,
+    /// animation and the event loop" is a guess about what happens in it. Sleep and
+    /// work are opposite findings — a loop waiting for its next animation tick is
+    /// running exactly as designed, and a loop *busy* for the same milliseconds is a
+    /// defect — and no timer inside Qt distinguishes them, because from Qt's side
+    /// both are "the dispatcher has not returned yet".
+    ///
+    /// Counted in the C library rather than in the toolkit because this is where
+    /// the parking happens: `poll` is the only call in this system that blocks an
+    /// event loop, and the plugin, the toolkit and the program all reach the same
+    /// one.
+    ///
+    /// # Safety
+    /// C ABI: each non-null pointer is written once with one `uint64_t`.
+    #[no_mangle]
+    pub unsafe extern "C" fn staros_poll_wait(asleep_ns: *mut u64, parks: *mut u64) {
+        let (ns, count) = crate::fd::poll_wait_totals();
+        if !asleep_ns.is_null() {
+            // SAFETY: forwarded from the caller, checked non-null, one `u64` wide.
+            unsafe { asleep_ns.write(ns) };
+        }
+        if !parks.is_null() {
+            // SAFETY: as above.
+            unsafe { parks.write(count) };
+        }
+    }
+
     /// Send one message on an endpoint descriptor, carrying `msg.cap` if it is not
     /// zero. Returns 0, or a negated errno.
     ///

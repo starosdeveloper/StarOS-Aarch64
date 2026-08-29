@@ -66,7 +66,7 @@ printf '\n' | timeout -k 5 180 qemu-system-aarch64 \
 
 echo
 echo "what the system said about itself:"
-grep -a -E "^\[shell\] (frame profile|[0-9]+ frame)|^\[qstaros\] present|^\[displaysrv\] composite" \
+grep -a -E "^\[shell\] (frame profile|between frames|[0-9]+ frame)|^\[qstaros\] present|^\[displaysrv\] composite" \
     "$TMP/serial.log" | sed 's/^/  /'
 
 # ---------------------------------------------------------------- the arithmetic
@@ -91,6 +91,18 @@ awk '
     have_shell = 1
 }
 /^\[shell\] [0-9]+ frame\(s\) in/ { wall_frames = $2; wall_ms = $5; have_wall = 1 }
+/^\[shell\] between frames over/ {
+    # Same first-occurrence rule the plugin line uses: key word, then value.
+    # (No apostrophes in here: the whole awk program is one single-quoted shell
+    # word, and one of those ends it mid-rule.)
+    for (i = 1; i <= NF; i++) {
+        if ($i == "total"  && gap_total  == "") gap_total  = $(i + 1)
+        if ($i == "asleep" && gap_asleep == "") gap_asleep = $(i + 1)
+        if ($i == "awake"  && gap_awake  == "") gap_awake  = $(i + 1)
+        if ($i == "parks"  && gap_parks  == "") gap_parks  = $(i + 1)
+    }
+    have_gap = 1
+}
 /^\[qstaros\] present:/ {
     if ($3 + 0 > qt_frames) {
         qt_frames = $3 + 0
@@ -134,7 +146,17 @@ END {
     if (have_wall && wall_frames > 0) {
         interval = 1000 * wall_ms / wall_frames
         printf "  %-34s %8d us   (%.1f frame(s) a second)\n", "wall clock between frames", interval, 1000000 / interval
-        printf "  %-34s %8d us   polish, animation, the event loop\n", "unaccounted", interval - stage_total
+        if (have_gap) {
+            # Measured, not inferred. The subtraction above only says how much time
+            # is outside the three stages; these two say what it was spent on, and
+            # they are opposite findings — sleep is the render loop waiting for its
+            # next tick, awake is work nobody has looked at.
+            printf "  %-34s %8d us   measured from frameSwapped to the next frame\n", "the gap between frames", gap_total
+            printf "  %-34s %8d us   parked in poll, %s park(s) per gap\n", "  asleep", gap_asleep, gap_parks
+            printf "  %-34s %8d us   polish, animation, delivering events\n", "  awake", gap_awake
+        } else {
+            printf "  %-34s %8d us   polish, animation, the event loop\n", "unaccounted", interval - stage_total
+        }
     }
 
     printf "\ninside present:\n\n"

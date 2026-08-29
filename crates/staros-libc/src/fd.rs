@@ -389,6 +389,44 @@ pub struct PollFd {
     pub revents: i16,
 }
 
+/// Nanoseconds this process has spent *parked* inside `poll`, and how many times
+/// it parked.
+///
+/// Not the time spent in `poll`: the time spent asleep in it. A `poll` that finds a
+/// descriptor already ready never reaches the wait and is counted as zero, which is
+/// the distinction the number exists for — an event loop that returns immediately
+/// four hundred times a second and one that sleeps sixteen milliseconds between
+/// frames look identical from the outside and are opposite problems.
+///
+/// Global rather than per-thread, and `Relaxed`: this is a profile, and the only
+/// question asked of it is "how much of the gap between two frames was sleep". A
+/// count that is off by one park under contention answers that just as well, and a
+/// per-thread version would need TLS in a path that is about to make a syscall
+/// anyway.
+static POLL_ASLEEP_NS: AtomicU64 = AtomicU64::new(0);
+static POLL_PARKS: AtomicU64 = AtomicU64::new(0);
+
+/// Run `park`, adding what it slept to the counters above.
+///
+/// The clock is read around the wait and not around `poll_impl`, so what is counted
+/// is the sleep and not the readiness scan that precedes it. On a machine with no
+/// clock the wait still happens and the park is still counted — the time is what is
+/// unavailable, not the fact.
+fn timed_park<T>(park: impl FnOnce() -> T) -> T {
+    let started = sys::clock_now();
+    let out = park();
+    POLL_PARKS.fetch_add(1, Ordering::Relaxed);
+    if let (Some(a), Some(b)) = (started, sys::clock_now()) {
+        POLL_ASLEEP_NS.fetch_add(b.saturating_sub(a), Ordering::Relaxed);
+    }
+    out
+}
+
+/// `(nanoseconds asleep in poll, times parked)`, since the process started.
+pub(crate) fn poll_wait_totals() -> (u64, u64) {
+    (POLL_ASLEEP_NS.load(Ordering::Relaxed), POLL_PARKS.load(Ordering::Relaxed))
+}
+
 /// The shared body of `poll` and `ppoll`.
 ///
 /// `deadline` is absolute nanoseconds, `None` for "wait forever", `Some(0)` for
@@ -439,7 +477,7 @@ pub(crate) fn poll_impl(fds: &mut [PollFd], deadline: Option<u64>) -> c_int {
             // than a busy loop.
             match deadline {
                 Some(d) => {
-                    sys::sleep_until(d);
+                    timed_park(|| sys::sleep_until(d));
                     return 0;
                 }
                 None => {
@@ -452,7 +490,7 @@ pub(crate) fn poll_impl(fds: &mut [PollFd], deadline: Option<u64>) -> c_int {
 
         #[cfg(feature = "park-trace")]
         crate::thread::park_trace(if deadline.is_some() { "poll-timed" } else { "poll-forever" });
-        let fired = sys::wait_any(&handles[..count], deadline.unwrap_or(0));
+        let fired = timed_park(|| sys::wait_any(&handles[..count], deadline.unwrap_or(0)));
         if !fired && deadline.is_some() {
             // The deadline passed with nothing signalled. One last readiness pass
             // happens at the top of the loop only if we continue, so report the

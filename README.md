@@ -444,6 +444,15 @@ frame to 3.1 %**, a round trip from 5 112 µs to 981, and the server now spends 
 compositing than the client spends in the whole round trip — which is the overlap,
 stated as a number. Waiting was not removed; it stopped being in the frame.
 
+The last unmeasured fifth of a frame is measured too, and it was not what the label
+said. The gap between one frame and the next — 7 427 µs of a 43 056 µs interval — is
+**81 % sleep**: the event loop parks in `poll` exactly once, waits for the next
+animation tick, and wakes. The work in there is 1 412 µs. The counter lives in the C
+library (`staros_poll_wait`) rather than in the toolkit, because `poll` is the only
+call that parks an event loop here and time *asleep* is a different number from time
+*in the call* — a poll that finds a descriptor ready never parks. The frame is not
+waiting on a timer; it is waiting on rasterising, which is Qt's.
+
 Two of the checks turned out to be measuring the host rather than the system, and both
 are fixed: `input-check.sh` pressed its keys on a fifteen-second timer that the boot
 outgrew, and now waits for the driver to say its queues are armed; `qml-verify` asked

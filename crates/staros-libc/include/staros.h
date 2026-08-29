@@ -88,6 +88,20 @@ void *staros_shared_map(unsigned int cap);
  * worker thread ending is not the program ending. */
 unsigned int staros_death_notification(void);
 
+/* How long this process has been asleep *inside* `poll`, in nanoseconds, and how
+ * many times it parked there. Either pointer may be null.
+ *
+ * Time asleep, not time in the call: a `poll` that finds a descriptor already ready
+ * never parks and adds nothing. That distinction is the whole point. A loop that
+ * spends sixteen milliseconds between frames waiting for its next animation tick is
+ * working as designed; a loop *busy* for the same milliseconds is a defect, and from
+ * inside a toolkit the two look identical — both are "the dispatcher has not
+ * returned yet".
+ *
+ * The counters are process-wide and never reset. Sample twice and subtract, which
+ * is what makes them usable per frame. */
+void staros_poll_wait(unsigned long long *asleep_ns, unsigned long long *parks);
+
 /* How many bytes a shared buffer holds; 0 for a handle that is not ours.
  *
  * A server must ask this rather than believe the message that delegated the
