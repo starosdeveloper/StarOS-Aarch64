@@ -197,9 +197,11 @@ extern "C" fn main() -> ! {
     };
 
     let count = archive.entries().count();
-    puts("[fssrv] the files are mine: ");
-    put_dec(count as u64);
-    puts(" of them, served over IPC to processes that hold no archive\n");
+    let mut line = Line::new();
+    line.put(b"[fssrv] the files are mine: ");
+    line.num(count as u64);
+    line.put(b" of them, served over IPC to processes that hold no archive\n");
+    line.flush();
 
     let mut table = Table::new();
     let mut served: u32 = 0;
@@ -237,13 +239,15 @@ extern "C" fn main() -> ! {
         }
     }
 
-    puts("[fssrv] served ");
-    put_dec(u64::from(served));
-    puts(" requests, ");
-    put_dec(bytes_out);
-    puts(" bytes of file data, and refused ");
-    put_dec(u64::from(refused));
-    puts(" - the archive never left this address space\n");
+    let mut line = Line::new();
+    line.put(b"[fssrv] served ");
+    line.num(u64::from(served));
+    line.put(b" requests, ");
+    line.num(bytes_out);
+    line.put(b" bytes of file data, and refused ");
+    line.num(u64::from(refused));
+    line.put(b" - the archive never left this address space\n");
+    line.flush();
     exit();
 }
 
@@ -421,24 +425,68 @@ fn puts(s: &str) {
     }
 }
 
-/// Write a decimal number.
-fn put_dec(mut value: u64) {
-    let mut digits = [0u8; 20];
-    let mut n = 0;
-    loop {
-        digits[n] = b'0' + (value % 10) as u8;
-        value /= 10;
-        n += 1;
-        if value == 0 {
-            break;
+/// A line being built for `DebugWrite`, bounded and self-truncating.
+///
+/// This server used to print its two reports as alternating `puts` and `put_dec`
+/// calls, which is one `DebugWrite` per fragment and one opening per fragment for
+/// another task to write into. It showed: the boot line came out of a real run
+/// split across two lines, with a display-server line wedged into the middle of it.
+/// Nothing was wrong with the server and nothing was wrong with the console — the
+/// line was simply never a line, and a report that is *usually* whole is the worst
+/// kind of evidence, because the run where it tears is the run being read.
+///
+/// Truncation is what happens on overflow. A diagnostic that panics is worse than a
+/// diagnostic that is short.
+struct Line {
+    buf: [u8; 192],
+    n: usize,
+}
+
+impl Line {
+    const fn new() -> Self {
+        Self { buf: [0; 192], n: 0 }
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.n < self.buf.len() {
+                self.buf[self.n] = b;
+                self.n += 1;
+            }
         }
     }
-    let mut out = [0u8; 20];
-    for i in 0..n {
-        out[i] = digits[n - 1 - i];
+
+    /// Append `value` in decimal. Nothing is appended if it will not fit, which is
+    /// the honest failure for a diagnostic: a truncated number reads as a real one.
+    fn num(&mut self, value: u64) {
+        let mut digits = [0u8; 20];
+        let mut count = 0;
+        let mut left = value;
+        loop {
+            digits[count] = b'0' + (left % 10) as u8;
+            count += 1;
+            left /= 10;
+            if left == 0 {
+                break;
+            }
+        }
+        if count > self.buf.len() - self.n {
+            return;
+        }
+        for i in 0..count {
+            self.buf[self.n + i] = digits[count - 1 - i];
+        }
+        self.n += count;
     }
-    // SAFETY: every byte written is an ASCII digit.
-    puts(unsafe { core::str::from_utf8_unchecked(&out[..n]) });
+
+    /// One syscall, one line.
+    fn flush(&mut self) {
+        // SAFETY: `DebugWrite` reads `n` bytes from a buffer we own.
+        unsafe {
+            let _ = syscall2(SYS_DEBUG_WRITE, self.buf.as_ptr() as u64, self.n as u64);
+        }
+        self.n = 0;
+    }
 }
 
 /// End this process.

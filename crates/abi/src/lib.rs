@@ -9,6 +9,7 @@
 //! `no_std` except under `cargo test`, where the host test harness needs `std`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod affinity;
 pub mod error;
 pub mod fsproto;
 pub mod syscall;

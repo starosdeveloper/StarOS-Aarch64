@@ -195,6 +195,34 @@ size_t staros_shared_bytes(unsigned int cap);
 #define STAROS_BUTTON_RIGHT  2u
 #define STAROS_BUTTON_MIDDLE 4u
 
+/* ---- CPU affinity ------------------------------------------------------- */
+
+/* The core this thread is on at the instant of the call.
+ *
+ * A snapshot. An unpinned thread may be somewhere else before the value is
+ * returned, and no amount of locking would change that — "which core am I on" has
+ * no stable answer for a thread that has not said where it wants to be. */
+int staros_cpu_id(void);
+
+/* Restrict this thread to the cores in `mask` (bit n = core n) and return the
+ * mask of cores that are ONLINE. A mask of 0 sets nothing and asks only for that
+ * second number, so the usual shape is:
+ *
+ *     unsigned long long cores = (unsigned long long)staros_set_affinity(0);
+ *     if (cores & (1ull << 2)) staros_set_affinity(1ull << 2);
+ *
+ * Returns -1 if the mask names no online core, leaving this thread's affinity
+ * unchanged: a thread pinned to a core that never came up never runs again, and
+ * this call is the last place anyone can be told.
+ *
+ * On success with a non-zero mask the call does not return until this thread is on
+ * a permitted core, so staros_cpu_id() straight afterwards reads the new one.
+ *
+ * Not spelled sched_setaffinity: that one takes a cpu_set_t, and a 1024-bit set
+ * with a macro family around it would claim a portability this system does not
+ * have. MAX_CPUS here is eight, so the mask is one integer. */
+long long staros_set_affinity(unsigned long long mask);
+
 /* ---- Measurements ------------------------------------------------------- */
 
 /* Bytes that munmap and mremap accounted for and the kernel still has mapped.

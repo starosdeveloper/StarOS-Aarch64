@@ -527,6 +527,29 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // nothing, and it is the caller's own.
         Some(Syscall::TaskId) => sched::current_pid() as isize,
 
+        // Which core the caller is on, right now. Needs no capability for the same
+        // reason `TaskId` does not: it names no object, grants nothing, and
+        // describes only where the caller already is.
+        //
+        // Deliberately a snapshot. An unpinned task may be elsewhere before the
+        // value reaches a register, and no lock could change that — "which core am
+        // I on" simply has no stable answer for a task that has not said where it
+        // wants to be. Pinned with `SetAffinity` it does, and the pair is what lets
+        // a program prove its own pinning instead of trusting it.
+        Some(Syscall::CpuId) => sched::current_cpu() as isize,
+
+        // Restrict the caller to the cores in the mask at `x0`, and answer with the
+        // mask of cores that are online. A mask of zero asks for that second number
+        // without setting anything.
+        //
+        // The authority question here is worth stating, because it is why there is
+        // no capability: the mask restricts the *caller*, and giving up cores you
+        // could have run on is not an authority anyone needs protecting from.
+        // Pinning another task would be a different syscall with a different answer
+        // — that is authority over someone else's scheduling, and this kernel has
+        // no capability that names it.
+        Some(Syscall::SetAffinity) => sched::set_affinity(req.args[0]),
+
         // Bind the notification named by `x1` to the endpoint named by `x0`, so a
         // message arriving there also signals it. Both handles are the caller's, and
         // the endpoint one must carry receive rights: this grants the authority to

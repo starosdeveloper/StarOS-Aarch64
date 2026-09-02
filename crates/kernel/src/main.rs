@@ -1989,6 +1989,40 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         "scheduling: {total} context switch(es) over {busy_cores} core(s) —{spread}",
     );
 
+    // Affinity, and the one number in it that can fail. The mask a task asked for
+    // reads back exactly as written whether or not the picker ever consults it; the
+    // cores it *ran on* since asking is what changes the moment the affinity test
+    // comes out of `Scheduler::pickable`. So the mask is printed as context and the
+    // ran-on set is printed as the claim, and they are printed next to each other
+    // precisely so a reader can see them disagree.
+    //
+    // Printed unconditionally, including the zeroes. A report that goes quiet when
+    // it has nothing to say is indistinguishable from one that is not there — which
+    // is how the console-mirror instrumentation measured nothing for a whole phase.
+    let (pinned, forced) = sched::affinity_stats();
+    let mut pins = [(0u64, 0u64, 0u64); 16];
+    let n = sched::pinned_report(&mut pins);
+    let _ = writeln!(
+        console,
+        "affinity: {pinned} pin(s), {forced} forced migration(s), {n} task(s) still pinned",
+    );
+    for &(id, mask, ran_on) in &pins[..n] {
+        // `ran_on` empty means the task has not been scheduled since it pinned
+        // itself, which is a third outcome and not a pass: it is what a pin to a
+        // core that exists but is never idle would look like.
+        let verdict = if ran_on == 0 {
+            "not scheduled since"
+        } else if ran_on & !mask == 0 {
+            "stayed inside its mask"
+        } else {
+            "RAN OUTSIDE ITS MASK"
+        };
+        let _ = writeln!(
+            console,
+            "affinity:   task {id} pinned to {mask:#x}, ran on {ran_on:#x} — {verdict}",
+        );
+    }
+
     // The IPC contention test's other half. The receiver already reported that the
     // *arithmetic* held (no message lost or duplicated); this says the traffic was
     // genuinely spread across cores rather than serialised on one — the difference

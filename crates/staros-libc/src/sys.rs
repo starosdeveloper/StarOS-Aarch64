@@ -240,6 +240,21 @@ pub(crate) fn task_id() -> i64 {
     unsafe { syscall0(Syscall::TaskId) as i64 }
 }
 
+/// The core this thread is running on at the instant of the call.
+pub(crate) fn cpu_id() -> usize {
+    // SAFETY: `CpuId` takes no arguments, touches no memory and always returns.
+    unsafe { syscall0(Syscall::CpuId) as usize }
+}
+
+/// Restrict this thread to the cores in `mask`, and return the mask of cores that
+/// are online — or a negative error if `mask` names none of them. A `mask` of zero
+/// changes nothing and only asks for the online set.
+pub(crate) fn set_affinity(mask: u64) -> isize {
+    // SAFETY: `SetAffinity` reads one integer and may switch this thread to another
+    // core before returning; it touches no caller memory.
+    unsafe { syscall1(Syscall::SetAffinity, mask) }
+}
+
 /// Give up the rest of this timeslice.
 pub(crate) fn yield_now() {
     // SAFETY: `Yield` reschedules and returns.

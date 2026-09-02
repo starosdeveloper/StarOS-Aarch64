@@ -55,6 +55,24 @@ pub fn online_count() -> u32 {
     ONLINE.load(Ordering::Acquire).count_ones() + 1
 }
 
+/// Which cores are running kernel code, as an affinity mask: bit `n` = cpu `n`.
+///
+/// The primary's bit is added here rather than stored, because [`ONLINE`] is
+/// written by *secondaries* announcing themselves and cpu 0 has nobody to announce
+/// to — it is the core doing the asking. Folding it in at the one place that reads
+/// the mask keeps that asymmetry from leaking into every caller, which is exactly
+/// what [`online_count`]'s `+ 1` is doing one line above.
+///
+/// This is the set an affinity request is checked against, and it is deliberately
+/// the cores that *arrived* rather than the cores the device tree lists. Firmware
+/// that accepts `CPU_ON` and then does nothing is a real failure mode on real
+/// hardware (see [`ONLINE_POLL_LIMIT`]), and a task pinned to a core that never
+/// came up is a task that never runs again.
+#[must_use]
+pub fn online_mask() -> u64 {
+    ONLINE.load(Ordering::Acquire) | 1
+}
+
 /// The MPIDR values of the machine's cores, in device tree order.
 ///
 /// `/cpus` overrides the root's cell counts — addresses are one cell there, not

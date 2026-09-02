@@ -48,6 +48,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use staros_abi::affinity;
 use staros_abi::error::KError;
 use staros_arch_aarch64::addrspace::AddressSpace;
 use staros_arch_aarch64::context::{context_switch, CpuContext};
@@ -185,6 +186,37 @@ struct Task {
     /// keepable — a handle that stopped resolving between the registration and the
     /// death would turn "you will be told" into "you might be".
     death_notify: Option<usize>,
+    /// Which cores this task may be picked by: bit `n` = core `n`. Set by
+    /// [`set_affinity`]; [`affinity::ALL`] until a task asks for less.
+    ///
+    /// Per task and not per address space, unlike [`Task::caps`], and the two
+    /// differ for a reason rather than by oversight. A capability table describes
+    /// what a *program* may act on, and its threads are the same program; affinity
+    /// describes where a *schedulable thing* runs, and a program spreading work
+    /// across cores is precisely a program whose threads want different answers.
+    /// Inheriting it would make "pin each worker to its own core" inexpressible.
+    affinity: affinity::Mask,
+    /// The core that ran this task last, or [`affinity::NO_HOME`] if it has never
+    /// run.
+    ///
+    /// The whole of the locality policy: [`Scheduler::pick`] prefers a task this
+    /// core ran before, so a task tends to come back to the cache lines it left
+    /// behind. A *preference* and never a constraint, and the two ways it could
+    /// become one are both closed deliberately — see [`affinity::choose`] for the
+    /// fall-through pass, and [`affinity::homed_here`] for why a task that has never
+    /// run is at home on every core rather than on none.
+    last_cpu: usize,
+    /// Every core this task has run on since its affinity was last set: bit `n` =
+    /// core `n`.
+    ///
+    /// This field exists to be *falsifiable*, and it is the only one here that does.
+    /// "The task was pinned to core 1" is a claim about a mask, and a mask that is
+    /// never consulted still reads back exactly as it was written. "The task ran on
+    /// core 1 and on no other core" is a claim about what happened, and it is the
+    /// one that fails the moment the affinity test is taken out of
+    /// [`Scheduler::pickable`]. Cleared by [`set_affinity`], so the bits always
+    /// describe the pinning currently in force rather than the task's whole life.
+    ran_on: u64,
     /// Where each shared-memory object this task has mapped landed in its address
     /// space, and how far the placement cursor has advanced.
     ///
@@ -366,30 +398,79 @@ impl Scheduler {
         }
     }
 
-    /// Whether slot `i` may be picked to run *now*: it is `Ready`, and no core is
-    /// still saving its context (`on_cpu` clear). Skipping an on-cpu task is what
-    /// keeps a peer from loading a context another core has not finished writing —
-    /// see [`Task::on_cpu`]. The task becomes pickable on a later scan, the moment
-    /// its outgoing core's successor clears the flag.
-    fn pickable(&self, i: usize) -> bool {
-        self.tasks[i].state == State::Ready && !self.tasks[i].on_cpu.load(Ordering::Relaxed)
+    /// Whether core `cpu` may pick slot `i` to run *now*: it is `Ready`, its
+    /// affinity permits this core, and no core is still saving its context
+    /// (`on_cpu` clear).
+    ///
+    /// Skipping an on-cpu task is what keeps a peer from loading a context another
+    /// core has not finished writing — see [`Task::on_cpu`]. The task becomes
+    /// pickable on a later scan, the moment its outgoing core's successor clears the
+    /// flag.
+    ///
+    /// The affinity test is here, in the one place every core asks its question,
+    /// rather than in the paths that make a task `Ready`. A pinned task is perfectly
+    /// runnable; what changes is *who may run it*, and that is a question only the
+    /// asking core can answer about itself.
+    fn pickable(&self, i: usize, cpu: usize) -> bool {
+        self.tasks[i].state == State::Ready
+            && affinity::allows(self.tasks[i].affinity, cpu)
+            && !self.tasks[i].on_cpu.load(Ordering::Relaxed)
     }
 
-    /// First pickable slot, if any.
-    fn first_ready(&self) -> Option<usize> {
-        (0..self.tasks.len()).find(|&i| self.pickable(i))
+    /// Whether core `cpu` is the natural home of slot `i` — the locality
+    /// preference, consulted only for slots [`Scheduler::pickable`] already admits.
+    ///
+    /// A task that has never run is at home *everywhere*; see
+    /// [`affinity::homed_here`] for why treating it otherwise starves it.
+    fn sticky(&self, i: usize, cpu: usize) -> bool {
+        affinity::homed_here(self.tasks[i].last_cpu, cpu)
     }
 
-    /// Next pickable slot after `from`, scanning round-robin (never returns
-    /// `from` itself).
-    fn pick_next(&self, from: usize) -> Option<usize> {
-        let n = self.tasks.len();
-        if n == 0 {
-            return None;
+    /// The slot core `cpu` should take next, scanning round-robin from just after
+    /// `from` and preferring one it ran before. Never returns `from`.
+    ///
+    /// The policy itself lives in [`affinity::choose`], where it is host-tested; all
+    /// that happens here is supplying it with this scheduler's two predicates.
+    fn pick(&self, cpu: usize, from: usize) -> Option<usize> {
+        affinity::choose(
+            self.tasks.len(),
+            from,
+            |i| self.pickable(i, cpu),
+            |i| self.sticky(i, cpu),
+        )
+    }
+
+    /// The slot core `cpu` should take when it is running nothing at all — a
+    /// bootstrap or idle loop, which has no `from` to scan away from and must be
+    /// able to reach slot 0.
+    fn pick_idle(&self, cpu: usize) -> Option<usize> {
+        affinity::choose_first(
+            self.tasks.len(),
+            |i| self.pickable(i, cpu),
+            |i| self.sticky(i, cpu),
+        )
+    }
+
+    /// Claim slot `next` for core `cpu`: mark it `Running` and on-cpu, make it this
+    /// core's current task, and record where it ran.
+    ///
+    /// One function rather than the five copies of these five lines this scheduler
+    /// used to carry. They were identical and had to stay identical — a path that
+    /// marked a task `Running` without setting `on_cpu` is the stale-context race
+    /// [`Task::on_cpu`] describes, and one that forgot `last_cpu` would quietly turn
+    /// locality off for whichever path it was. Claiming is a single operation, so it
+    /// is written once.
+    ///
+    /// Must be called with the scheduler lock held and before it is dropped: the
+    /// claim is what stops a peer core from picking the same slot.
+    fn take(&mut self, cpu: usize, next: usize) {
+        self.tasks[next].state = State::Running;
+        self.tasks[next].on_cpu.store(true, Ordering::Relaxed);
+        self.tasks[next].last_cpu = cpu;
+        if cpu < u64::BITS as usize {
+            self.tasks[next].ran_on |= 1 << cpu;
         }
-        (1..=n)
-            .map(|off| (from + off) % n)
-            .find(|&i| self.pickable(i))
+        self.current[cpu] = next;
     }
 
     /// Whether any task is `Ready`, already `Running` on some core, or `Sleeping`.
@@ -619,6 +700,13 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
         // Not inherited. A thread's death is not its creator's, and a registration
         // copied into every thread would fire the moment any of them ended.
         death_notify: None,
+        // Also not inherited, and for the sharper reason in [`Task::affinity`]: a
+        // program that spreads work across cores creates threads precisely so they
+        // can be somewhere else. A thread born pinned where its creator is pinned
+        // would make that impossible to ask for.
+        affinity: affinity::ALL,
+        last_cpu: affinity::NO_HOME,
+        ran_on: 0,
         // A *copy* of the creator's placements, exactly like the capability table
         // above and for a sharper reason: the pages are already in this address
         // space at those addresses. A thread starting with an empty table would put
@@ -704,6 +792,12 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         wake_pending: false,
         on_cpu: AtomicBool::new(false),
         death_notify: None,
+        // Every core, until the task asks for fewer: a kernel that decided where a
+        // program should run would be making a policy choice on behalf of one that
+        // has not expressed a preference.
+        affinity: affinity::ALL,
+        last_cpu: affinity::NO_HOME,
+        ran_on: 0,
         shared: Placements::new(staros_arch_aarch64::addrspace::USER_SHARED_VA),
         devices: Placements::new(staros_arch_aarch64::addrspace::USER_DEV_VA),
     })?;
@@ -748,11 +842,10 @@ pub fn start() {
     loop {
         let picked = {
             let mut sched = SCHED.lock();
-            sched.first_ready().map(|first| {
-                sched.current[cpu] = first;
-                sched.tasks[first].state = State::Running;
-                // On-cpu until our successor releases it after the switch saves it.
-                sched.tasks[first].on_cpu.store(true, Ordering::Relaxed);
+            sched.pick_idle(cpu).map(|first| {
+                // Claimed before the guard drops — `take` marks it `Running` and
+                // on-cpu, so no peer core can select it too.
+                sched.take(cpu, first);
                 // Switching *from* the bootstrap context, which is not a task —
                 // nothing to settle when the successor resumes here.
                 PREV[cpu].store(usize::MAX, Ordering::Relaxed);
@@ -807,11 +900,10 @@ pub fn run_secondary() -> ! {
     loop {
         let picked = {
             let mut sched = SCHED.lock();
-            sched.first_ready().map(|first| {
-                sched.current[cpu] = first;
-                sched.tasks[first].state = State::Running;
-                // On-cpu until our successor releases it after the switch saves it.
-                sched.tasks[first].on_cpu.store(true, Ordering::Relaxed);
+            sched.pick_idle(cpu).map(|first| {
+                // Claimed before the guard drops — `take` marks it `Running` and
+                // on-cpu, so no peer core can select it too.
+                sched.take(cpu, first);
                 // Switching *from* the bootstrap context (not a task): nothing to
                 // settle when the successor returns here.
                 PREV[cpu].store(usize::MAX, Ordering::Relaxed);
@@ -885,16 +977,14 @@ fn reschedule() {
         if prev == usize::MAX {
             return;
         }
-        let Some(next) = sched.pick_next(prev) else {
+        let Some(next) = sched.pick(cpu, prev) else {
             return;
         };
         if sched.tasks[prev].state == State::Running {
             sched.tasks[prev].state = State::Ready;
         }
         // Claimed before the guard drops, so no other core can pick it too.
-        sched.tasks[next].state = State::Running;
-        sched.tasks[next].on_cpu.store(true, Ordering::Relaxed);
-        sched.current[cpu] = next;
+        sched.take(cpu, next);
         // Counted per core, because "there is no load balancing" was written down
         // as a limitation and is not one: the ready set is a single array every
         // core scans, so any core picks any runnable task and there is nobody to
@@ -979,11 +1069,9 @@ pub fn exit() -> ! {
             .any(|(i, t)| i != prev && t.state != State::Dead && t.ttbr0 == ttbr0);
         dead_space = if shared { None } else { space };
         prev_ptr = &mut sched.tasks[prev].ctx;
-        match sched.pick_next(prev) {
+        match sched.pick(cpu, prev) {
             Some(next) => {
-                sched.tasks[next].state = State::Running;
-                sched.tasks[next].on_cpu.store(true, Ordering::Relaxed);
-                sched.current[cpu] = next;
+                sched.take(cpu, next);
                 next_ttbr0 = sched.tasks[next].ttbr0;
                 next_ptr = &sched.tasks[next].ctx;
             }
@@ -1059,6 +1147,195 @@ pub fn set_death_notify(notif: Option<usize>) {
     let mut sched = SCHED.lock();
     let cur = sched.current[me()];
     sched.tasks[cur].death_notify = notif;
+}
+
+/// The index of the core this call is executing on. Backs the `CpuId` syscall.
+///
+/// Read from `MPIDR_EL1` rather than from the scheduler, so it needs no lock and
+/// cannot be stale in the way a recorded value could: it is the core asking about
+/// itself, which is the only question with an unambiguous answer here.
+#[must_use]
+pub fn current_cpu() -> usize {
+    me()
+}
+
+/// Tasks that have narrowed their affinity, and migrations forced because a task
+/// excluded the core it was standing on. Both are the claim: a pinned count of
+/// zero means the syscall was never exercised, and a forced-migration count of
+/// zero means every pin happened to name the core the caller was already on —
+/// which is the pin that proves nothing.
+static PINNED: AtomicU64 = AtomicU64::new(0);
+static FORCED_MIGRATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Restrict the current task to the cores in `mask`, and answer with the mask of
+/// cores that are online. Backs the `SetAffinity` syscall.
+///
+/// A `mask` of zero sets nothing and only asks for that second number — the one
+/// thing a caller cannot work out for itself, since the device tree lists cores
+/// that *exist* and a core that was asked for and never arrived is in that list
+/// too.
+///
+/// A mask naming no online core is [`KError::InvalidArgument`]. This is the only
+/// moment the caller can still be told: such a task stays `Ready` and unpickable
+/// for ever, and in the task table, the shutdown report and every log line, that is
+/// indistinguishable from one blocked on a message nobody will send.
+///
+/// **Returns only once the caller is on a permitted core.** An affinity that took
+/// effect at some unspecified later point would be untestable by the only party
+/// that cares: a caller reading `CpuId` immediately afterwards and finding the old
+/// core cannot tell "not yet" from "not working". So a task that has just excluded
+/// the core it is on gives that core up and comes back on one it asked for — and
+/// comes back there *by construction*, because after [`migrate_off`] the only core
+/// that could have resumed it is one [`Scheduler::pickable`] admitted.
+///
+/// The loop around that is not defensive padding. Between installing the mask and
+/// leaving, the timer can preempt this task, and it may then be resumed on a core
+/// that is already permitted — at which point there is nothing to migrate off and
+/// the check must be re-read on the core we actually woke up on, not the one we
+/// asked on.
+pub fn set_affinity(mask: affinity::Mask) -> isize {
+    let online = crate::smp::online_mask();
+    if mask == 0 {
+        return online as isize;
+    }
+    if !affinity::satisfiable(mask, online) {
+        return KError::InvalidArgument.as_raw();
+    }
+    {
+        let mut sched = SCHED.lock();
+        let cur = sched.current[me()];
+        sched.tasks[cur].affinity = mask;
+        // Cleared, not accumulated: these bits must describe the pinning now in
+        // force. A task that ran everywhere before being pinned would otherwise
+        // carry that history into the evidence for the pin.
+        sched.tasks[cur].ran_on = 0;
+        if mask != affinity::ALL {
+            PINNED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // A core that was idling may now be the only one allowed to run this task, and
+    // an idle core sleeps in `wfi` until something interrupts it. Without the
+    // doorbell the migration below would wait for that core's next timer tick.
+    crate::smp::wake_others();
+    while !affinity::allows(mask, me()) {
+        FORCED_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+        migrate_off();
+    }
+    // Record the core we ended up on. `ran_on` is otherwise only written by
+    // [`Scheduler::take`], which fires when a core *claims* a task — and a task
+    // that pins itself to the core it is already standing on is never claimed
+    // again if nothing else is ready to displace it. On a single-core machine that
+    // is every pin, and the report read `ran on 0x0 — not scheduled since` about a
+    // task plainly in the middle of running. The core executing this line is a core
+    // this task has run on, by the most direct evidence there is.
+    {
+        let mut sched = SCHED.lock();
+        let cpu = me();
+        let cur = sched.current[cpu];
+        if cpu < u64::BITS as usize {
+            sched.tasks[cur].ran_on |= 1 << cpu;
+        }
+    }
+    online as isize
+}
+
+/// Give up this core, staying runnable, and resume on whichever core picks us up.
+///
+/// Unlike [`reschedule`], this *always* leaves: if no other task is ready, the core
+/// returns to its bootstrap loop rather than carrying on running us, because the
+/// whole point is that this core may no longer run this task. And unlike
+/// [`park_and_switch`], the task is left `Ready` rather than parked — nothing is
+/// going to wake it, and nothing needs to.
+///
+/// That combination is what makes the `from` exclusion in [`affinity::choose`] load
+/// bearing rather than incidental. Every other caller marks the outgoing task
+/// unpickable (`Running`, `Blocked`, `Sleeping`, `Dead`) *before* asking for a
+/// successor, so a scan that wrapped back onto it would find it unpickable anyway.
+/// This one marks it `Ready` first, on purpose, and would pick itself.
+fn migrate_off() {
+    // SAFETY: mask IRQs across the switch, as every other switch path here does.
+    let saved = unsafe { exceptions::irq_save() };
+
+    let prev_ptr: *mut CpuContext;
+    let next_ptr: *const CpuContext;
+    let next_ttbr0: u64;
+    {
+        let mut sched = SCHED.lock();
+        let cpu = me();
+        let prev = sched.current[cpu];
+        if prev == usize::MAX {
+            drop(sched);
+            // SAFETY: matching restore for the save above.
+            unsafe { exceptions::irq_restore(saved) };
+            return;
+        }
+        // Runnable, just not here. A peer may claim it the instant the guard drops;
+        // `on_cpu` stays set until our successor clears it, so the claim cannot
+        // happen before this core has finished saving the context.
+        sched.tasks[prev].state = State::Ready;
+        PREV[cpu].store(prev, Ordering::Relaxed);
+        prev_ptr = &mut sched.tasks[prev].ctx;
+        match sched.pick(cpu, prev) {
+            Some(next) => {
+                sched.take(cpu, next);
+                next_ttbr0 = sched.tasks[next].ttbr0;
+                next_ptr = &sched.tasks[next].ctx;
+            }
+            // Nothing else for this core: back to its bootstrap loop, which will
+            // idle or finish. Continuing to run the current task is the one thing
+            // this function may not do.
+            None => {
+                sched.current[cpu] = usize::MAX;
+                next_ttbr0 = sched.bootstrap_ttbr0[cpu];
+                next_ptr = &sched.bootstrap[cpu];
+            }
+        }
+    }
+    // SAFETY: a valid root table sharing the kernel identity map.
+    unsafe { mmu::set_ttbr0(next_ttbr0) };
+    // SAFETY: distinct contexts, IRQs masked. We resume here on whichever core
+    // picked us up — which, by `pickable`, is one this task's affinity permits.
+    unsafe { context_switch(prev_ptr, next_ptr) };
+    // Resumed as someone's successor: settle (and maybe reap) our predecessor.
+    post_switch();
+
+    // SAFETY: matching restore for the save above.
+    unsafe { exceptions::irq_restore(saved) };
+}
+
+/// How many tasks narrowed their affinity, and how many were forced off a core by
+/// doing so.
+#[must_use]
+pub fn affinity_stats() -> (u64, u64) {
+    (
+        PINNED.load(Ordering::Relaxed),
+        FORCED_MIGRATIONS.load(Ordering::Relaxed),
+    )
+}
+
+/// Every task that is currently pinned, as `(task id, affinity mask, cores it has
+/// run on since it was pinned)`. Returns how much of `out` was filled.
+///
+/// The third number is the evidence and the first two are only context. A mask
+/// reads back exactly as written whether or not anything consults it; the set of
+/// cores a task *actually ran on* is what changes when the affinity test is taken
+/// out of [`Scheduler::pickable`], and that is the falsification this report is
+/// here to make possible.
+#[must_use]
+pub fn pinned_report(out: &mut [(u64, u64, u64)]) -> usize {
+    let sched = SCHED.lock();
+    let mut n = 0;
+    for t in sched.tasks.iter() {
+        if n == out.len() {
+            break;
+        }
+        if t.affinity == affinity::ALL {
+            continue;
+        }
+        out[n] = (t.id, t.affinity, t.ran_on);
+        n += 1;
+    }
+    n
 }
 
 /// How many task slots the table holds.
@@ -1167,11 +1444,9 @@ fn park_and_switch(parked: State) {
         // peer from loading `prev` before its context is safely saved.
         PREV[cpu].store(prev, Ordering::Relaxed);
         prev_ptr = &mut sched.tasks[prev].ctx;
-        match sched.pick_next(prev) {
+        match sched.pick(cpu, prev) {
             Some(next) => {
-                sched.tasks[next].state = State::Running;
-                sched.tasks[next].on_cpu.store(true, Ordering::Relaxed);
-                sched.current[cpu] = next;
+                sched.take(cpu, next);
                 next_ttbr0 = sched.tasks[next].ttbr0;
                 next_ptr = &sched.tasks[next].ctx;
             }

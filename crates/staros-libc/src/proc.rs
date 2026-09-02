@@ -598,6 +598,52 @@ pub mod exports {
         result
     }
 
+    // ------------------------------------------------------------------- affinity
+
+    // Not in the Qt contract, and named `staros_*` rather than `sched_getcpu` /
+    // `sched_setaffinity` on purpose. The glibc pair takes a `cpu_set_t` — a
+    // 1024-bit array with a family of macros around it — and implementing that
+    // shape here would be pretending to a portability this system does not have.
+    // The kernel's affinity is one register wide because this kernel's `MAX_CPUS`
+    // is eight, and a header that said otherwise would be the lie this whole module
+    // is written to avoid. A program that wants the POSIX spelling can have it the
+    // day something asks for it, on top of these.
+
+    /// The core this thread is running on at the instant of the call.
+    ///
+    /// A snapshot, and honest about it: an unpinned thread may be elsewhere before
+    /// the value is returned. Pinned with [`staros_set_affinity`], it is stable —
+    /// and the pair is how a program proves its own pinning rather than trusting it.
+    #[no_mangle]
+    pub extern "C" fn staros_cpu_id() -> c_int {
+        crate::sys::cpu_id() as c_int
+    }
+
+    /// Restrict this thread to the cores named by `mask` (bit `n` = core `n`), and
+    /// return the mask of cores that are **online**.
+    ///
+    /// A `mask` of zero sets nothing and asks only for that second number, which is
+    /// the one a caller cannot work out for itself — so the ordinary use is
+    /// `staros_set_affinity(0)` to learn what exists, then a second call to pin.
+    ///
+    /// Returns `-1` if `mask` names no online core; the thread's affinity is
+    /// unchanged. That case is an error rather than an obedient pin because a thread
+    /// restricted to a core that never came up never runs again, and this call is
+    /// the last moment anyone can be told.
+    ///
+    /// On a successful non-zero mask the call **does not return until this thread is
+    /// on a permitted core**, so a `staros_cpu_id()` immediately afterwards reads the
+    /// new one.
+    #[no_mangle]
+    pub extern "C" fn staros_set_affinity(mask: u64) -> i64 {
+        let rc = crate::sys::set_affinity(mask);
+        if rc < 0 {
+            -1
+        } else {
+            rc as i64
+        }
+    }
+
     // --------------------------------------------------------------------- system
 
     /// `struct utsname`, in glibc's layout: six 65-byte fields.

@@ -211,23 +211,56 @@ def main():
     f.readline()
     cmd({"execute": "qmp_capabilities"})
 
-    # Sample until the guest powers off, and judge the **last** frame.
+    # Judge the frame the display server *finished* on.
     #
     # This used to stop at the first frame that passed, and that was a check with a
     # hole in it: a window closing without repainting what it covered leaves the
     # wrong pixels behind, and every earlier frame — before that window was ever
     # opened — passes. The falsification proved it, by not failing.
     #
-    # The last frame is the screen as the machine stopped: every surface created,
-    # composited, raised and destroyed, in that order, with nothing still to come.
-    # A transient correct frame no longer counts for anything.
+    # So it became "the last frame before power-off", and that was the same hole
+    # with the sign flipped. Two things are wrong with power-off as the marker:
+    #
+    #   * it is not a bound. The loop stopped after a fixed 240 screendumps, and a
+    #     screendump of a 640x480 framebuffer over QMP is not free — on a busy host
+    #     the budget ran out while the guest was still starting its clients, and a
+    #     mid-run frame got judged under the words "the last frame before power-off";
+    #   * it is a race even when the budget holds. The C program's double-buffer
+    #     swap is one of the last things composited, and the machine powers off a
+    #     few tens of milliseconds later. A screendump landing in that gap is empty,
+    #     the empty file is discarded, and the frame judged is the one *before* the
+    #     swap. That is exactly what failed here: (301,301) read as (0,255,0), the
+    #     first buffer's brighter green, on a run where the last real frame held
+    #     (0,200,0) — the back buffer, correct, two dumps later.
+    #
+    # The marker that is not a race is the display server saying it is done. Its
+    # profile line is printed after its last composite and before it exits, and
+    # nothing draws afterwards — the compositor is the only writer of this screen.
+    # So: sample until that line appears in the serial log, then take the frames
+    # after it and judge the last readable one. Power-off still ends the loop, and
+    # running out of wall clock is now a failure that says so rather than a verdict.
+    log = os.path.join(tmpdir, "serial.log")
+    DONE = b"[displaysrv] composite:"
+
+    def finished():
+        try:
+            with open(log, "rb") as fh:
+                return DONE in fh.read()
+        except OSError:
+            return False
+
+    deadline = time.monotonic() + 90.0
     last = None
-    verdict = "no frame captured"
-    for i in range(240):
-        ppm = os.path.join(tmpdir, f"verify{i:03d}.ppm")
+    settled = False
+    after_done = 0
+    frames = 0
+    while time.monotonic() < deadline:
+        ppm = os.path.join(tmpdir, f"verify{frames:04d}.ppm")
+        frames += 1
         try:
             r = cmd({"execute": "screendump", "arguments": {"filename": ppm}})
         except Exception:
+            # The socket went away with the guest. Whatever we have is final.
             break
         if "error" in r:
             break
@@ -242,15 +275,39 @@ def main():
                 last = ppm
             else:
                 os.remove(ppm)
-        time.sleep(0.08)
+        if settled:
+            # A handful of dumps past the server's last composite, so the frame
+            # judged is one taken strictly after it and not one racing it.
+            after_done += 1
+            if after_done >= 4:
+                break
+        elif finished():
+            settled = True
+        time.sleep(0.05)
+
+    # The guest is gone; so is the other end of this socket. Drop it explicitly,
+    # or the interpreter's finalizer tries to flush a closed pipe on the way out and
+    # prints a BrokenPipeError traceback over a result that is already decided.
+    try:
+        f.close()
+        s.close()
+    except OSError:
+        pass
+
+    if not settled:
+        print(
+            f"fb-verify: FAIL - after {frames} screendumps the display server never "
+            "reported a finished composite; no frame here is its last one"
+        )
+        sys.exit(1)
 
     if last is None:
-        print(f"fb-verify: FAIL - {verdict}")
+        print("fb-verify: FAIL - the display server finished without a readable frame")
         sys.exit(1)
 
     ok, why = check(last)
     if not ok:
-        print(f"fb-verify: FAIL - the last frame before power-off: {why}")
+        print(f"fb-verify: FAIL - the display server's last frame: {why}")
         sys.exit(1)
 
     print(f"fb-verify: PASS - {why}")

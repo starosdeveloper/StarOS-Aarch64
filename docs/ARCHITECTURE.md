@@ -893,6 +893,28 @@ Done:
   that ignores the client's requested position passes every text assertion in the
   smoke matrix (the pixel count still matches) and fails the pixel check.
 
+  A screen check is only as good as its choice of *when* to look, and that choice
+  was wrong twice. First frame that passes: blind to a window that closes without
+  repainting, since every frame before the window existed is clean. Last frame
+  before power-off: a race, because the last composite and the power-off are tens of
+  milliseconds apart and a screendump landing between them is empty — the empty file
+  is discarded and the verdict comes from the frame before. It reported
+  `(301,301) is (0,255,0)` — the double buffer's *first* buffer — on runs whose real
+  final frame held `(0,200,0)`. The marker is now the display server's own profile
+  line, printed after its last composite and before it exits; the frame judged is
+  taken after that, and nothing else on this machine writes to the framebuffer.
+
+- **Diagnostics are lines or they are not evidence.** `fssrv` printed its two
+  reports as alternating string and number writes, which is one `DebugWrite` per
+  fragment and one opening per fragment for another task to write into. A real run
+  produced `[fssrv] the files are mine: ` with a display-server line wedged into the
+  middle of it and the count on the row below. Nothing was wrong with the server or
+  with the console — the line was simply never a line. It now builds into one
+  bounded buffer and leaves in one syscall, which is what `displaysrv` already did
+  and what `inputsrv` had to learn twice. A report that is *usually* whole is worse
+  than one that is always short, because the run where it tears is the run being
+  read.
+
 - **Input, driven entirely in EL0 (`crates/virtio`, `services/inputsrv`).** A key
   pressed outside the machine reaches a program in user space without the kernel
   reading a device register, touching a ring, or seeing an event: it supplies a
@@ -1044,6 +1066,106 @@ Done:
   `scheduling: 1946 context switch(es) over 4 core(s) — cpu0=464 cpu1=577 cpu2=523
   cpu3=382`. Even spread, no core starved. A total alone could not have shown it.
 
+- **Affinity, and a locality preference under it.** The note below used to say that
+  what was genuinely missing was any notion of keeping a task near the core whose
+  caches are warm for it. Both halves of that are now here, and they are different
+  in kind: one is a *constraint* a task asks for, the other is a *preference* the
+  picker applies to tasks that asked for nothing.
+
+  A task carries an affinity mask — bit `n` means "may run on core `n`" — and
+  `Scheduler::pickable` consults it, so the restriction lives in the one place every
+  core asks its question about a slot rather than in the paths that make a task
+  runnable. A pinned task is perfectly runnable; what changes is *who may run it*,
+  and that is a question only the asking core can answer about itself. `SetAffinity`
+  (syscall 37) sets it, and `CpuId` (36) answers where the caller is, which is what
+  makes a pin something a program can *prove* rather than trust.
+
+  Three decisions in that syscall are worth their lines:
+
+  - **It is per task, not per address space** — unlike the capability table, which
+    was made shared for exactly the opposite reason. A capability table describes
+    what a *program* may act on and its threads are the same program; affinity
+    describes where a *schedulable thing* runs, and a program spreading work across
+    cores is precisely one whose threads want different answers. Inherited affinity
+    would make "pin each worker to its own core" inexpressible.
+  - **A mask naming no online core is refused**, and checked against the cores that
+    *arrived* rather than the ones the device tree lists — firmware that accepts
+    `CPU_ON` and then does nothing is a real failure mode on hardware. A task pinned
+    to a core that never came up stays `Ready` and unpickable for ever, and in the
+    task table, the shutdown report and every log line that is indistinguishable from
+    one blocked on a message nobody will send. The syscall is the last moment anyone
+    can be told.
+  - **It does not return until the caller is on a permitted core.** An affinity
+    taking effect at some unspecified later point is untestable by the only party
+    that cares: a caller reading `CpuId` immediately afterwards and finding the old
+    core cannot tell "not yet" from "not working". So a task that has just excluded
+    the core it is standing on gives that core up (`migrate_off`) and comes back on
+    one it asked for — by construction, since the only core that could have resumed
+    it is one `pickable` admitted.
+
+  The preference is the other half and is deliberately weaker: each task records the
+  core that ran it last, and the picker takes a task this core ran before if one is
+  runnable, otherwise anything at all. The fall-through is what keeps stickiness from
+  becoming starvation — a preference that could not fall through would leave a core
+  idle beside a runnable task, which is worse than a cold cache by a wide margin.
+
+  The fall-through was not enough on its own, and finding out cost a boot. A task
+  that has never run has no last core, and the first version compared `last_cpu ==
+  cpu`, so a *fresh* task matched the preference on no core at all and was reachable
+  only through the fall-through — that is, only at an instant when nothing that had
+  already run was runnable. On a busy machine that instant need not arrive. The
+  symptom was a newly created thread that never started, its parent timing out on the
+  two-second deadline it waits with, and `[client] THREAD WRONG` on the single-core
+  configuration — a check written years before affinity existed, for a completely
+  different failure, catching this one because it is the only one that waits on a
+  thread with a bound. A task that has never run is now at home on **every** core,
+  which is also the right answer on the merits: the preference exists to keep a task
+  near cache lines it left behind, and a task that has never run has left none
+  anywhere, so there is nothing to be near and nothing to defer it for.
+
+  Worth noting what did *not* catch it. The fifteen host tests passed, because every
+  one of them described the preference as intended rather than as written; a test
+  asserting that a fresh slot is an ordinary candidate in the first pass exists now,
+  and it is the sixteenth. The four-core configurations passed too — with several
+  cores, some core's preference pass comes up empty often enough to reach the
+  fall-through, so the starvation is a single-core symptom of a policy bug that is
+  not about single cores at all.
+
+  The policy is a pure function in `crates/abi/src/affinity.rs` with fifteen host
+  tests, cut out for the reason every other pure crate here was: a scan that wraps
+  one slot short, a preference pass that falls through to the wrong candidate and a
+  mask that admits core 64 do not announce themselves on a boot log. They appear as
+  "the pinned task ran somewhere else, sometimes".
+
+  Cutting it out found one. The kernel's round-robin scan was `(1..=n)`, whose last
+  offset wraps back to the slot it started from — so `pick_next` could return the
+  very task the caller was switching away from, which its own doc said it never did.
+  It was harmless only because all five callers happened to mark that task
+  unpickable (`Running`, `Blocked`, `Sleeping`, `Dead`) *before* asking. That is a
+  property of five call sites and not of the scan, and it stopped being true the
+  moment `migrate_off` wanted to leave a task `Ready` while looking for its
+  successor: it would have picked itself, `context_switch(p, p)`, saving a context
+  into the struct it then restores from and clearing `on_cpu` on a task this core is
+  still running. The exclusion is now in the range.
+
+  The claim is falsifiable and was falsified. Each pinned task's mask and the set of
+  cores that actually ran it are printed side by side at shutdown, precisely so a
+  reader can see them disagree:
+
+  ```
+  affinity: 6 pin(s), 5 forced migration(s), 4 task(s) still pinned
+  affinity:   task 30 pinned to 0x1, ran on 0x1 — stayed inside its mask
+  affinity:   task 31 pinned to 0x2, ran on 0x2 — stayed inside its mask
+  affinity:   task 32 pinned to 0x4, ran on 0x4 — stayed inside its mask
+  affinity:   task 33 pinned to 0x8, ran on 0x8 — stayed inside its mask
+  ```
+
+  Take the mask test out of `pickable` and the same run says `RAN OUTSIDE ITS MASK`
+  on three of the four, the forced-migration count goes from 5 to 8 404, and six
+  assertions in the C program fail by name. A mask reads back exactly as written
+  whether or not anything consults it; the set of cores a task *ran on* is the only
+  number here that can be wrong.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not
@@ -1053,12 +1175,19 @@ Not yet implemented:
   first thing to look for when "the kernel booted and then died". The one thing
   already in place is linking with `--fix-cortex-a53-843419`, the default for
   `aarch64-unknown-none`.
-- No *affinity* and no per-core run queues: every core scans one shared ready set,
-  which is why there is nothing to steal and why the switch spread comes out even
-  (see above). What is genuinely absent is any notion of keeping a task near the
-  core whose caches are warm for it — on a board with asymmetric cores that will
-  matter, and here it does not. Cross-core TLB shootdown for unmapping uses the
-  broadcast `tlbi ...is` variants (hardware agrees), which is enough for what
+- No per-core run queues: every core scans one shared ready set, which is why there
+  is nothing to steal and why the switch spread comes out even (see above).
+  Affinity and a last-core preference are now on top of that shared set (see
+  above), which is the cheap two-thirds of the problem; the expensive third is a
+  queue per core, and it buys nothing until the scan of one array is measurably the
+  cost — at a few dozen slots it is not. Cross-core TLB shootdown for unmapping uses
+  the broadcast `tlbi ...is` variants (hardware agrees), which is enough for what
   unmaps today.
+- No *scheduling classes*: affinity says where a task may run and nothing says in
+  what order. Every runnable task is equal, the timer preempts them all at the same
+  interval, and a display server has no way to say it matters more than a memory
+  test. On a board this is what stands between a smooth frame and a merely average
+  one, and it is a policy question the shared ready set makes easy to answer later
+  and pointless to guess at now.
 - The ECAM enumerator is bus-0, single-function, no bridges.
 - A second arch backend to validate the HAL boundary.

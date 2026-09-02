@@ -177,6 +177,14 @@ run() {
     RECLAIM_STRICT=1
     req "isolated, kernel continues"               # the canary EL0 fault was contained
     forbid "LEAKED"                                # the reclaim check did not fail
+    # The kernel's own affinity verdict, on every machine in the matrix. This is the
+    # half that survives a host without clang: `hello-c` is what *asks* for a pin and
+    # it is skipped there, but the report itself is printed unconditionally, and the
+    # kernel compares each pinned task's mask against the cores that actually ran it.
+    # A picker that ignores the mask says RAN OUTSIDE ITS MASK here even when no C
+    # program is in the image to notice.
+    req "affinity: "
+    forbid "RAN OUTSIDE ITS MASK"
     forbid "did not initialise"                    # no half-configured device
     # IPC under contention: three senders and one receiver on a two-slot endpoint.
     # The receiver checks the sum of every sequence number it drained, so a message
@@ -371,6 +379,25 @@ if [ -n "$INITRAMFS" ]; then
     # QML's JavaScript engine turned out to size its own recursion limit from it.
     req "uname StarOS 0.2.0, stack limit 1024 KiB"
     req "[hello-c] threads: 4 workers x 250 increments = 1000"
+    # Affinity, from the side that can be wrong about it. The counts in the line are
+    # measured — a single-core machine reports one of everything — so only the fixed
+    # ends are asserted here, and the individual claims are carried by the `FAIL`
+    # forbids below, which name the exact assertion rather than a total.
+    req "[hello-c] affinity: "
+    req "an absent core refused"
+    # Each of these is a different way for affinity to be absent while looking
+    # present. The first is the one that fails on a kernel whose picker ignores the
+    # mask entirely; the second is what a per-address-space affinity would produce
+    # (every thread inheriting main's core); the third and fourth are the syscall
+    # refusing, or failing to refuse, a mask naming a core that never came up.
+    forbid "[hello-c] FAIL: each worker stayed on exactly one core"
+    forbid "[hello-c] FAIL: no two workers were pinned to the same core"
+    forbid "[hello-c] FAIL: a mask naming no online core was refused"
+    forbid "[hello-c] FAIL: a mask mixing an absent core with a real one was accepted"
+    # The postcondition that makes the check above able to tell "not yet" from "not
+    # working": SetAffinity does not return until the caller is on a permitted core.
+    forbid "[hello-c] FAIL: SetAffinity returned with us already on the core it was given"
+    forbid "[hello-c] FAIL: across 64 reschedules the pinned thread was never seen anywhere else"
     # The event-loop layer: a thread blocked in poll until another thread wrote to
     # an eventfd, a pipe carried bytes between them, and a timeout was waited out
     # rather than returned from. The number in the line is measured, so only the
@@ -504,13 +531,22 @@ req "[displaysrv] composited client surfaces onto a screen no client can touch"
 # scheduler under TCG. It was 61 in one run and 53 in the next, both correct.
 #
 # So the tally is split. Everything still deterministic is asserted verbatim here:
-# how many surfaces outlive the demo, how many refusals were provoked, how many
-# clients were reaped, and that no key was routed or dropped on a machine with
-# nobody typing. The frames themselves are asserted by `services/shell`'s own line
-# further down, as a lower bound, and by `scripts/qml-check.sh`, which looks at the
-# pixels.
+# how many surfaces outlive the demo, how many refusals were provoked, and that no
+# key was routed or dropped on a machine with nobody typing. The frames themselves
+# are asserted by `services/shell`'s own line further down, as a lower bound, and by
+# `scripts/qml-check.sh`, which looks at the pixels.
+#
+# The *reaped* count went the same way as the frames, one boundary later. It was
+# pinned at two, and two is how many clients have finished and been noticed by the
+# time this line prints — which is a race between the last client's exit and the
+# shutdown report, not a property of the compositor. A loaded host ran the QML scene
+# for 146 frames instead of 261, a third client finished inside the run, and the
+# assertion failed on a boot in which nothing was wrong. What the reaping actually
+# claims is asserted where it is deterministic: the crashed client's windows coming
+# off the screen, below.
 req "[displaysrv] 4 surface(s) live,"
-req "8 refused, 2 client(s) reaped, 0 input event(s) routed, 0 dropped for want of a window"
+req "8 refused, "
+req "client(s) reaped, 0 input event(s) routed, 0 dropped for want of a window"
 # A fourth client opened a window, asked the server to watch it, and crashed. The
 # kernel signals the notification it delegated, the server takes its windows off
 # the screen, and the count says it happened. Whether the *pixels* went back is

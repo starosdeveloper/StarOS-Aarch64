@@ -366,6 +366,49 @@ pub enum Syscall {
     ///
     /// [`WouldBlock`]: crate::error::KError::WouldBlock
     RecvUntil = 35,
+
+    /// The index of the core the caller is running on *at the instant it asks*.
+    ///
+    /// Takes nothing, grants nothing, and needs no capability: it names no object
+    /// and describes only where the caller already is. Never negative.
+    ///
+    /// The answer is a snapshot and is honest about being one — an unpinned task
+    /// may be on another core before the value reaches a register. That is not a
+    /// defect to be fixed with a lock; it is what "which core am I on" means for a
+    /// task that has not said where it wants to be. Pinned with
+    /// [`SetAffinity`](Syscall::SetAffinity), the answer is stable, and the pair is
+    /// what lets a program *prove* its own pinning rather than trust it.
+    CpuId = 36,
+
+    /// Restrict the caller to the cores named by the bitmask in `x0` (bit `n` =
+    /// core `n`), and return the mask of cores that are actually **online**.
+    ///
+    /// A mask of zero changes nothing and only asks for that second number, which
+    /// is the one piece of this a caller cannot work out for itself: the device
+    /// tree lists the cores that *exist*, and a core that was asked for and never
+    /// arrived is in that list too. Returning it from the call that consumes it
+    /// means a program can ask for core 3 and learn in the same syscall that there
+    /// is no core 3, instead of pinning itself somewhere unreachable.
+    ///
+    /// A mask naming no online core is [`InvalidArgument`] rather than an
+    /// unrunnable task. This is the only moment the caller can still be told: a
+    /// task pinned to a core that does not exist stays `Ready` for ever, and in the
+    /// task table, the shutdown report and every log line that is indistinguishable
+    /// from one waiting for a message that will not come.
+    ///
+    /// **The call does not return until the caller is on a permitted core.** An
+    /// affinity that took effect at some unspecified later point would be untestable
+    /// by the only party that cares — a caller that reads
+    /// [`CpuId`](Syscall::CpuId) straight afterwards and finds the old core cannot
+    /// tell "not yet" from "not working". So a task that has just excluded the core
+    /// it is on yields it, and comes back on one it asked for.
+    ///
+    /// Affinity is per *task*, not per process: threads of one program pin
+    /// separately, which is the only division that means anything for a program
+    /// spreading work across cores.
+    ///
+    /// [`InvalidArgument`]: crate::error::KError::InvalidArgument
+    SetAffinity = 37,
 }
 
 impl Syscall {
@@ -409,6 +452,8 @@ impl Syscall {
             33 => Some(Syscall::SendNoWait),
             34 => Some(Syscall::Unmap),
             35 => Some(Syscall::RecvUntil),
+            36 => Some(Syscall::CpuId),
+            37 => Some(Syscall::SetAffinity),
             _ => None,
         }
     }
@@ -420,11 +465,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=35 {
+        for n in 0..=37 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(36), None);
+        assert_eq!(Syscall::from_raw(38), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

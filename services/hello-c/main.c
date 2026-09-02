@@ -1337,6 +1337,169 @@ static void check_threads(void)
            WORKERS, BUMPS, shared_counter, staros_threads_live());
 }
 
+/* CPU affinity: a thread saying where it will run, and then proving it ran there.
+ *
+ * The proof is the whole difference between this and a mask that reads back. The
+ * kernel keeps a per-task record of every core a task has touched since it was
+ * pinned and prints it at shutdown; this side does the same thing from EL0, where
+ * the only instrument is `staros_cpu_id()` and the only way to be wrong is to be
+ * somewhere else. Both halves must agree, and each is falsified by a different
+ * mistake: drop the affinity test from the picker and this side's very first
+ * assertion fails, because a thread that has just given up its core is picked up by
+ * whichever one reaches it first — most likely the one it left, since the picker
+ * prefers a task it ran before.
+ *
+ * A core index this kernel can never have. `MAX_CPUS` is 8; asking for core 63 is
+ * how a caller finds out that a mask is checked against the cores that actually
+ * came up rather than against the ones the device tree lists. */
+#define ABSENT_CORE 63
+
+static unsigned long long affinity_online;
+/* Every core each pinned worker was seen on, one bit per core. */
+static unsigned long long worker_cores[WORKERS];
+static int worker_pinned_ok[WORKERS];
+
+/* Yield enough times that an unpinned thread on a multi-core machine would have
+ * moved, and record where we were each time. Few enough that four threads doing it
+ * do not lengthen the smoke matrix: each iteration is one syscall that reschedules
+ * and one that reads a register. */
+#define AFFINITY_SAMPLES 64
+
+static int count_cores(unsigned long long mask)
+{
+    int n = 0;
+    for (int cpu = 0; cpu < 64; cpu++)
+        if (mask & (1ull << cpu))
+            n++;
+    return n;
+}
+
+static unsigned long long sample_cores(void)
+{
+    unsigned long long seen = 0;
+    for (int i = 0; i < AFFINITY_SAMPLES; i++) {
+        int cpu = staros_cpu_id();
+        if (cpu >= 0 && cpu < 64)
+            seen |= 1ull << cpu;
+        sched_yield();
+    }
+    return seen;
+}
+
+static void *affinity_worker(void *arg)
+{
+    long id = (long)arg;
+    /* Each worker takes the id'th online core, so on a four-core machine the four
+     * of them pin to four different cores and the assertion below is about
+     * separation as well as about staying put. */
+    int target = -1;
+    int seen = 0;
+    for (int cpu = 0; cpu < 64; cpu++) {
+        if (affinity_online & (1ull << cpu)) {
+            if (seen == (int)id) {
+                target = cpu;
+                break;
+            }
+            seen++;
+        }
+    }
+    if (target < 0)
+        return 0;
+
+    if (staros_set_affinity(1ull << target) < 0)
+        return 0;
+    /* The postcondition the syscall promises: on return we are already there.
+     * Anything weaker would make this check unable to tell "not yet" from
+     * "not working". */
+    worker_pinned_ok[id] = (staros_cpu_id() == target);
+    worker_cores[id] = sample_cores();
+    return 0;
+}
+
+static void check_affinity(void)
+{
+    affinity_online = (unsigned long long)staros_set_affinity(0);
+    check(affinity_online != 0, "the kernel reported at least one online core");
+    check((affinity_online & 1) != 0, "core 0 is online, since we are running on it");
+
+    int cores = count_cores(affinity_online);
+
+    /* A mask naming only a core that never came up must be refused. If it were
+     * obeyed, this thread would be `Ready` and unrunnable for the rest of the boot,
+     * which reads in the task table exactly like a thread blocked on a message. */
+    int before = staros_cpu_id();
+    check(staros_set_affinity(1ull << ABSENT_CORE) < 0,
+          "a mask naming no online core was refused");
+    check(staros_cpu_id() == before, "the refused mask left us where we were");
+
+    /* The same absent core *with* a real one is satisfiable, and must be accepted:
+     * the rule is "at least one online core", not "every named core exists". A
+     * program written for an eight-core board and run on a two-core one asks
+     * exactly this. */
+    check(staros_set_affinity((1ull << ABSENT_CORE) | 1ull) > 0,
+          "a mask mixing an absent core with a real one was accepted");
+    check(staros_cpu_id() == 0, "that mask put us on core 0, the only one it allowed");
+
+    /* The strong case, and the only one that needs more than one core: pin to a
+     * core we are *not* on, and read back immediately. On a single-core machine
+     * there is no such core and this degenerates into re-pinning to core 0 — still
+     * a valid check, just a weaker one, and the log says which was run. */
+    int target = 0;
+    for (int cpu = 63; cpu >= 0; cpu--) {
+        if (affinity_online & (1ull << cpu)) {
+            target = cpu;
+            break;
+        }
+    }
+    check(staros_set_affinity(1ull << target) > 0, "pinning to the highest online core");
+    check(staros_cpu_id() == target,
+          "SetAffinity returned with us already on the core it was given");
+
+    unsigned long long stayed = sample_cores();
+    check(stayed == (1ull << target),
+          "across 64 reschedules the pinned thread was never seen anywhere else");
+
+    /* Now the same thing from several threads at once, each on its own core.
+     * Affinity is per task and not per address space, so pinning main must not have
+     * pinned the workers — if it had, they would all report main's core and the
+     * separation check below would fail. */
+    int spawned = cores < WORKERS ? cores : WORKERS;
+    pthread_t threads[WORKERS];
+    for (long i = 0; i < spawned; i++)
+        check(pthread_create(&threads[i], 0, affinity_worker, (void *)i) == 0,
+              "pthread_create for an affinity worker");
+
+    unsigned long long union_of_workers = 0;
+    for (int i = 0; i < spawned; i++) {
+        check(pthread_join(threads[i], 0) == 0, "pthread_join for an affinity worker");
+        check(worker_pinned_ok[i], "each worker was on its core the moment it pinned");
+        check(worker_cores[i] != 0, "each worker sampled where it was running");
+        /* One bit, and it must be the bit nobody else has. */
+        check((worker_cores[i] & (worker_cores[i] - 1)) == 0,
+              "each worker stayed on exactly one core");
+        check((union_of_workers & worker_cores[i]) == 0,
+              "no two workers were pinned to the same core");
+        union_of_workers |= worker_cores[i];
+    }
+    check((union_of_workers & ~affinity_online) == 0,
+          "no worker ran on a core the kernel says is not online");
+
+    /* Counted from what was observed, not from what was asked for. The summary
+     * below is the line a reader skims, and it printed the number of threads
+     * spawned until a deliberately broken picker scattered every worker across
+     * every core and the summary went on claiming four distinct ones. */
+    int distinct_cores = count_cores(union_of_workers);
+
+    /* Unpin, or every check after this one runs on one core. The affinity outlives
+     * the function that set it, which is the point of it and also the way to make
+     * the rest of this program mysteriously slow. */
+    check(staros_set_affinity(~0ull) > 0, "unpinning back to every core");
+
+    printf("[hello-c] affinity: %d core(s) online, main pinned to cpu%d and was seen on "
+           "%d core(s), %d worker(s) on %d distinct core(s), an absent core refused\n",
+           cores, target, count_cores(stayed), spawned, distinct_cores);
+}
+
 /* A capability minted after a thread started must be usable *by that thread*.
  *
  * The kernel used to give each thread a copy of its creator's capability table, so
@@ -2237,6 +2400,7 @@ int main(void)
     check_transfer();
     check_process();
     check_threads();
+    check_affinity();
     check_late_capability();
     check_poll();
     check_endpoint();
