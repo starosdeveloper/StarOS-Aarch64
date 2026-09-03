@@ -403,19 +403,27 @@ Done:
   is a silent reset, so both forms are honoured) — and `mm::region::largest_free`
   sweeps the exclusions to pick the biggest surviving run. That run is split:
   the kernel heap is carved off the front, sized as
-  `BuddyFrameAllocator::metadata_bytes(rest) + 1 MiB` slack, and the remainder
-  becomes the frame pool. The ordering is not circular — the heap gets raw bytes
+  `BuddyFrameAllocator::metadata_bytes(rest) + HEAP_TASKS * 32 KiB + 1 MiB`, and
+  the remainder becomes the frame pool. That middle term used not to be there, and
+  its absence is written up below under **A fixed heap needs a high-water mark**:
+  what consumes this heap is one 32 KiB kernel stack per live task, and sizing it
+  by a round megabyte was sizing it by a figure about nothing. The ordering is not circular — the heap gets raw bytes
   from the map, and only the buddy tree's `Box<[u32]>` metadata comes from the
   heap — which is what let the buddy allocator lose its `BUDDY_MAX_FRAMES` cap
   and size itself to the machine. `mmu::init` likewise takes the RAM window and
   writes the linear map from it (normal memory over RAM, device below it,
   *unmapped* above, so a stray access faults instead of wandering).
 
-  Verified in QEMU across four machines on one unchanged image, and the numbers
-  are the proof: `-m 2G` → `2048 MiB RAM, 1919 MiB usable, heap 3072 KiB @
-  0x48100000, 1024 MiB of frames`; `-m 256M` → `heap 1152 KiB, 64 MiB of frames`;
-  `-m 128M` → `128 MiB RAM, 63 MiB usable, heap 1088 KiB @ 0x44100000, 32 MiB of
-  frames @ 0x44210000`. The heap lands *immediately after the DTB* in each case
+  Verified in QEMU across the machine matrix on one unchanged image, and the
+  numbers are the proof: `-m 256M` → `256 MiB RAM, 125 MiB usable, heap 3324 KiB @
+  0x48300000, 121 MiB of frames @ 0x4863f000`; `-m 128M` → `128 MiB RAM, 63 MiB
+  usable, heap 3200 KiB @ 0x44100000, 59 MiB of frames @ 0x44420000`. The two heaps
+  differ only by the device tree in front of them, which is the term that follows
+  the machine; the rest is the fixed reservation for task stacks. On the smaller
+  machine that is 2.4 % of RAM, and the boot peaks at `778 of 3200 KiB` — the check
+  that the sizing above is affordable where it matters, since 128 MiB is the
+  smallest configuration in the matrix. The heap lands *immediately after the DTB*
+  in each case
   (QEMU places the blob at `ram_base + min(ram/2, 128 MiB)`, so it moves with
   `-m`, and the heap follows it) — the exclusion logic tracking a moving blob
   across configurations is the thing that could not be faked. The full
@@ -963,6 +971,67 @@ Done:
   it for the whole boot, and looks identical in every screenshot; the shutdown line
   says `THE SECOND BUFFER WAS NEVER SHOWN` instead, and the smoke matrix forbids
   that word on every machine.
+
+- **A fixed heap needs a high-water mark, and four exhaustions are not one error.**
+  A C++ program aborted on some boots and not others:
+  `thread::_M_start_thread: the kernel refused another thread`. Nothing in the
+  kernel said anything. `SpawnThread` had four ways to fail — the creator's address
+  space, physical frames, the kernel heap, the task table — and all four returned
+  the same `OutOfResources` with no line anywhere, so which resource had run out
+  was not merely unlogged but unknowable.
+
+  The instrument was the fix. `FreeListAllocator` now counts bytes in use, refusals,
+  and above all the **peak**, because a fixed heap is exhausted at an instant and
+  half empty a moment later: the allocation returns `None`, the caller turns that
+  into an error of its own, and by the time anything asks how full the heap was, it
+  is not full any more. `used` counts the normalised *block*, not the request, or a
+  small-allocation workload runs out ahead of what the numbers predict; and a
+  refusal is counted even when `used < total`, because first-fit fragments and "no
+  hole large enough" is not "the region is full" — the two numbers side by side are
+  what tells those apart.
+
+  The first measurement settled it in one line:
+
+  ```
+  kernel heap: peak 1219 of 1276 KiB (543 KiB still in use), 0 allocation(s) refused — room for 39 task stack(s) at once
+  ```
+
+  **95 % full at the peak, with less than two kernel stacks of headroom.** Every
+  task's stack is 32 KiB out of this region, so the ceiling on simultaneously live
+  tasks was thirty-nine and the demo's table reaches forty-six. The intermittent was
+  that margin being crossed or not, which depends on nothing but scheduling order.
+
+  Deliberately starving the heap then found a *second* defect, and a better one.
+  Ten allocations were refused, `spawn: no thread was refused`, and half the boot's
+  programs never started — the instrument had been fitted to `spawn_thread` and not
+  to `spawn_user`, so a refused *process* was visible only as a complaint from the
+  program it happened to. With both paths named, the same run reads:
+
+  ```
+  [spawn] process refused: the kernel heap ran out — kernel heap 861 of 892 KiB in use, peak 861 KiB
+  kernel heap: peak 880 of 892 KiB (512 KiB still in use), 10 allocation(s) refused — room for 27 task stack(s) at once
+  spawn: 10 SPAWN(S) REFUSED — 10 process(es) on the kernel heap, see the [spawn] lines above
+  ```
+
+  Ten and ten: the allocator's own count and the scheduler's named causes agree
+  exactly, which is the claim that no refusal is going unattributed. They are
+  counted by different code in different crates, so a silent path elsewhere would
+  show up as a gap between them.
+
+  The sizing then followed from the number rather than from a round figure. The
+  heap holds `HEAP_TASKS` (64) kernel stacks plus the old megabyte for everything
+  that is not a stack, and the ceiling is printed so that the day a workload needs
+  more, the number to change is visible:
+
+  ```
+  kernel heap: peak 1222 of 3324 KiB (539 KiB still in use), 0 allocation(s) refused — room for 103 task stack(s) at once
+  ```
+
+  Same workload, same peak, 37 % instead of 95 %. The ABI is deliberately
+  unchanged: all four causes still answer `OutOfResources`, because only one of
+  them (the caller's own address space) is permanent for the caller, and splitting
+  the error is worth doing on evidence about which of them actually fires — which
+  is what these counters are for and what nobody had.
 
 - **Diagnostics are lines or they are not evidence.** `fssrv` printed its two
   reports as alternating string and number writes, which is one `DebugWrite` per

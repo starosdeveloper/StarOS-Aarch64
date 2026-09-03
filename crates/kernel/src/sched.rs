@@ -57,11 +57,19 @@ use staros_arch_aarch64::{boot, exceptions, mmu, timer};
 use staros_mm::PAGE_SIZE;
 
 use crate::cap::{self, Cap, CapTable};
+use crate::console::klog;
 use crate::ipc::KMessage;
 use crate::sync::SpinLock;
 
 /// Per-task kernel stack size in 64-bit words (32 KiB).
-const STACK_WORDS: usize = 4096;
+pub const STACK_WORDS: usize = 4096;
+
+/// Bytes one task's kernel stack takes out of the kernel heap.
+///
+/// Public because the shutdown report divides the heap by it to state the ceiling
+/// on simultaneously live tasks, and a second copy of the number written there
+/// would be a second thing to keep in step.
+pub const STACK_BYTES: usize = STACK_WORDS * 8;
 
 /// Lifecycle state of a task slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -717,6 +725,125 @@ fn post_switch() {
     // `_freed_stack` drops here, outside the scheduler lock.
 }
 
+/// Which resource a spawn ran out of.
+///
+/// Four different exhaustions used to be one `OutOfResources` and no line
+/// anywhere, which is how a thread refused under load became an unexplained
+/// intermittent: a C++ program aborted, and nothing said whether the machine was
+/// out of RAM, the program was out of address space, or the kernel was out of
+/// heap. They are not the same failure and they do not have the same fix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Resource {
+    /// The *creator's* heap region had no room for another stack. Per process, and
+    /// the only one of the four that will not come back: this program cannot make
+    /// another thread however long it waits.
+    AddressSpace,
+    /// Physical frames. Machine-wide and transient — someone else's memory coming
+    /// back makes this succeed.
+    Frames,
+    /// The kernel's own heap, which is fixed at boot and is where every task's
+    /// 32 KiB kernel stack comes from. Machine-wide, and the one this whole change
+    /// exists to make visible.
+    KernelHeap,
+    /// The task table could not grow, which is the kernel heap by another route
+    /// and is counted separately because the allocation is a different shape.
+    TaskTable,
+}
+
+impl Resource {
+    const fn name(self) -> &'static str {
+        match self {
+            Resource::AddressSpace => "the creator's address space",
+            Resource::Frames => "physical frames",
+            Resource::KernelHeap => "the kernel heap",
+            Resource::TaskTable => "the task table",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Resource::AddressSpace => 0,
+            Resource::Frames => 1,
+            Resource::KernelHeap => 2,
+            Resource::TaskTable => 3,
+        }
+    }
+}
+
+/// How many `SpawnThread` refusals each resource caused.
+static THREAD_REFUSALS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The same, for whole processes.
+///
+/// Separate from the thread counter because they fail at different places for
+/// different reasons, and because the first run with the heap deliberately shrunk
+/// showed exactly why the distinction matters: ten allocations were refused, no
+/// thread was refused, and half the boot's programs never started. The instrument
+/// had been fitted to one of the two paths.
+static PROCESS_REFUSALS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Refuse a `SpawnThread`, saying which resource ran out and how full the kernel
+/// heap was at that moment.
+///
+/// The error the caller receives is unchanged. Four causes still answer
+/// `OutOfResources`, and splitting the ABI is deliberately not part of this: only
+/// one of the four is permanent for the caller, so a split would be worth making —
+/// and worth making on evidence about which of them actually fires, which is what
+/// these counters are for and what nobody had.
+fn refuse_thread(what: Resource) -> isize {
+    THREAD_REFUSALS[what.index()].fetch_add(1, Ordering::Relaxed);
+    say_refused("thread", what);
+    KError::OutOfResources.as_raw()
+}
+
+/// Refuse a whole process, by the same rule and for the same reason.
+///
+/// A separate counter and the same line, because a process and a thread fail at
+/// different places: a process brings its own address space and a thread borrows
+/// one, so `AddressSpace` cannot be a process's cause and `Frames` reaches it
+/// through the space builder rather than through this function.
+fn refuse_process(what: Resource) {
+    PROCESS_REFUSALS[what.index()].fetch_add(1, Ordering::Relaxed);
+    say_refused("process", what);
+}
+
+/// Name the resource and the heap's state at the instant of a refusal.
+///
+/// The heap figure belongs *here* and not only in the shutdown report, and that is
+/// the whole difficulty this instrumentation exists for: a fixed heap exhausted at
+/// one instant is half empty a moment later, so a reader who only has the final
+/// numbers cannot tell a boot that grazed the wall from one that hit it. The
+/// high-water mark at shutdown says the pressure existed somewhere; this line says
+/// it existed here.
+fn say_refused(kind: &str, what: Resource) {
+    let h = crate::heap::stats();
+    klog!(
+        "[spawn] {kind} refused: {} ran out — kernel heap {} of {} KiB in use, peak {} KiB",
+        what.name(),
+        h.used / 1024,
+        h.total / 1024,
+        h.peak / 1024,
+    );
+}
+
+/// How many `SpawnThread` and process spawns each resource refused, in
+/// [`Resource::index`] order, with their names.
+#[must_use]
+pub fn spawn_refusals() -> [(&'static str, u64, u64); 4] {
+    [
+        Resource::AddressSpace,
+        Resource::Frames,
+        Resource::KernelHeap,
+        Resource::TaskTable,
+    ]
+    .map(|r| {
+        (
+            r.name(),
+            THREAD_REFUSALS[r.index()].load(Ordering::Relaxed),
+            PROCESS_REFUSALS[r.index()].load(Ordering::Relaxed),
+        )
+    })
+}
+
 /// Create a thread in the *current* task's address space: another schedulable
 /// task sharing every page and every capability, starting at EL0 `entry` with
 /// `arg` in `x0`, on `stack_pages` of fresh anonymous memory, with `tls` as its
@@ -766,12 +893,12 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
     // this space's heap cursor, and two threads spawning at once would otherwise
     // hand their children the same stack.
     let Some((space, stack_base)) = reserve_anon_shared(cur, stack_pages) else {
-        return KError::OutOfResources.as_raw();
+        return refuse_thread(Resource::AddressSpace);
     };
     // SAFETY: at EL1 with this (active) space's tables reachable through the linear
     // map; `map_anon_at` only adds pages at addresses just reserved.
     if !crate::mem::with(|frames| unsafe { space.map_anon_at(frames, stack_base, stack_pages) }) {
-        return KError::OutOfResources.as_raw();
+        return refuse_thread(Resource::Frames);
     }
     // Stacks grow down, and AArch64 requires a 16-byte aligned `sp`.
     // Stacks grow down, and AArch64 requires a 16-byte aligned `sp`.
@@ -786,7 +913,7 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
     let user_sp = (stack_base + stack_pages * PAGE_SIZE as u64) & !0xf;
 
     let Some(kstack) = alloc_stack() else {
-        return KError::OutOfResources.as_raw();
+        return refuse_thread(Resource::KernelHeap);
     };
     let mut ctx = CpuContext::empty();
     ctx.init(crate::user_thread_entry, stack_top(&kstack));
@@ -835,12 +962,12 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
         // would put it on top of a shared buffer its creator is drawing into.
         devices,
     }) else {
-        return KError::OutOfResources.as_raw();
+        return refuse_thread(Resource::KernelHeap);
     };
 
     let mut sched = SCHED.lock();
     if sched.tasks.try_reserve(1).is_err() {
-        return KError::OutOfResources.as_raw();
+        return refuse_thread(Resource::TaskTable);
     }
     let mut task = task;
     let id = sched.tasks.len() as u64;
@@ -892,10 +1019,13 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
     // short, but mainly to keep the lock order a straight line: allocating takes
     // the heap's lock, and doing that underneath the scheduler's would nest two
     // locks for no reason.
-    let stack = alloc_stack()?;
+    let Some(stack) = alloc_stack() else {
+        refuse_process(Resource::KernelHeap);
+        return None;
+    };
     let mut ctx = CpuContext::empty();
     ctx.init(entry, stack_top(&stack));
-    let task = try_box(Task {
+    let Some(task) = try_box(Task {
         ctx,
         stack,
         state: State::Ready,
@@ -922,7 +1052,10 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         ran_on: 0,
         shared: Placements::new(staros_arch_aarch64::addrspace::USER_SHARED_VA),
         devices: Placements::new(staros_arch_aarch64::addrspace::USER_DEV_VA),
-    })?;
+    }) else {
+        refuse_process(Resource::KernelHeap);
+        return None;
+    };
 
     let mut sched = SCHED.lock();
     // Append rather than reuse a `Dead` slot. Reuse would need proof that the dead
@@ -933,6 +1066,8 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
     // definition, off the dead stack. So a task's stack no longer waits until
     // reboot; only the small `Task` header lingers, bounded by how many tasks ran.
     if sched.tasks.try_reserve(1).is_err() {
+        drop(sched);
+        refuse_process(Resource::TaskTable);
         return None;
     }
     let mut task = task;

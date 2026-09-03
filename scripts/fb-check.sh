@@ -35,7 +35,15 @@ echo "booting with ramfb and checking the composited frame…"
 python3 scripts/fb-verify.py "$QMP" "$TMP" >"$TMP/verify.out" 2>&1 &
 VERIFY=$!
 
-printf '\n' | timeout -k 5 60 qemu-system-aarch64 \
+# 180 and not 60, and the number is measured rather than picked. Six runs of this
+# exact configuration on one host came in at 48, 49, 49, 50, 56 and 62 seconds —
+# the old limit sat *inside* that range, so the check failed on host load rather
+# than on pixels. Twice in one afternoon it reported
+# "the display server never reported a finished composite", which reads like a
+# broken compositor and was a stopwatch. A limit is there to catch a hang; it has
+# to be far enough above the slowest honest run that the two cannot be confused.
+# The siblings already are: input-check gives 180 and qml-check 120.
+printf '\n' | timeout -k 5 180 qemu-system-aarch64 \
     -M virt,gic-version=3,virtualization=on -cpu max -smp 4 -m 512M \
     -display none -device ramfb \
     -kernel "$TMP/Image" \

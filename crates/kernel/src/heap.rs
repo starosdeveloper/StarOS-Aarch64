@@ -22,7 +22,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, NonNull};
 
-use staros_mm::heap::FreeListAllocator;
+use staros_mm::heap::{FreeListAllocator, HeapStats};
 
 use crate::sync::SpinLock;
 
@@ -48,6 +48,20 @@ pub unsafe fn init(start: usize, len: usize) {
     unsafe {
         ALLOCATOR.0.lock().init(start as *mut u8, len);
     }
+}
+
+/// What the kernel heap has done with itself: bytes in use, the high-water mark,
+/// the region's size, and how many allocations it refused.
+///
+/// The *peak* is the number this kernel was missing, and its absence is why a
+/// thread refused under load was an unexplained intermittent rather than a fact.
+/// A fixed heap that fills at one instant and empties at the next leaves nothing
+/// behind: the allocation returned null, the caller turned it into
+/// `OutOfResources`, and by the time anything asked how full the heap was, it was
+/// not full any more.
+#[must_use]
+pub fn stats() -> HeapStats {
+    ALLOCATOR.0.lock().stats()
 }
 
 // SAFETY: `alloc`/`dealloc` uphold the `GlobalAlloc` contract — each returns a

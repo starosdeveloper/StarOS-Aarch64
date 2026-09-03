@@ -108,9 +108,31 @@ mod syscall;
 /// `#interrupt-cells` of every ARM interrupt controller: `<kind, number, flags>`.
 const GIC_INTERRUPT_CELLS: u32 = 3;
 
-/// Heap left over once the frame allocator's tree has taken its share: object
-/// tables, task state, and whatever the kernel allocates as it grows.
-const KERNEL_HEAP_SLACK: u64 = 1024 * 1024;
+/// How many tasks the kernel heap is sized to hold the kernel stacks of *at once*.
+///
+/// This number exists because the old one did not. The heap used to be sized as
+/// "the device tree plus a round megabyte", which is a figure about nothing: what
+/// consumes this heap is one 32 KiB kernel stack per live task, and a megabyte
+/// happens to be thirty-two of them. On the machine in `cargo krun` the boot
+/// peaked at **1219 KiB of 1276** — 95 % full, with less than two stacks of
+/// headroom — and the failure that produced was a `SpawnThread` refused on some
+/// runs and not others, depending only on how many tasks were alive at the same
+/// instant. An intermittent with no line anywhere naming it.
+///
+/// Sixty-four rather than the ~46 the demo reaches, so that the margin is stated
+/// rather than discovered. It is a *ceiling* and the shutdown report prints it, so
+/// the day a workload needs more the number to change is visible instead of being
+/// a mystery abort in a C++ program.
+const HEAP_TASKS: u64 = 64;
+
+/// Heap left over once the frame allocator's tree has taken its share: the kernel
+/// stacks of [`HEAP_TASKS`] live tasks, plus object tables, capability tables,
+/// task headers and whatever else the kernel allocates as it grows.
+///
+/// The second term is the old constant, kept at its old value because it was
+/// demonstrably enough for everything that is not a stack; what was missing is the
+/// first term, which is the part that scales with the machine's workload.
+const KERNEL_HEAP_SLACK: u64 = HEAP_TASKS * sched::STACK_BYTES as u64 + 1024 * 1024;
 
 /// Timer tick rate driving preemption (Hz). Keeps preemption live under the
 /// user-space processes even though this demo is IPC-driven.
@@ -2028,6 +2050,69 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         console,
         "scheduling: {total} context switch(es) over {busy_cores} core(s) —{spread}",
     );
+
+    // The kernel's own heap, and the number a fixed heap cannot be understood
+    // without.
+    //
+    // `used` at the end is nearly meaningless — everything has been torn down by
+    // now — and it was the only figure this kernel could have produced. The *peak*
+    // is what says whether the boot ever came near the wall, and it is what turns
+    // "a thread was refused, once, on some runs" from a mood into a measurement:
+    // every task's kernel stack is 32 KiB out of this region, so the ceiling on
+    // simultaneously live tasks is this number divided by that, and a run whose
+    // table grew past it is a run that had to refuse something.
+    //
+    // `refused` is the allocator's own count and not a caller's. A caller that
+    // turns a null pointer into an error of its own is exactly how an exhausted
+    // heap becomes invisible, which is what happened here.
+    let h = heap::stats();
+    let ceiling = h.total / sched::STACK_BYTES;
+    let _ = writeln!(
+        console,
+        "kernel heap: peak {} of {} KiB ({} KiB still in use), {} allocation(s) refused — \
+         room for {ceiling} task stack(s) at once",
+        h.peak / 1024,
+        h.total / 1024,
+        h.used / 1024,
+        h.refused,
+    );
+    let _ = writeln!(
+        console,
+        "kernel heap: {} call(s), {} alloc step(s) and {} dealloc step(s) over the free list \
+         — {} step(s) per call",
+        h.calls,
+        h.alloc_steps,
+        h.dealloc_steps,
+        (h.alloc_steps + h.dealloc_steps) / h.calls.max(1),
+    );
+    // Both spawn paths, because instrumenting one of them is how the first
+    // deliberately-starved run reported ten refused allocations, no refused
+    // threads, and half a boot's programs missing.
+    let refusals = sched::spawn_refusals();
+    let refused: u64 = refusals.iter().map(|&(_, t, p)| t + p).sum();
+    if refused == 0 {
+        let _ = writeln!(console, "spawn: nothing was refused for want of a resource");
+    } else {
+        let mut causes = alloc::string::String::new();
+        for (name, threads, procs) in refusals {
+            if threads > 0 {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut causes,
+                    format_args!(" {threads} thread(s) on {name},"),
+                );
+            }
+            if procs > 0 {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut causes,
+                    format_args!(" {procs} process(es) on {name},"),
+                );
+            }
+        }
+        let _ = writeln!(
+            console,
+            "spawn: {refused} SPAWN(S) REFUSED —{causes} see the [spawn] lines above",
+        );
+    }
 
     // The scanout, and the number that separates two buffers from double
     // buffering. Reserving a second buffer and mapping it costs memory and shows up

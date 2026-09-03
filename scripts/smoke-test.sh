@@ -205,6 +205,15 @@ run() {
     req "scanout: "
     forbid "A FLIP WAS REFUSED"
     forbid "THE SECOND BUFFER WAS NEVER SHOWN"
+    # The kernel heap, which is fixed at boot and is where every task's 32 KiB
+    # kernel stack comes from. This is the check that did not exist while a thread
+    # refused under load was an unexplained intermittent: the abort happened in a
+    # C++ program, the kernel said nothing, and the heap that was full at that
+    # instant was half empty by the time anything printed a number. Asserting the
+    # line puts the high-water mark and the ceiling in every machine's log; the
+    # forbid is the failure itself, named at the spawn that could not be served.
+    req "kernel heap: peak "
+    forbid "SPAWN(S) REFUSED"
     forbid "did not initialise"                    # no half-configured device
     # IPC under contention: three senders and one receiver on a two-slot endpoint.
     # The receiver checks the sum of every sequence number it drained, so a message
