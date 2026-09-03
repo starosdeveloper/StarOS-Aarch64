@@ -20,7 +20,7 @@ use staros_mm::PAGE_SIZE;
 use crate::cap::Cap;
 use crate::ipc::KMessage;
 use crate::obj::{self, Object};
-use crate::{ipc, irq, notify, sched};
+use crate::{ipc, irq, notify, sched, screen};
 use crate::console::klog;
 
 /// Kernel syscall dispatcher, invoked from the arch SVC trap.
@@ -565,6 +565,25 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // bound that holds against a hostile caller is one it can have now.
         Some(Syscall::SetClass) => sched::set_class(req.args[0]),
 
+        // Move the display to another of the framebuffer's buffers.
+        //
+        // A capability, unlike `SetClass` above, and the difference is what the two
+        // name. A class is a claim about the caller and the fairness escape bounds
+        // what a false one can take; a scanout is a *device*, shared by everyone
+        // who can see the screen, and a process that never received it has no
+        // business deciding what is displayed. The pixels needed no capability
+        // because they are memory and were mapped; this is the part of a
+        // framebuffer that cannot be mapped.
+        Some(Syscall::FbFlip) => {
+            if let Err(e) = resolve_scanout(req.args[0] as u32) {
+                return e.as_raw();
+            }
+            match screen::flip(req.args[1] as usize) {
+                Some(shown) => shown as isize,
+                None => KError::InvalidArgument.as_raw(),
+            }
+        }
+
         // Bind the notification named by `x1` to the endpoint named by `x0`, so a
         // message arriving there also signals it. Both handles are the caller's, and
         // the endpoint one must carry receive rights: this grants the authority to
@@ -811,6 +830,23 @@ fn resolve_receivable_endpoint(handle: u32) -> Result<usize, KError> {
     match sched::resolve_cap(handle) {
         Some(Cap::Endpoint { obj, recv: true, .. }) => match obj::get(obj) {
             Some(Object::Endpoint { id }) => Ok(id),
+            _ => Err(KError::BadHandle),
+        },
+        Some(_) => Err(KError::PermissionDenied),
+        None => Err(KError::BadHandle),
+    }
+}
+
+/// Check that `handle` names a live scanout capability.
+///
+/// Nothing is returned, because the object carries nothing: there is one display,
+/// and holding the capability *is* the authority. The resolution still has to
+/// happen — through `obj::get`, so that a revoked scanout stops working like every
+/// other revoked object rather than only when someone remembers to check.
+fn resolve_scanout(handle: u32) -> Result<(), KError> {
+    match sched::resolve_cap(handle) {
+        Some(Cap::Scanout { obj }) => match obj::get(obj) {
+            Some(Object::Scanout) => Ok(()),
             _ => Err(KError::BadHandle),
         },
         Some(_) => Err(KError::PermissionDenied),

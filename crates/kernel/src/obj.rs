@@ -76,6 +76,21 @@ pub enum Object {
         /// How many contiguous 4 KiB frames it spans.
         pages: u32,
     },
+    /// The display's scanout: the authority to say which of the framebuffer's
+    /// buffers the controller reads.
+    ///
+    /// It names no address, and that is the point. The *pixels* are handed to the
+    /// display server as an ordinary mapping; what cannot be handed over is a
+    /// register on a device reached through fw_cfg or a GPU mailbox. So this object
+    /// carries nothing at all — holding it is the whole of the authority, and the
+    /// only thing it permits is choosing a buffer index the kernel already
+    /// allocated. There is exactly one, minted at boot for whoever is given the
+    /// screen.
+    ///
+    /// Delegable like every other capability, which is what makes it worth being a
+    /// capability rather than an owner check: the day a compositor hands the screen
+    /// to a full-screen client, the mechanism is already the right one.
+    Scanout,
 }
 
 /// A stable, revocable reference to an [`Object`]: which slot, and the generation

@@ -45,6 +45,7 @@ const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 
+
 // The framebuffer contract shared with every other source (mailbox, GOP, …).
 pub use crate::fbinfo::FramebufferInfo;
 
@@ -59,8 +60,11 @@ pub use crate::fbinfo::FramebufferInfo;
 /// freed — the caller must account for them as permanently reserved.
 pub unsafe fn init(
     fw_cfg_phys: u64,
+    buffers: usize,
     mut alloc: impl FnMut(usize) -> Option<PhysAddr>,
 ) -> Option<FramebufferInfo> {
+    // One at minimum: a zero-buffer framebuffer is a black screen with no error.
+    let buffers = buffers.max(1);
     let base = mmu::phys_to_virt(fw_cfg_phys) as usize;
 
     // A single scratch page holds the DMA descriptor, the directory read buffer,
@@ -75,7 +79,6 @@ pub unsafe fn init(
     // (`scratch_phys`/`scratch_va`); the directory buffer and config sit after it.
     const DIR_OFF: usize = 64; // directory read buffer
     const DIR_CAP: usize = 2048; // enough for QEMU virt's ~20 files
-    const CFG_OFF: usize = 3072; // ramfb config (28 bytes)
 
     // --- find the etc/ramfb selector by reading the file directory ------------
     // SAFETY: descriptor and buffer are in the scratch page; `base` is fw_cfg.
@@ -114,14 +117,18 @@ pub unsafe fn init(
     }
     let key = ramfb_key?;
 
-    // --- allocate and clear the pixel buffer ----------------------------------
+    // --- allocate and clear the pixel buffers ---------------------------------
+    // `BUFFERS` screens in one contiguous run, so buffer `i` is at
+    // `fb_phys + i * HEIGHT * stride` and a flip is arithmetic rather than a
+    // second allocation. Cleared whole: a scanout pointed at a buffer nothing has
+    // drawn into yet must show black, not whatever the last boot left in that RAM.
     let stride = WIDTH as usize * 4;
-    let fb_bytes = stride * HEIGHT as usize;
-    let fb_pages = fb_bytes.div_ceil(PAGE_SIZE);
+    let plane_bytes = stride * HEIGHT as usize;
+    let fb_pages = (plane_bytes * buffers).div_ceil(PAGE_SIZE);
     let fb = alloc(fb_pages)?;
     let fb_phys = fb.0 as u64;
     let fb_va = mmu::phys_to_virt(fb_phys) as *mut u8;
-    // SAFETY: freshly allocated, linear-mapped, owned; sized for the buffer.
+    // SAFETY: freshly allocated, linear-mapped, owned; sized for the buffers.
     unsafe { core::ptr::write_bytes(fb_va, 0, fb_pages * PAGE_SIZE) };
 
     // --- write the ramfb config (all fields big-endian) -----------------------
@@ -152,13 +159,117 @@ pub unsafe fn init(
         return None;
     }
 
+    // Everything a later flip needs, kept rather than dropped on the floor. The
+    // scratch page is already never freed; what changes here is that the *fw_cfg
+    // key* and the block's base outlive `init`, because re-pointing the scanout is
+    // the same write to the same key with one field changed.
+    // SAFETY: single-core early boot; nothing else can be reading this static, and
+    // this is the only writer it ever has.
+    unsafe {
+        RAMFB = Some(Ramfb {
+            base,
+            key,
+            scratch_phys,
+            scratch_va,
+            fb_phys,
+            plane_bytes,
+            buffers,
+        });
+    }
+
     Some(FramebufferInfo {
         phys: fb_phys,
         width: WIDTH as usize,
         height: HEIGHT as usize,
         stride,
+        buffers,
     })
 }
+
+/// What [`init`] learned that [`set_scanout`] needs again.
+struct Ramfb {
+    /// Linear-map address of the fw_cfg MMIO block.
+    base: usize,
+    /// fw_cfg selector of the `etc/ramfb` file.
+    key: u16,
+    /// Physical and linear-map addresses of the scratch page holding the DMA
+    /// descriptor and the config block.
+    scratch_phys: u64,
+    scratch_va: *mut u8,
+    /// Physical base of the whole pixel allocation, buffer 0 first.
+    fb_phys: u64,
+    /// Bytes in one full-screen buffer.
+    plane_bytes: usize,
+    /// How many of them the allocation holds — the bound [`set_scanout`] checks an
+    /// index against.
+    buffers: usize,
+}
+
+/// Written once by [`init`] on the boot core, read by [`set_scanout`].
+///
+/// A plain static and not a lock, because the locking belongs to the caller and
+/// saying so is more honest than pretending otherwise: `set_scanout` reuses one
+/// scratch page and one pair of MMIO registers, so two cores calling it at once
+/// would interleave a descriptor. The kernel serialises it at the syscall, which is
+/// the only caller and the only place that knows a task is asking.
+static mut RAMFB: Option<Ramfb> = None;
+
+/// Point the scanout at buffer `index`, without reallocating or reconfiguring
+/// anything else. Returns `false` if this machine has no `ramfb` or the transfer
+/// failed.
+///
+/// This is the whole of "flip" on QEMU. `ramfb` has no page-flip ioctl and no
+/// vblank — it is a config block in fw_cfg, and writing it again with a different
+/// `addr` is what moves the display. QEMU rebuilds its display surface on that
+/// write, so the change takes effect at once rather than at a scanline boundary,
+/// which is exactly the thing this cannot demonstrate: there is no vertical blank
+/// here to synchronise with, so what double buffering buys on this machine is that
+/// the compositor never writes the buffer being read, and *not* an absence of
+/// tearing that could be seen. The tearing claim belongs to a board.
+///
+/// # Safety
+/// [`init`] must have succeeded, and callers must not run this concurrently with
+/// itself — it reuses one scratch page and the fw_cfg DMA registers.
+pub unsafe fn set_scanout(index: usize) -> bool {
+    // SAFETY: written once during single-core boot, read-only afterwards.
+    let Some(fb) = (unsafe { (&raw const RAMFB).as_ref().and_then(|r| r.as_ref()) }) else {
+        return false;
+    };
+    if index >= fb.buffers {
+        return false;
+    }
+    let stride = WIDTH as usize * 4;
+    let addr = fb.fb_phys + (index * fb.plane_bytes) as u64;
+
+    // The same 28-byte block `init` wrote, with `addr` moved. Rewritten whole
+    // rather than patched: fw_cfg takes a write of the entire file, and a partial
+    // one would leave QEMU parsing a mixture of two configurations.
+    // SAFETY: writing into the scratch page this module owns.
+    unsafe {
+        let cfg = fb.scratch_va.add(CFG_OFF);
+        write_be64(cfg.add(0), addr);
+        write_be32(cfg.add(8), DRM_FORMAT_XRGB8888);
+        write_be32(cfg.add(12), 0); // flags
+        write_be32(cfg.add(16), WIDTH);
+        write_be32(cfg.add(20), HEIGHT);
+        write_be32(cfg.add(24), stride as u32);
+    }
+    // SAFETY: descriptor and config are in the scratch page; `base` is fw_cfg.
+    unsafe {
+        dma(
+            fb.base,
+            fb.scratch_phys,
+            fb.scratch_va,
+            u32::from(fb.key) << 16 | CTL_SELECT | CTL_WRITE,
+            28,
+            fb.scratch_phys + CFG_OFF as u64,
+        )
+    }
+}
+
+/// Byte offset of the config block inside the scratch page. Shared by [`init`] and
+/// [`set_scanout`], which write the same 28 bytes to the same place.
+const CFG_OFF: usize = 3072;
 
 /// Run one fw_cfg DMA transfer and wait for completion. Returns `false` if QEMU
 /// reports the error bit. `desc_va`/`desc_phys` point at a 16-byte scratch region

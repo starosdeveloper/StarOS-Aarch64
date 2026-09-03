@@ -440,6 +440,30 @@ pub enum Syscall {
     ///
     /// [`InvalidArgument`]: crate::error::KError::InvalidArgument
     SetClass = 38,
+
+    /// Scan out framebuffer buffer `x1`, through the scanout capability at `x0`.
+    /// Returns the index now on screen.
+    ///
+    /// The one part of a framebuffer that cannot be handed to a process by mapping
+    /// it. The pixels are ordinary memory and the display server has them; the
+    /// scanout *base* is a register reached through fw_cfg on QEMU or a GPU mailbox
+    /// on a Pi, and there is no page of it to grant. So the buffers are user
+    /// space's and choosing between them is a syscall.
+    ///
+    /// This is the whole of double buffering at the ABI. The kernel allocates the
+    /// buffers stacked in one run and maps them all into the server, which draws
+    /// the next frame into one nobody is looking at and then asks for the display
+    /// to move. There is no vertical blank to wait for here and the call does not
+    /// pretend to be a vsync: it returns as soon as the device has taken the new
+    /// base.
+    ///
+    /// An index the screen does not have is [`InvalidArgument`] rather than a
+    /// clamp. A compositor asking for buffer 2 on a two-buffer screen has a bug,
+    /// and quietly showing it buffer 1 would leave that bug drawing into memory
+    /// nobody displays with nothing anywhere saying so.
+    ///
+    /// [`InvalidArgument`]: crate::error::KError::InvalidArgument
+    FbFlip = 39,
 }
 
 impl Syscall {
@@ -486,6 +510,7 @@ impl Syscall {
             36 => Some(Syscall::CpuId),
             37 => Some(Syscall::SetAffinity),
             38 => Some(Syscall::SetClass),
+            39 => Some(Syscall::FbFlip),
             _ => None,
         }
     }
@@ -497,11 +522,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=38 {
+        for n in 0..=39 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(39), None);
+        assert_eq!(Syscall::from_raw(40), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

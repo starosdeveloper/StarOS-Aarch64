@@ -85,6 +85,19 @@ pub struct FbRequest {
     pub depth: u32,
     /// Channel order: [`PIXEL_ORDER_RGB`] or [`PIXEL_ORDER_BGR`].
     pub pixel_order: u32,
+    /// How many full-screen buffers to make room for, stacked vertically.
+    ///
+    /// This is the whole of double buffering on a Pi, and it is spelled as a
+    /// *taller virtual framebuffer* rather than as a second allocation because that
+    /// is what the firmware offers. `SET_PHYSICAL_WH` is what the display scans;
+    /// `SET_VIRTUAL_WH` is how big the buffer behind it is; and
+    /// [`build_offset_message`] moves the window between them. So two buffers is
+    /// one allocation of `height * 2` rows, with the second screen starting at
+    /// y = `height`.
+    ///
+    /// One is the old behaviour exactly: virtual equals physical and there is
+    /// nowhere to pan to.
+    pub buffers: u32,
 }
 
 /// What the GPU granted in reply to an [`FbRequest`].
@@ -130,7 +143,16 @@ pub fn build_fb_message(req: &FbRequest) -> ([u32; FB_MSG_WORDS], usize) {
     let mut at = 2;
 
     at = put_tag(&mut buf, at, TAG_SET_PHYSICAL_WH, &[req.width, req.height]);
-    at = put_tag(&mut buf, at, TAG_SET_VIRTUAL_WH, &[req.width, req.height]);
+    // Virtual height is physical height times the number of buffers: the display
+    // scans `height` rows, the allocation holds `height * buffers` of them, and the
+    // offset below chooses which screenful is on show. `buffers` of one leaves this
+    // exactly as it was.
+    at = put_tag(
+        &mut buf,
+        at,
+        TAG_SET_VIRTUAL_WH,
+        &[req.width, req.height * req.buffers.max(1)],
+    );
     at = put_tag(&mut buf, at, TAG_SET_VIRTUAL_OFFSET, &[0, 0]);
     at = put_tag(&mut buf, at, TAG_SET_DEPTH, &[req.depth]);
     at = put_tag(&mut buf, at, TAG_SET_PIXEL_ORDER, &[req.pixel_order]);
@@ -245,6 +267,52 @@ pub fn parse_fb_response(buf: &[u32]) -> Option<FbAllocation> {
     })
 }
 
+/// Number of `u32` words a [`build_offset_message`] buffer occupies, padding
+/// included.
+pub const OFFSET_MSG_WORDS: usize = 8;
+
+/// Build a `SET_VIRTUAL_OFFSET` message: move the scanned-out window to
+/// `(x, y)` within the virtual framebuffer.
+///
+/// The flip, on a Pi. There is no address here and there could not be one — the
+/// buffer was allocated once, and what moves is which of its rows the display
+/// controller starts at. A caller with `buffers` screens stacked passes
+/// `y = index * height`.
+///
+/// Its own message and not a re-send of [`build_fb_message`] with a different
+/// offset, because that one carries `ALLOCATE_BUFFER`: re-sending it would ask the
+/// firmware to allocate again, on every frame, and the base could move under a
+/// mapping the kernel has already handed to a process.
+#[must_use]
+pub fn build_offset_message(x: u32, y: u32) -> ([u32; OFFSET_MSG_WORDS], usize) {
+    let mut buf = [0u32; OFFSET_MSG_WORDS];
+    buf[1] = CODE_REQUEST;
+    let mut at = 2;
+    at = put_tag(&mut buf, at, TAG_SET_VIRTUAL_OFFSET, &[x, y]);
+    buf[at] = TAG_END;
+    at += 1;
+    let words = (at + 3) & !3;
+    buf[0] = (words * 4) as u32;
+    (buf, words * 4)
+}
+
+/// The `(x, y)` the firmware says the window is now at, from a processed
+/// [`build_offset_message`] buffer.
+///
+/// `None` unless the overall success bit is set and the tag came back — and the
+/// values are the firmware's, not the ones that were asked for. A Pi clamps an
+/// offset that would run past the virtual height, and a flip that was silently
+/// clamped to zero is a compositor drawing into a buffer nobody is looking at.
+/// Reading back what actually happened is the only way that failure is visible.
+#[must_use]
+pub fn parse_offset_response(buf: &[u32]) -> Option<(u32, u32)> {
+    if Tags::overall_code(buf)? & RESPONSE_BIT == 0 {
+        return None;
+    }
+    let v = tag_values(buf, TAG_SET_VIRTUAL_OFFSET)?;
+    Some((*v.first()?, *v.get(1)?))
+}
+
 /// Convert a VideoCore *bus* address to an ARM *physical* address.
 ///
 /// The GPU hands back framebuffer addresses in its own address space, where RAM is
@@ -267,6 +335,7 @@ mod tests {
             height: 480,
             depth: 32,
             pixel_order: PIXEL_ORDER_RGB,
+            buffers: 2,
         }
     }
 
@@ -286,7 +355,9 @@ mod tests {
     fn request_carries_the_geometry_in_the_right_tags() {
         let (buf, _) = build_fb_message(&sample_req());
         assert_eq!(tag_values(&buf, TAG_SET_PHYSICAL_WH), Some(&[640, 480][..]));
-        assert_eq!(tag_values(&buf, TAG_SET_VIRTUAL_WH), Some(&[640, 480][..]));
+        // Virtual is two screens tall: what the display scans is 480 rows, what the
+        // allocation holds is 960, and the second screen begins at y = 480.
+        assert_eq!(tag_values(&buf, TAG_SET_VIRTUAL_WH), Some(&[640, 960][..]));
         assert_eq!(tag_values(&buf, TAG_SET_DEPTH), Some(&[32][..]));
         assert_eq!(
             tag_values(&buf, TAG_SET_PIXEL_ORDER),
@@ -398,6 +469,69 @@ mod tests {
                 buf[w] ^= 1 << bit;
                 // Neither walking nor parsing may panic on any single-bit flip.
                 let _ = parse_fb_response(&buf);
+                let _ = Tags::new(&buf).count();
+            }
+        }
+    }
+
+    #[test]
+    fn one_buffer_asks_for_exactly_the_old_message() {
+        // The claim that this change is opt-in: with one buffer the virtual size
+        // equals the physical one, which is byte for byte what was sent before.
+        let mut req = sample_req();
+        req.buffers = 1;
+        let (buf, _) = build_fb_message(&req);
+        assert_eq!(tag_values(&buf, TAG_SET_VIRTUAL_WH), Some(&[640, 480][..]));
+        // And zero is treated as one rather than as a zero-height allocation,
+        // which the firmware would answer with a black screen and no error.
+        req.buffers = 0;
+        let (buf, _) = build_fb_message(&req);
+        assert_eq!(tag_values(&buf, TAG_SET_VIRTUAL_WH), Some(&[640, 480][..]));
+    }
+
+    #[test]
+    fn the_offset_message_is_well_formed_and_carries_the_pan() {
+        let (buf, len) = build_offset_message(0, 480);
+        assert_eq!(len as u32, buf[0]);
+        assert_eq!(len % 16, 0);
+        assert!(len / 4 <= OFFSET_MSG_WORDS);
+        assert_eq!(buf[1], CODE_REQUEST);
+        assert_eq!(buf[len / 4 - 1], TAG_END);
+        assert_eq!(tag_values(&buf, TAG_SET_VIRTUAL_OFFSET), Some(&[0, 480][..]));
+        // It must not carry ALLOCATE_BUFFER: re-sending that on every flip would
+        // ask the firmware to allocate again, and the base could move under a
+        // mapping the kernel has already handed to a process.
+        assert_eq!(tag_values(&buf, TAG_ALLOCATE_BUFFER), None);
+    }
+
+    #[test]
+    fn the_offset_reply_is_the_firmware_s_answer_not_the_request() {
+        let (mut buf, _) = build_offset_message(0, 480);
+        // A firmware that clamped the pan to zero — the failure this parse exists
+        // to make visible, since the request would read back as 480 and the screen
+        // would be showing the buffer nobody is drawing into.
+        buf[1] = CODE_SUCCESS;
+        buf[4] = RESPONSE_BIT | 8;
+        buf[5] = 0;
+        buf[6] = 0;
+        assert_eq!(parse_offset_response(&buf), Some((0, 0)));
+    }
+
+    #[test]
+    fn an_offset_reply_without_the_success_bit_is_none() {
+        let (buf, _) = build_offset_message(0, 480);
+        // Straight out of the builder the overall code is a request, not a reply.
+        assert_eq!(parse_offset_response(&buf), None);
+    }
+
+    #[test]
+    fn offset_corruption_sweep_never_panics() {
+        let (base, _) = build_offset_message(0, 480);
+        for w in 0..OFFSET_MSG_WORDS {
+            for bit in 0..32 {
+                let mut buf = base;
+                buf[w] ^= 1 << bit;
+                let _ = parse_offset_response(&buf);
                 let _ = Tags::new(&buf).count();
             }
         }

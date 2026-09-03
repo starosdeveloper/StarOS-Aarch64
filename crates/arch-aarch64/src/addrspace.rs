@@ -957,23 +957,62 @@ impl AddressSpace {
 
     /// Record where the framebuffer landed and what shape it is, in this space's
     /// data page: virtual address at `+40`, width at `+48`, height at `+52`,
-    /// stride at `+56`, all as the display server reads them.
+    /// stride at `+56`, buffer count at `+60`, all as the display server reads
+    /// them.
     ///
     /// Seeded rather than asked for over a syscall because the server cannot ask
-    /// before it runs, and what it needs is four numbers the kernel already knows.
+    /// before it runs, and what it needs is five numbers the kernel already knows.
+    ///
+    /// The address is the base of buffer *zero* and the count says how many follow
+    /// it, each `height * stride` bytes further on — the mapping covers all of them.
+    /// A count of one is a server with nowhere to draw but the pixels being scanned
+    /// out, which is what this was before there was a count at all; a server reading
+    /// a zero there (an older kernel, a machine with no screen) must treat it as
+    /// one rather than as none.
     ///
     /// # Safety
     /// The space must have been built by [`new`](AddressSpace::new) (so its data
     /// frame exists) and not yet be running.
-    pub unsafe fn write_fb_info(&self, fb_va: u64, width: u32, height: u32, stride: u32) {
+    pub unsafe fn write_fb_info(
+        &self,
+        fb_va: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        buffers: u32,
+    ) {
         // SAFETY: `data_phys` backs a 4 KiB Normal-RAM frame this space owns;
-        // offsets 40..60 are aligned and inside the page.
+        // offsets 40..64 are aligned and inside the page.
         unsafe {
             let base = mmu::phys_to_virt(self.data_phys) as *mut u8;
             base.add(40).cast::<u64>().write_volatile(fb_va);
             base.add(48).cast::<u32>().write_volatile(width);
             base.add(52).cast::<u32>().write_volatile(height);
             base.add(56).cast::<u32>().write_volatile(stride);
+            base.add(60).cast::<u32>().write_volatile(buffers);
+        }
+    }
+
+    /// Record the handle of this space's scanout capability at `+64`.
+    ///
+    /// Seeded rather than fixed at a known number because the display server's
+    /// endpoint handles *are* its ABI — a request and its reply are a pair the
+    /// server finds by arithmetic — so nothing may be installed ahead of them. The
+    /// scanout therefore lands wherever the capability table had room, and the one
+    /// place that knows is the kernel that put it there.
+    ///
+    /// Zero means no scanout was granted, which is the null handle and resolves in
+    /// no table: a server reading it will simply be refused, which is the right
+    /// answer for a machine whose framebuffer cannot be re-pointed.
+    ///
+    /// # Safety
+    /// As [`write_fb_info`](AddressSpace::write_fb_info).
+    pub unsafe fn write_scanout_handle(&self, handle: u32) {
+        // SAFETY: `data_phys` backs a frame this space owns; offset 64 is aligned
+        // and inside the page.
+        unsafe {
+            let base = mmu::phys_to_virt(self.data_phys) as *mut u8;
+            base.add(64).cast::<u32>().write_volatile(handle);
         }
     }
 

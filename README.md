@@ -111,7 +111,7 @@ intrinsics); prefer them over a bare `cargo build`.
 cargo kbuild                 # build the kernel ELF for aarch64
 cargo krun                   # build + boot it in QEMU (with a framebuffer)
 cargo kclippy                # clippy across the workspace
-cargo ktest-host             # portable-crate unit tests on the host (238 tests)
+cargo ktest-host             # portable-crate unit tests on the host (263 tests)
 ./scripts/smoke-test.sh      # boot the whole matrix and assert on the output
 ./scripts/fb-check.sh        # assert on the *pixels* the display server composited
 ./scripts/qml-check.sh       # assert on the *pixels* of the QML scene, then click it and assert they changed
@@ -186,7 +186,7 @@ framebuffer: ramfb 640x480 online (mirroring the console to the screen)
 syscall Yield -> 0; syscall 0xdead -> -6
 clock: 62500000 Hz counter, 16 ns per 1 tick(s) (exact)
 interrupt controller: GICv2 online
-clock: one tick interval (6250000 counter ticks) measured 101457 us against an expected 100000 us (agrees with the tick interval)
+clock: one tick interval (6250000 counter ticks) measured 101016 us against an expected 100000 us (agrees with the tick interval)
 smp: 1 core(s) online (PSCI v1.1)
 smp: 1 cores x 20000 locked increments = 20000 (expected 20000) — no increments lost
 smp: single core — no inter-processor interrupt to send
@@ -203,45 +203,45 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [inputsrv] a keyboard
 [inputsrv] virtio-input driver up in EL0: 2 device(s), queues armed, waiting
 [ipc] task 9 send resumed
+[devicemgr] found a keyboard at a003e00 intid 79 and delegated it to the input driver
+[devicemgr] no IOMMU on this machine; DMA capability stands but is unenforced
+[devicemgr] unpacked the initramfs in user space: 21 files, no storage driver
+[devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
 [displaysrv] the screen is mine: kernel output stopped, pixels are a process's now
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
-[fbclient] asked the screen its size (640x480 xRGB8888), then had two 64x64 surfaces composited - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096
 [fsclient] two endpoint capabilities and one page of my own memory - no archive, no device
+[fbclient] asked the screen its size (640x480 xRGB8888), then had two 64x64 surfaces composited - overlapping, restacked, and an 8x8 commit repainted 64 pixels and not 4096
+[fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
+[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight
+[hello-c] math: sin(1e15)=0.858273, pow(1.0000001,1e7)=2.718282, hypot(3,4)=5.0
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
 [fssrv] the files are mine: 21 of them, served over IPC to processes that hold no archive
 [stack] walked 40 pages down a stack that started with one mapped, every marker read back - pages arrived on demand
 [fault] task 25 killed: EL0 fault at 0x7ffedffb0 (ec 0x24) — stack guard: growth limit reached — isolated, kernel continues
 [fault]   backtrace (2 frames, x29 chain): 0x8000085c 0x80000854
 [child] hello - I was created at runtime, not by the kernel
+[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
 [client] monotonic clock: two ClockNow reads from EL0, the second strictly later - no capability needed
 [driver] user-space UART-RX driver waiting for input
-[fsclient] stat 'greeting.txt' over IPC: 25 bytes, mode 100644
-[hello-c] a C program in EL0: printf, malloc, clock and files, no syscall in sight
-[hello-c] math: sin(1e15)=0.858273, pow(1.0000001,1e7)=2.718282, hypot(3,4)=5.0
 [hello-cpp] a namespace-scope constructor ran before main
 [hello-cpp] a C++ program in EL0: vector, string, thread, and a static with a destructor
 [client] SleepUntil: woke no earlier than its 20 ms absolute deadline
 #server drove the UART, then revoked it for everyone
 [qt-hello] starting
-[shell] starting
 [child] hello - I was created at runtime, not by the kernel
 [client] read from shared memory: shared-memory works: written by the server, read by the client
 [client] read the marker from the SECOND page of a 2-page shared buffer
-[devicemgr] found a keyboard at a003e00 intid 79 and delegated it to the input driver
-[devicemgr] no IOMMU on this machine; DMA capability stands but is unenforced
-[devicemgr] unpacked the initramfs in user space: 21 files, no storage driver
-[devicemgr] read 'greeting.txt' from the initramfs: hello from the initramfs
 [fsclient] read 'greeting.txt' through fssrv in 2 chunks: hello from the initramfs
 [fsclient] 25 of 25 bytes in 2 reads, the second one from offset 6
-[hello-cpp] backing store: 1200 KiB for a whole 640x480 screen, filled and read back from C++
-[loaded] hello - my ELF was a file in the initramfs, parsed in user space and handed to the kernel as bytes
-[client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block
+[shell] starting
 [dyingclient] a 32x32 window on screen, the server watching me, and now I crash
 [fault] task 7 killed: EL0 fault at 0x0 (ec 0x24) — isolated, kernel continues
 [fault]   backtrace (2 frames, x29 chain): 0x80000d40 0x80000d3c
 [devicemgr] started 'init.elf' from the initramfs as a new process - the kernel loaded a file, not a built-in image
 [devicemgr] the kernel refused a non-ELF file and an unmapped pointer, as it must
+[hello-cpp] backing store: 1200 KiB for a whole 640x480 screen, filled and read back from C++
+[client] WaitAny: index 1 of 2 from the server's notification, a lone silent source timed out, a later signal was still counted, and no stale registration poisoned the next block
 [hello-cpp] a 1920x1080 backing store: 8100 KiB, contiguous, mapped whole
 [hello-cpp] dynamic_cast: sibling base at +16, virtual base at +32, 9 checks over all three type-info shapes
 [hello-cpp] a static local was constructed on first use
@@ -275,13 +275,13 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [hello-c] mmap: 12305 bytes mapped and returned, 0 retained by the kernel, 64 MiB cycled through a smaller pool
 [hello-c] calendar: 2025-08-13 00:00:00 UTC (Wed)
 [hello-c] heap: 103 allocations, 896 bytes live at the end
-[hello-c] clock: 22553408 ns across a 20 ms nanosleep
+[hello-c] clock: 35803808 ns across a 20 ms nanosleep
 [hello-c] read 'greeting.txt' through fssrv with libc's open/read/lseek: hello from the initramfs
 [hello-c] FILE*: fgetc/ungetc/fgets/fread agree with ftell
 [qt-hello] painted 320x240, text in 'IBM Plex Mono' 115 px wide, 20 px tall
 [qt-hello] event loop tick 1
 [qt-hello] quitting
-[qstaros] present: 1 frame(s), 76800 px - commit 680 us/frame, post 680 us/frame, await 0 us/frame, restore 0 us/frame - worst post 680 us, worst await 0 us, worst restore 0 us, 8 ns/px committed
+[qstaros] present: 1 frame(s), 76800 px - commit 1209 us/frame, post 1209 us/frame, await 0 us/frame, restore 0 us/frame - worst post 1209 us, worst await 0 us, worst restore 0 us, 15 ns/px committed
 [qt-hello] exec returned 0
 [fssrv] served 233 requests, 688420 bytes of file data, and refused 11 - the archive never left this address space
 [hello-c] listed 'docs': 1 file, 1 directory, over a flat archive
@@ -291,41 +291,43 @@ framebuffer: handed to displaysrv (id 14); the kernel logs to the UART from here
 [displaysrv] a client died; its windows are off the screen
 [shell] view shown and the keyboard claimed
 [shell] entering the event loop
-[displaysrv] composite: 128 frame(s), 1657232 px in 198278 us - 1549 us/frame, 12947 px/frame, 119 ns/px, worst 9830 us for 96000 px
-[displaysrv] composite: 256 frame(s), 3361504 px in 436019 us - 1703 us/frame, 13130 px/frame, 129 ns/px, worst 30252 us for 17168 px
-[shell] 303 frame(s) in 15167 ms
-[shell] frame profile over 303 frame(s): sync 8470 us, raster 29945 us, present 1147 us per frame; worst frame 414466 us
-[shell] between frames over 302 gap(s): total 10002 us, asleep 8460 us, awake 1541 us, parks 1.00 per gap
-[shell] the animated rectangle moved from x=86.3 to x=202.5
+[displaysrv] composite: 128 frame(s), 1671906 px in 297530 us - 2324 us/frame, 13061 px/frame, 177 ns/px, worst 31673 us for 4096 px
+[displaysrv] composite: 256 frame(s), 3327110 px in 521442 us - 2036 us/frame, 12996 px/frame, 156 ns/px, worst 31673 us for 4096 px
+[shell] 337 frame(s) in 15015 ms
+[shell] frame profile over 337 frame(s): sync 7280 us, raster 26609 us, present 983 us per frame; worst frame 354290 us
+[shell] between frames over 336 gap(s): total 9258 us, asleep 7966 us, awake 1291 us, parks 1.00 per gap
+[shell] the animated rectangle moved from x=147.7 to x=164.3
 [shell] input: 0 click(s) reached a MouseArea, 0 key(s) reached the scene, the last was Qt key 0
-[qstaros] present: 303 frame(s), 3938384 px - commit 1121 us/frame, post 426 us/frame, await 695 us/frame, restore 140 us/frame - worst post 1491 us, worst await 22099 us, worst restore 1105 us, 86 ns/px committed
+[qstaros] present: 337 frame(s), 4311556 px - commit 828 us/frame, post 382 us/frame, await 446 us/frame, restore 132 us/frame - worst post 1415 us, worst await 13326 us, worst restore 842 us, 64 ns/px committed
 [shell] exec returned 0
 [fssrv] served 371 requests, 696124 bytes of file data, and refused 23 - the archive never left this address space
 [hello-c] threads: 4 workers x 250 increments = 1000, 1 thread(s) live at the end
 [hello-c] affinity: 1 core(s) online, main pinned to cpu0 and was seen on 1 core(s), 1 worker(s) on 1 distinct core(s), an absent core refused
-[hello-c] classes: over 1200 ms on one core, latency took 176116631 turn(s) and bulk 16327099 - 10x, and neither was starved
+[hello-c] classes: over 1200 ms on one core, latency took 368936255 turn(s) and bulk 31354016 - 11x, and neither was starved
 [hello-c] capabilities: a handle minted after a thread was running resolved inside it, 8192 bytes - one table per address space, not per task
-[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 21991152 ns
-[hello-c] endpoint in poll: a message from another process woke the loop in 2924304 ns, and a 20 ms bounded receive on an empty one gave up after 24652864 ns
+[hello-c] poll: a thread slept on an eventfd and a pipe, and a 20 ms timeout took 23228064 ns
+[hello-c] endpoint in poll: a message from another process woke the loop in 3747600 ns, and a 20 ms bounded receive on an empty one gave up after 23144720 ns
 [hello-c] shared buffers: 16 KiB of surface, mapped at 0x500001000 and 0x500005000
 [displaysrv] a client died; its windows are off the screen
 [displaysrv] composited client surfaces onto a screen no client can touch
-[displaysrv] 4 surface(s) live, 313 commit(s), 4385440 pixel(s) composited, 8 refused, 3 client(s) reaped, 0 input event(s) routed, 0 dropped for want of a window
-[displaysrv] composite: 313 frame(s), 4032416 px in 549848 us - 1756 us/frame, 12883 px/frame, 136 ns/px, worst 33888 us for 14674 px
+[displaysrv] 4 surface(s) live, 347 commit(s), 4758612 pixel(s) composited, 8 refused, 3 client(s) reaped, 0 input event(s) routed, 0 dropped for want of a window
+[displaysrv] buffers: 2, 355 flip(s), 0 refused - 5978928 px painted for 5065812 px of damage, 18% over
+[displaysrv] composite: 347 frame(s), 4405588 px in 708419 us - 2041 us/frame, 12696 px/frame, 160 ns/px, worst 31673 us for 4096 px
 [hello-c] window: a 48x48 surface on a 640x480 screen, double buffered, from C through staros.h
 [hello-c] font: read 133796 bytes of IBM Plex Mono through fssrv, checksum 6016661948058288260
 [hello-c] ctype: fourteen classifications the header had promised and nobody had written
 [hello-c] stdlib: qsort, bsearch, rand, strdup and the special functions this sysroot had only promised
 [hello-c] C RUNTIME OK - every check passed
 [fssrv] served 248 requests, 275941 bytes of file data, and refused 11 - the archive never left this address space
-clock: the demo took 56106 ms on the monotonic clock, during which core 0 took 951 tick(s)
-sleep: 7 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 312 clock wake-up(s), worst overshoot 17958 us
-scheduler: all tasks finished after 951 timer ticks; task table grew to 46 (old fixed max 8)
+clock: the demo took 55114 ms on the monotonic clock, during which core 0 took 1021 tick(s)
+sleep: 7 task-sleep(s) parked, 1 deadline(s) already past (returned at once), 346 clock wake-up(s), worst overshoot 14010 us
+scheduler: all tasks finished after 1021 timer ticks; task table grew to 46 (old fixed max 8)
 task teardown: reaped 42 dead-task kernel stacks (1344 KiB returned to the heap)
 user stacks: 65 page(s) mapped on demand (260 KiB), 1 mapped up front per task, limit 1024 KiB
-preemption: timer ticks per core — cpu0=951
-scheduling: 1902 context switch(es) over 1 core(s) — cpu0=1902
-classes: 4 declaration(s) — latency 360, normal 4922, bulk 1; 69 preempt(s) declined, 669 fair pick(s), 16 inversion(s) — within the fairness budget
+preemption: timer ticks per core — cpu0=1021
+scheduling: 1948 context switch(es) over 1 core(s) — cpu0=1948
+scanout: 2 buffer(s), 355 flip(s), 0 refused, showing buffer 1 at the end — every flip taken
+classes: 4 declaration(s) — latency 395, normal 4981, bulk 2; 86 preempt(s) declined, 683 fair pick(s), 15 inversion(s) — within the fairness budget
 affinity: 5 pin(s), 0 forced migration(s), 3 task(s) still pinned
 affinity:   task 41 pinned to 0x1, ran on 0x1 — stayed inside its mask
 affinity:   task 42 pinned to 0x1, ran on 0x1 — stayed inside its mask
@@ -334,7 +336,7 @@ ipc storm: 192 sends / 192 recvs on one endpoint — cpu0=192s/192r (1 core(s) s
 console mirror: 200 byte(s) painted, 0 timed at 0 us (0 ns/byte, scroll included)
 shared memory: an 8-page buffer assembled from 8 run(s) of frames out of a pool holed on purpose — contiguity is no longer required, only DMA needs it
 frame reclaim: post-teardown alloc 0x4844f000 (exited client's root was 0x48440000)
-frame reclaim: longest free run 32 MiB -> 32 MiB after teardown — every frame returned
+frame reclaim: longest free run 32 MiB -> 16 MiB after teardown — short only by what the tasks below still hold
   (4 task(s) still alive and holding their address space — send a newline to let the UART driver exit and the pool returns whole)
     task 2 (pid 2): blocked (waiting for a message)
     task 6 (pid 6): blocked (waiting for a message), recv on ep24
@@ -347,7 +349,7 @@ shutting down (PSCI SYSTEM_OFF)
 
 Two layers, deliberately different in kind:
 
-- **`cargo ktest-host`** — 238 tests over the portable crates (`abi`, `hal`,
+- **`cargo ktest-host`** — 263 tests over the portable crates (`abi`, `hal`,
   `cpio`, `fdt`, `framebuffer`, `videocore`, `virtio`, `iommu`, `mm`, `ipc`,
   `staros-libc`, `init`), including `fdt` against real `.dtb` blobs, `cpio` against a
   real archive, `hal`'s tick↔nanosecond arithmetic against the frequencies real
@@ -360,8 +362,7 @@ Two layers, deliberately different in kind:
 - **`./scripts/smoke-test.sh`** — builds one image and boots it across the machine
   matrix (GICv2 smp1, GICv2 smp4, GICv3 smp4, 128 MiB, `ramfb`, SMMU, and an
   8-core run without `--quick`), asserting on expected lines *and* the absence of
-  failure signals. Currently **282 assertions, exit=0** on `--quick` (313 on the
-  full matrix).
+  failure signals. Currently **334 assertions, exit=0** across the full matrix.
 - **`./scripts/input-check.sh`** — the only check that makes the *outside world*
   act: QEMU synthesises a real key press and a real click, and the assertions are
   that a driver in EL0 decoded them with no kernel code anywhere in the path, and
@@ -441,6 +442,15 @@ Two layers, deliberately different in kind:
   Setting the EL0 margin against that same run found a weak assertion — with the
   bands gone but the refusal to switch down still in, the split is 2.26 to one,
   which a threshold of two to one had been letting through.
+- **Double buffering** is checked by the two things that can each be true while the
+  other is false. That the *picture* is right is `fb-check.sh`'s job and it did not
+  need changing: remove the per-buffer staleness the second buffer needs and it
+  fails on a pixel — `surface pixel (101,81) is (24, 24, 32), not red`, the buffer
+  on show never having received that surface's paint. That the *display actually
+  moved* is the kernel's, because only the kernel performs a flip: two buffers with
+  zero flips reserves twice the memory, shows one half of it for the whole boot and
+  looks identical in every screenshot, so the shutdown line says
+  `THE SECOND BUFFER WAS NEVER SHOWN` and the matrix forbids that on every machine.
 - **`./scripts/gdb-check.sh`** — boots with QEMU's gdbstub, breaks inside an EL0
   program and asserts that gdb unwinds to *that program's* caller. It is the check
   for the debugger itself, which matters from here on: the code arriving in EL0 was
@@ -567,6 +577,33 @@ waiting to stop the measurement never woke, so the spinner never stopped, so the
 boot never finished. An escape that always serves the bottom does not prevent
 starvation, it moves it one band up where there is nothing watching for it.
 Fairness rounds now alternate between the middle and bottom bands.
+
+Back on the graphical side, G8's third item is closed: the screen is double
+buffered. The pixels were always user space's — the kernel maps them into the
+display server and stops drawing — but the *scanout base* is a register behind
+fw_cfg on QEMU and a GPU mailbox on a Pi, and there is no page of it to hand over.
+So the kernel allocates the buffers stacked in one run, maps them all, and choosing
+between them is a syscall through a capability that names no address at all.
+
+The interesting part is not the flip. It is that **damage tracking and a second
+buffer are each correct alone and wrong together**, silently. Repainting only what
+changed is exact with one buffer, because that buffer holds every earlier frame;
+with two, the one being drawn into is a frame behind, so this frame's damage leaves
+the previous frame's unrepaired and the screen shows stale pixels every other
+frame. Staleness is therefore tracked per buffer. Removing that is a pixel failure
+and not a log one — `surface pixel (101,81) is (24, 24, 32), not red` — which is
+the whole reason `fb-check` exists.
+
+The cost is measured rather than argued: under the QML workload the server painted
+**5 685 332** pixels for **4 790 080** of damage, 18 % over, across 327 flips with
+none refused. On the sparse `fb-check` workload — ten commits rather than hundreds
+of frames — the same code came out at 91 % and 134 % on two runs, because staleness
+is a bounding rectangle and the overhead there is dominated by whichever pair of
+damages happened to straddle the screen. What none of this shows is an absence of tearing: `ramfb` has no
+vertical blank and neither does QEMU, so a flip lands at once rather than at a
+scanline boundary. What is shown is that the compositor never writes the buffer
+being read. Tearing is a claim for a board, and G8's vsync item stays open for the
+same reason.
 
 Design rationale, the SMP/IPC/IOMMU write-ups, and an honest "not yet
 implemented" list live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

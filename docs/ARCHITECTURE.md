@@ -904,6 +904,66 @@ Done:
   line, printed after its last composite and before it exits; the frame judged is
   taken after that, and nothing else on this machine writes to the framebuffer.
 
+- **Double buffering: the pixels are user space's, the scanout is not.** The
+  framebuffer is memory and was handed over by mapping it. The *scanout base* —
+  which of those pixels the display controller reads — is a register behind fw_cfg
+  on QEMU and a GPU mailbox on a Pi, and there is no page of it to grant. So the
+  kernel allocates the buffers stacked in one run, maps all of them into the
+  display server, and choosing between them is a syscall: `FbFlip` (39), through a
+  `Cap::Scanout`. That capability names no address at all — holding it *is* the
+  authority, and the only thing it permits is an index the kernel already
+  allocated. It is a capability rather than an owner check because it delegates:
+  the day a compositor hands the screen to a full-screen client, the mechanism is
+  already the right one.
+
+  One allocation of stacked buffers rather than two independent ones, because that
+  is the shape both hardware paths want. A Pi pans inside one taller *virtual*
+  framebuffer — `SET_VIRTUAL_OFFSET` moves a y origin and cannot take an address —
+  and `ramfb` takes a base that this makes into arithmetic. Two separate runs would
+  have served QEMU and had to be undone for the board. The Pi path also reads the
+  firmware's answer back rather than trusting its own request: a Pi silently clamps
+  a pan it cannot satisfy and reports success, so a flip that did nothing looks
+  exactly like one that worked.
+
+  **The correctness trap is damage tracking, and it is invisible until it is
+  pixels.** With one buffer, repainting only what changed is exact, because the
+  buffer already holds every earlier frame. With two, the buffer being drawn into
+  is not the one the last frame went to — it is one frame behind — so painting only
+  this frame's damage leaves the *previous* frame's damage unrepaired, and the
+  screen shows stale pixels every other frame. The server therefore tracks
+  staleness **per buffer**: every damage marks all of them, and the one being
+  painted is brought fully up to date and cleared. Take that out and `fb-check`
+  says so in pixels:
+
+  ```
+  fb-verify: FAIL - the display server's last frame: surface pixel (101,81) is (24, 24, 32), not red
+  [displaysrv] buffers: 2, 16 flip(s), 0 refused - 562256 px painted for 562256 px of damage, 0% over
+  ```
+
+  The `0% over` is the removal itself, and the missing red is what it costs: the
+  buffer on show never received that surface's paint.
+
+  The price is measured rather than argued. Under the QML workload the server
+  painted `5685332` pixels for `4790080` pixels of damage — **18 % over** — for 327
+  flips, none refused. On the sparse `fb-check` workload the same code came out at
+  91 % and 134 % over on two runs, because the staleness is a bounding rectangle and
+  two damages far apart cover the space between them: with ten commits the overhead
+  is dominated by whichever pair happened to straddle the screen, so it moves
+  between runs. The workload that matters is the one with hundreds of frames, and
+  there it is stable and small. Both numbers are in the report; tightening the
+  region algebra later would be an argument with a number in it.
+
+  What this **cannot** demonstrate is an absence of tearing. `ramfb` has no
+  vertical blank and neither does QEMU, so the flip takes effect at once rather
+  than at a scanline boundary. What is demonstrated here is that the compositor
+  never writes the buffer being read, and that the display was actually moved
+  between them — the kernel counts the flips, because only the kernel performs
+  them, and a server counting its own requests would count the ones the kernel
+  refused. Two buffers with zero flips reserves twice the memory, shows one half of
+  it for the whole boot, and looks identical in every screenshot; the shutdown line
+  says `THE SECOND BUFFER WAS NEVER SHOWN` instead, and the smoke matrix forbids
+  that word on every machine.
+
 - **Diagnostics are lines or they are not evidence.** `fssrv` printed its two
   reports as alternating string and number writes, which is one `DebugWrite` per
   fragment and one opening per fragment for another task to write into. A real run

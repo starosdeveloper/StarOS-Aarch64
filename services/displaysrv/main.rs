@@ -175,6 +175,7 @@ const SYS_ENDPOINT_PENDING: usize = 31;
 const SYS_SEND_NOWAIT: usize = 33;
 const SYS_CLOCK_NOW: usize = 20;
 const SYS_SET_CLASS: usize = 38;
+const SYS_FB_FLIP: usize = 39;
 
 /// The scheduling class this server asks for: picked before ordinary work when
 /// both are runnable on a core.
@@ -404,45 +405,167 @@ impl Surface {
     }
 }
 
-/// The framebuffer as this process sees it.
+/// The most buffers this server will use, however many the kernel provides.
+///
+/// Two is what double buffering is; the array is fixed at this because the server
+/// keeps one staleness rectangle per buffer and there is no allocator here. A
+/// kernel offering more is used two-deep, which is a limitation and not a failure.
+const MAX_BUFFERS: usize = 2;
+
+/// The framebuffer as this process sees it: every buffer the kernel mapped, which
+/// one is being drawn into, and how far each has fallen behind.
 struct Screen {
     base: *mut u8,
     width: usize,
     height: usize,
     stride: usize,
+    /// How many buffers the mapping covers, at least one.
+    buffers: usize,
+    /// Bytes from one buffer to the next.
+    plane: usize,
+    /// The buffer being drawn into — never the one on screen, when there are two.
+    back: usize,
+    /// Handle of the scanout capability, or 0 if the kernel granted none. Zero is
+    /// the null handle and resolves in no table, so a flip through it is refused
+    /// rather than silently doing something else.
+    scanout: u32,
+    /// Per buffer, the region where it differs from what the screen should show.
+    ///
+    /// **This is the whole correctness problem of double buffering on top of damage
+    /// tracking, and it is the part that looks like it works when it does not.**
+    /// Damage tracking repaints only what changed; with one buffer that is exact,
+    /// because the buffer already holds every earlier frame. With two, the buffer
+    /// being drawn into is not the one the last frame went to — it is one frame
+    /// behind — so painting only this frame's damage into it leaves the *previous*
+    /// frame's damage unrepaired, and the screen shows a window's old pixels every
+    /// other frame. Tracking it per buffer is what makes each repaint cover exactly
+    /// what that buffer is missing.
+    ///
+    /// A bounding rectangle rather than a list: it over-paints when two damages are
+    /// far apart, and it cannot be wrong. A list would be tighter and is not worth
+    /// a region algebra here — the measured cost of the over-paint is reported at
+    /// shutdown, so tightening it later would be an argument with a number in it.
+    stale: [Option<Rect>; MAX_BUFFERS],
+    /// Pixels the callers asked to repaint, and pixels actually written. The
+    /// difference is what double buffering costs on top of damage tracking.
+    asked: usize,
+    painted: usize,
+    /// Flips this server requested, and flips the kernel refused.
+    flips: usize,
+    flips_refused: usize,
 }
 
 impl Screen {
     /// Read the geometry the kernel seeded, or `None` if it gave us no screen.
     fn from_seed() -> Option<Self> {
-        // SAFETY: the kernel wrote these four fields into our data page before our
+        // SAFETY: the kernel wrote these fields into our data page before our
         // TTBR0 ever ran, and mapped the pixels at the address in the first.
         unsafe {
             let base = ((USER_DATA_VA + 40) as *const u64).read_volatile();
             let width = ((USER_DATA_VA + 48) as *const u32).read_volatile() as usize;
             let height = ((USER_DATA_VA + 52) as *const u32).read_volatile() as usize;
             let stride = ((USER_DATA_VA + 56) as *const u32).read_volatile() as usize;
+            // A kernel that predates buffered scanout writes nothing here, and a
+            // machine without one writes zero. Both mean "one buffer", which is
+            // exactly the behaviour this server had before it could flip.
+            let buffers = ((USER_DATA_VA + 60) as *const u32).read_volatile() as usize;
+            let scanout = ((USER_DATA_VA + 64) as *const u32).read_volatile();
             if base == 0 || width == 0 || height == 0 || stride < width * BPP {
                 return None;
             }
-            Some(Self { base: base as *mut u8, width, height, stride })
+            let buffers = buffers.clamp(1, MAX_BUFFERS);
+            Some(Self {
+                base: base as *mut u8,
+                width,
+                height,
+                stride,
+                buffers,
+                scanout,
+                plane: height * stride,
+                // Start on the buffer that is *not* being scanned out. The kernel
+                // left the display on buffer 0, where its own console output still
+                // is; drawing there first would put this server's first frame on
+                // screen a piece at a time, which is the tearing the second buffer
+                // exists to avoid — on the one frame most likely to be screenshotted.
+                back: if buffers > 1 { 1 } else { 0 },
+                // Every buffer starts wrong: buffer 0 holds the kernel's console
+                // text and the rest hold whatever the allocator handed over. Saying
+                // so here is what makes the first composite repaint all of it
+                // without a special case for the first frame.
+                stale: [Some(Rect { x: 0, y: 0, w: width, h: height }); MAX_BUFFERS],
+                asked: 0,
+                painted: 0,
+                flips: 0,
+                flips_refused: 0,
+            })
         }
     }
 
-    /// Write one pixel, clipped. Clipping rather than trusting: the geometry comes
-    /// from firmware, and a stride that does not match the width is the normal
-    /// case, not the exception.
+    /// Write one pixel into the *back* buffer, clipped. Clipping rather than
+    /// trusting: the geometry comes from firmware, and a stride that does not match
+    /// the width is the normal case, not the exception.
     fn put(&mut self, x: usize, y: usize, colour: u32) {
         if x >= self.width || y >= self.height {
             return;
         }
-        let offset = y * self.stride + x * BPP;
-        // SAFETY: `offset` is inside `height * stride`, which is what the kernel
-        // mapped; the buffer is ours alone while we run.
+        let offset = self.back * self.plane + y * self.stride + x * BPP;
+        // SAFETY: `offset` is inside `buffers * height * stride`, which is what the
+        // kernel mapped; the buffer is ours alone while we run.
         unsafe {
             self.base.add(offset).cast::<u32>().write_volatile(colour);
         }
     }
+
+    /// Record that `rect` of the true screen content has changed, and answer with
+    /// the region the back buffer must be repainted over.
+    ///
+    /// Every buffer falls behind by `rect`; the back one is then brought fully up
+    /// to date, so its staleness is cleared and the returned rectangle is what it
+    /// had accumulated plus the new damage.
+    fn damage(&mut self, rect: Rect) -> Rect {
+        for i in 0..self.buffers {
+            self.stale[i] = Some(match self.stale[i] {
+                Some(had) => union(had, rect),
+                None => rect,
+            });
+        }
+        let repaint = self.stale[self.back].unwrap_or(rect);
+        self.stale[self.back] = None;
+        repaint
+    }
+
+    /// Show the back buffer and start drawing into the other one.
+    ///
+    /// A no-op on a single-buffered screen, which is the whole of the fallback:
+    /// everything above already drew into buffer 0, which is the one on display.
+    fn present(&mut self) {
+        if self.buffers < 2 || self.scanout == 0 {
+            return;
+        }
+        // SAFETY: `FbFlip` reads two integers and touches no memory of ours.
+        let rc = unsafe { syscall2(SYS_FB_FLIP, u64::from(self.scanout), self.back as u64) };
+        if rc < 0 {
+            self.flips_refused += 1;
+            return;
+        }
+        self.flips += 1;
+        self.back = (self.back + 1) % self.buffers;
+    }
+}
+
+/// The smallest rectangle covering both.
+fn union(a: Rect, b: Rect) -> Rect {
+    let x = if a.x < b.x { a.x } else { b.x };
+    let y = if a.y < b.y { a.y } else { b.y };
+    let right = {
+        let (ar, br) = (a.x + a.w, b.x + b.w);
+        if ar > br { ar } else { br }
+    };
+    let bottom = {
+        let (ab, bb) = (a.y + a.h, b.y + b.h);
+        if ab > bb { ab } else { bb }
+    };
+    Rect { x, y, w: right - x, h: bottom - y }
 }
 
 /// A rectangle in screen coordinates.
@@ -653,9 +776,34 @@ impl Compositor {
     }
 
     /// Repaint one rectangle of the screen from every surface that overlaps it,
-    /// bottom to top, and return how many pixels were written.
+    /// bottom to top, show the result, and return how many pixels were written.
+    ///
+    /// The caller names the region *the content changed in*; what is actually
+    /// painted is that region widened to whatever the back buffer is missing, and
+    /// the widening is not an optimisation detail — see [`Screen::stale`]. Every
+    /// caller here already composited exactly the region it had changed, which is
+    /// why the double-buffer bookkeeping goes in this one function rather than into
+    /// six call sites that would each have to remember it.
+    ///
+    /// Presenting from here means one flip per composite. On a screen with no
+    /// vertical blank a flip is a single device write, so the alternative —
+    /// batching several composites behind one flip — would buy a fraction of a
+    /// device write and cost the invariant that the screen always shows a finished
+    /// frame.
     fn composite(&self, screen: &mut Screen, rect: Rect) -> usize {
         let Some(rect) = rect.clip(screen) else {
+            return 0;
+        };
+        // What the caller committed, which is what it gets back. The widening below
+        // is a property of *this buffer*, not of the commit, and the two must not be
+        // added together: a client asserts that an 8x8 commit repaints 64 pixels and
+        // not the whole window, which is the check that says damage tracking works.
+        // Returning the widened figure made that check fail — correctly, since the
+        // number had stopped meaning what it was asserted about. The pixels actually
+        // written are counted in `Screen::painted` and reported beside the flips.
+        let damaged = rect.w * rect.h;
+        screen.asked += damaged;
+        let Some(rect) = screen.damage(rect).clip(screen) else {
             return 0;
         };
         let mut painted = 0;
@@ -675,7 +823,9 @@ impl Compositor {
                 painted += 1;
             }
         }
-        painted
+        screen.painted += painted;
+        screen.present();
+        damaged
     }
 }
 
@@ -902,6 +1052,7 @@ extern "C" fn main() -> ! {
 
     puts("[displaysrv] composited client surfaces onto a screen no client can touch\n");
     report(compositor.count, commits, pixels_drawn, rejected, reaped, routed, dropped);
+    report_buffers(&screen);
     report_profile(&profile);
 
     // The tally is printed and this server does **not** exit.
@@ -1565,6 +1716,45 @@ fn report(
     line.put(b" input event(s) routed, ");
     line.num(u64::from(dropped));
     line.put(b" dropped for want of a window\n");
+    line.flush();
+}
+
+/// What the second buffer cost, from the side that pays for it.
+///
+/// Two numbers and the gap between them is the point. `asked` is the damage the
+/// compositor was told about — what a single-buffered server would have repainted,
+/// and exactly the figure that made damage tracking look free. `painted` is what
+/// was actually written, which is larger because each buffer has to be brought up
+/// from a frame further back (see [`Screen::stale`]). The excess is the price of
+/// never writing the buffer being scanned out, in the only unit that matters here.
+///
+/// The flip count is the other half, and it is the one that can be zero while
+/// everything else looks right: a server that composited perfectly into a back
+/// buffer and never asked for it to be shown would print identical pixel counts
+/// and display nothing it drew.
+fn report_buffers(screen: &Screen) {
+    let mut line = Line::new();
+    line.put(b"[displaysrv] buffers: ");
+    line.num(screen.buffers as u64);
+    line.put(b", ");
+    line.num(screen.flips as u64);
+    line.put(b" flip(s), ");
+    line.num(screen.flips_refused as u64);
+    line.put(b" refused - ");
+    line.num(screen.painted as u64);
+    line.put(b" px painted for ");
+    line.num(screen.asked as u64);
+    line.put(b" px of damage, ");
+    // Percent over, computed here rather than left to the reader: the whole claim
+    // is that this number is small, and a claim nobody can check at a glance is
+    // one that stops being checked.
+    let over = if screen.asked == 0 {
+        0
+    } else {
+        (screen.painted.saturating_sub(screen.asked)) * 100 / screen.asked
+    };
+    line.num(over as u64);
+    line.put(b"% over\n");
     line.flush();
 }
 

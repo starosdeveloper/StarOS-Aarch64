@@ -62,6 +62,7 @@ pub unsafe fn init_framebuffer(
     mbox_phys: u64,
     width: u32,
     height: u32,
+    buffers: usize,
     mut alloc: impl FnMut(usize) -> Option<PhysAddr>,
 ) -> Option<FramebufferInfo> {
     let base = mmu::phys_to_virt(mbox_phys) as usize;
@@ -77,6 +78,7 @@ pub unsafe fn init_framebuffer(
         height,
         depth: 32,
         pixel_order: vc::PIXEL_ORDER_RGB,
+        buffers: buffers.max(1) as u32,
     };
     let (words, len_bytes) = vc::build_fb_message(&req);
 
@@ -112,12 +114,101 @@ pub unsafe fn init_framebuffer(
     }
     let fb = vc::parse_fb_response(&reply)?;
 
+    // How many buffers we actually got, not how many were asked for. The firmware
+    // clamps a virtual size it cannot back, and it does so silently: a caller that
+    // trusted its own request would pan into rows outside the allocation and the
+    // display would show whatever RAM is there. `size` is the allocation the GPU
+    // reports, so dividing it by one screen is the firmware's own answer to the
+    // question.
+    let plane = fb.pitch as usize * fb.height as usize;
+    let granted = (fb.size as usize)
+        .checked_div(plane)
+        .unwrap_or(1)
+        .clamp(1, buffers.max(1));
+
+    // SAFETY: written once during single-core early boot; this is the only writer.
+    unsafe {
+        MBOX = Some(Mbox {
+            base,
+            msg_phys,
+            msg_va,
+            height: fb.height,
+        });
+    }
+
     Some(FramebufferInfo {
         phys: u64::from(vc::bus_to_phys(fb.bus_base)),
         width: fb.width as usize,
         height: fb.height as usize,
         stride: fb.pitch as usize,
+        buffers: granted,
     })
+}
+
+/// What [`init_framebuffer`] learned that [`set_scanout`] needs again.
+struct Mbox {
+    /// Linear-map address of the mailbox MMIO block.
+    base: usize,
+    /// The message page, kept rather than handed back: a flip is another property
+    /// message, and allocating a page per frame to send it would be absurd.
+    msg_phys: u64,
+    msg_va: *mut u32,
+    /// Physical screen height in rows — what one buffer's worth of panning is.
+    height: u32,
+}
+
+/// Written once by [`init_framebuffer`] on the boot core, read by [`set_scanout`].
+///
+/// A plain static rather than a lock, for the reason [`crate::ramfb`] gives for
+/// its own: the message page and the mailbox registers are shared, so the caller
+/// serialises, and the kernel does that at the syscall.
+static mut MBOX: Option<Mbox> = None;
+
+/// Pan the display to buffer `index` — the flip, on a Pi.
+///
+/// Returns `false` if there is no mailbox, the GPU did not answer, or **the
+/// firmware answered with a different offset than the one asked for**. That last
+/// case is the one worth having a return value for: a Pi clamps a pan it cannot
+/// satisfy and reports success, so a flip that quietly did nothing looks exactly
+/// like a flip that worked, and the compositor goes on drawing into a buffer
+/// nobody is looking at.
+///
+/// # Safety
+/// [`init_framebuffer`] must have succeeded, and this must not run concurrently
+/// with itself — it reuses one message page and the mailbox registers.
+pub unsafe fn set_scanout(index: usize) -> bool {
+    // SAFETY: written once during single-core boot, read-only afterwards.
+    let Some(mb) = (unsafe { (&raw const MBOX).as_ref().and_then(|m| m.as_ref()) }) else {
+        return false;
+    };
+    let want_y = mb.height * index as u32;
+    let (words, len_bytes) = vc::build_offset_message(0, want_y);
+
+    // SAFETY: `msg_va` is the linear-mapped page this module owns; the message is
+    // `OFFSET_MSG_WORDS` u32s, well within a page.
+    unsafe {
+        for (i, w) in words.iter().enumerate() {
+            write_volatile(mb.msg_va.add(i), *w);
+        }
+        cache::clean_invalidate_data(mb.msg_va as u64, len_bytes);
+    }
+
+    let bus_addr = (mb.msg_phys as u32) | BUS_UNCACHED;
+    // SAFETY: `base` is the mailbox MMIO block; the caller serialises.
+    if !unsafe { mailbox_exchange(mb.base, vc::CHANNEL_PROP, bus_addr) } {
+        return false;
+    }
+    // SAFETY: same buffer, still mapped.
+    unsafe { cache::clean_invalidate_data(mb.msg_va as u64, len_bytes) };
+
+    let mut reply = words;
+    // SAFETY: reading back the same in-bounds words we wrote.
+    unsafe {
+        for (i, w) in reply.iter_mut().enumerate() {
+            *w = read_volatile(mb.msg_va.add(i));
+        }
+    }
+    vc::parse_offset_response(&reply) == Some((0, want_y))
 }
 
 /// Send `value` (a 16-byte-aligned bus address) on `channel` and wait for the GPU

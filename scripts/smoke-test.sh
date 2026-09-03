@@ -195,6 +195,16 @@ run() {
     # the band loop out of `class::choose` and this line says so.
     req "classes: "
     forbid "PICKED BELOW A WAITING HIGHER CLASS"
+    # The scanout, on every machine — including the ones with no screen at all,
+    # where the line reads zero buffers and says so. Two buffers with zero flips is
+    # a kernel that reserved twice the memory and showed one half of it for the
+    # whole boot, which looks identical in every screenshot because the screenshot
+    # would be of the half being shown. Only the kernel can count flips, since only
+    # the kernel performs them; the display server counting its own requests would
+    # count the ones the kernel refused.
+    req "scanout: "
+    forbid "A FLIP WAS REFUSED"
+    forbid "THE SECOND BUFFER WAS NEVER SHOWN"
     forbid "did not initialise"                    # no half-configured device
     # IPC under contention: three senders and one receiver on a two-slot endpoint.
     # The receiver checks the sum of every sequence number it drained, so a message

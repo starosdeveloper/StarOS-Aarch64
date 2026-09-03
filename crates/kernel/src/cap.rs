@@ -74,6 +74,17 @@ pub enum Cap {
         /// Reference to the DMA-buffer object.
         obj: ObjectRef,
     },
+    /// The right to choose which framebuffer buffer the display controller scans
+    /// out (`FbFlip`). Granted to whoever is given the screen.
+    ///
+    /// The pixels themselves are an ordinary mapping and need no capability; this
+    /// names the one part of a framebuffer that cannot be mapped, which is the
+    /// scanout base — a register behind fw_cfg or a GPU mailbox. See
+    /// [`Object::Scanout`](crate::obj::Object::Scanout).
+    Scanout {
+        /// Reference to the scanout object.
+        obj: ObjectRef,
+    },
 }
 
 impl Cap {
@@ -88,7 +99,8 @@ impl Cap {
             | Cap::Irq { obj }
             | Cap::DeviceAuthority { obj }
             | Cap::Shared { obj }
-            | Cap::Dma { obj } => obj,
+            | Cap::Dma { obj }
+            | Cap::Scanout { obj } => obj,
         }
     }
 }

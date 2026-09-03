@@ -99,6 +99,7 @@ mod mem;
 mod notify;
 mod obj;
 mod sched;
+mod screen;
 mod shm;
 mod smp;
 mod sync;
@@ -683,6 +684,15 @@ fn drain_smmu_events(console: &mut Pl011, sid: u32, want_addr: u64) -> bool {
 /// [`FramebufferInfo`]; the returned label only names which lit the screen. `None`
 /// means neither is present (or the allocation/handshake failed) — the kernel then
 /// runs on the UART alone.
+/// How many full-screen buffers to ask each framebuffer source for.
+///
+/// Two: one being scanned out, one to draw the next frame into. The number is here,
+/// beside the code that asks, rather than inside each source — `ramfb` and the
+/// VideoCore mailbox express it completely differently (a base address versus a
+/// taller virtual framebuffer and a pan), and the one thing they must agree on is
+/// how many there are.
+const FB_BUFFERS: usize = 2;
+
 fn acquire_framebuffer(
     fdt: &Fdt<'_>,
 ) -> Option<(staros_arch_aarch64::fbinfo::FramebufferInfo, &'static str)> {
@@ -696,7 +706,7 @@ fn acquire_framebuffer(
         // the device linear map; single-core early boot owns the registers. The
         // firmware-owned pixel buffer is permanently reserved.
         if let Some(info) = unsafe {
-            staros_arch_aarch64::mailbox::init_framebuffer(mbox, 640, 480, |pages| {
+            staros_arch_aarch64::mailbox::init_framebuffer(mbox, 640, 480, FB_BUFFERS, |pages| {
                 mem::with(|f| f.alloc_pages(pages))
             })
         } {
@@ -714,7 +724,9 @@ fn acquire_framebuffer(
     // is allocated here and deliberately never freed (accounted as reserved before
     // the free-run snapshot).
     let info = unsafe {
-        staros_arch_aarch64::ramfb::init(fw_cfg, |pages| mem::with(|f| f.alloc_pages(pages)))
+        staros_arch_aarch64::ramfb::init(fw_cfg, FB_BUFFERS, |pages| {
+            mem::with(|f| f.alloc_pages(pages))
+        })
     }?;
     Some((info, "ramfb"))
 }
@@ -756,6 +768,10 @@ fn init_framebuffer(console: &mut Pl011, fdt: &Fdt<'_>) -> Option<staros_arch_aa
     // primary core, before the secondaries or any EL0 task, so the sweep it prints
     // is race-free — a screenshot here shows the glyphs in isolation.
     console::framebuffer_selftest();
+    // Remember which source lit the screen, so a flip knows whom to ask. Done here
+    // rather than at the call site because this is the last point at which both the
+    // geometry and the source are in one scope.
+    screen::adopt(info, source);
     Some(info)
 }
 
@@ -1438,7 +1454,11 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     // screen to give away. Everything about this pair is ordinary — two processes
     // and two endpoints — except that one of them is handed the pixels.
     let display = framebuffer.and_then(|info| {
-        let len = info.height * info.stride;
+        // Every buffer, not just the one being scanned out. The server needs to
+        // draw into the invisible one, and it can only do that if the mapping
+        // reaches it — the kernel allocated them stacked in one run precisely so
+        // that this stays a single mapping of a longer region.
+        let len = info.total_bytes();
         // SAFETY: as the other spaces here; `info` describes the real pixel buffer,
         // which `build_exclusions` kept out of the frame pool, and this is the only
         // space it is mapped into.
@@ -1455,7 +1475,13 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
                 s.destroy(frames);
                 return None;
             };
-            s.write_fb_info(fb_va, info.width as u32, info.height as u32, info.stride as u32);
+            s.write_fb_info(
+                fb_va,
+                info.width as u32,
+                info.height as u32,
+                info.stride as u32,
+                info.buffers as u32,
+            );
             Some(s)
         })?;
         let mut caps = cap::empty_caps()?;
@@ -1485,6 +1511,20 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         cap::install(&mut caps, cap::Cap::Endpoint { obj: ep_events, send: false, recv: true });
         for ev in ep_ev {
             cap::install(&mut caps, cap::Cap::Endpoint { obj: ev, send: true, recv: false });
+        }
+        // The scanout, after every endpoint and *not* at a number written down
+        // anywhere. The endpoint handles above are the server's ABI — their
+        // pairing is how a reply finds its client — so putting anything ahead of
+        // them would renumber the lot. Where this one lands is therefore whatever
+        // `install` gives it, and the number is seeded into the data page beside
+        // the framebuffer geometry, which is already how the server is told the
+        // things it cannot ask for before it runs.
+        if let Some(scanout) = obj::create(obj::Object::Scanout) {
+            if let Some(h) = cap::install(&mut caps, cap::Cap::Scanout { obj: scanout }) {
+                // SAFETY: the space was built above and has not run; offset 64 is
+                // aligned and inside its data page.
+                unsafe { space.write_scanout_handle(h) };
+            }
         }
 
         // Its client: an ordinary `init` role with no privilege at all beyond the
@@ -1987,6 +2027,33 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
     let _ = writeln!(
         console,
         "scheduling: {total} context switch(es) over {busy_cores} core(s) —{spread}",
+    );
+
+    // The scanout, and the number that separates two buffers from double
+    // buffering. Reserving a second buffer and mapping it costs memory and shows up
+    // in no screenshot; what makes it double buffering is that the display was
+    // actually moved between them, which only the kernel can count because only the
+    // kernel performs it. Zero flips on a two-buffer screen is a compositor drawing
+    // into memory nobody is looking at — and it would still pass every pixel check
+    // here, because the other buffer would be the one being checked.
+    // The verdict is a *word* and not a number for a mechanical reason worth
+    // stating: the smoke matrix matches fixed strings, so "no flip was refused" can
+    // only be asserted if the kernel says which case it is rather than leaving a
+    // count for a regex nobody can write there.
+    let (flips, flips_refused, fb_buffers, fb_shown) = screen::stats();
+    let scanout_verdict = if flips_refused > 0 {
+        "A FLIP WAS REFUSED"
+    } else if fb_buffers > 1 && flips == 0 {
+        "THE SECOND BUFFER WAS NEVER SHOWN"
+    } else if fb_buffers > 1 {
+        "every flip taken"
+    } else {
+        "single buffered"
+    };
+    let _ = writeln!(
+        console,
+        "scanout: {fb_buffers} buffer(s), {flips} flip(s), {flips_refused} refused, \
+         showing buffer {fb_shown} at the end — {scanout_verdict}",
     );
 
     // Scheduling classes, and the inequality that is their whole claim.
