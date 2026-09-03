@@ -409,6 +409,37 @@ pub enum Syscall {
     ///
     /// [`InvalidArgument`]: crate::error::KError::InvalidArgument
     SetAffinity = 37,
+
+    /// Declare which scheduling class the caller belongs to (`x0`), and return the
+    /// class it was in before.
+    ///
+    /// [`SetAffinity`](Syscall::SetAffinity) says *where* a task may run and this
+    /// says *in what order* it is picked once several want the same core. Until
+    /// this call existed there was no way to say it: every runnable task was
+    /// equal, and a display server with a frame to finish waited behind a memory
+    /// test at the same interval as anything else.
+    ///
+    /// The values are [`Class`](crate::class::Class): `1` latency, `2` normal, `3`
+    /// bulk, lower picked first. `0` is [`QUERY`](crate::class::QUERY) — it changes
+    /// nothing and only reports, the same convention a zero mask follows in
+    /// `SetAffinity`. Anything else is [`InvalidArgument`]; an unrecognised class
+    /// is refused rather than rounded, because rounding it would silently place a
+    /// task in a band it did not ask for and no later call could tell.
+    ///
+    /// Per *task* and not per process, and not inherited by a thread, for the
+    /// reason affinity is not: a program with a render thread and a worker thread
+    /// is exactly a program whose threads want different answers.
+    ///
+    /// **No capability guards this, and the bound is arithmetic rather than
+    /// permission.** A task declaring itself latency-class is making a claim about
+    /// itself that nothing verifies. What stops that from being a way to stop the
+    /// machine is that the class ordering is skipped on one pick in every
+    /// [`FAIRNESS_EVERY`](crate::class::FAIRNESS_EVERY), per core, in favour of the
+    /// lowest band that has anything runnable — so the bottom band keeps a
+    /// guaranteed share of every core no matter what the top band declares.
+    ///
+    /// [`InvalidArgument`]: crate::error::KError::InvalidArgument
+    SetClass = 38,
 }
 
 impl Syscall {
@@ -454,6 +485,7 @@ impl Syscall {
             35 => Some(Syscall::RecvUntil),
             36 => Some(Syscall::CpuId),
             37 => Some(Syscall::SetAffinity),
+            38 => Some(Syscall::SetClass),
             _ => None,
         }
     }
@@ -465,11 +497,11 @@ mod tests {
 
     #[test]
     fn raw_roundtrips() {
-        for n in 0..=37 {
+        for n in 0..=38 {
             let sc = Syscall::from_raw(n).expect("valid number");
             assert_eq!(sc as usize, n);
         }
-        assert_eq!(Syscall::from_raw(38), None);
+        assert_eq!(Syscall::from_raw(39), None);
         assert_eq!(Syscall::from_raw(99), None);
     }
 }

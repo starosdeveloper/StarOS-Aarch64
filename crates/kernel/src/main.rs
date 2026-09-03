@@ -1989,6 +1989,38 @@ pub extern "Rust" fn kmain(dtb: u64) -> ! {
         "scheduling: {total} context switch(es) over {busy_cores} core(s) —{spread}",
     );
 
+    // Scheduling classes, and the inequality that is their whole claim.
+    //
+    // The per-band counts say the bands were used; they cannot say they were
+    // obeyed, because a band a picker ignores still accumulates picks. What can
+    // fail is the relation between the last two numbers. An inversion — taking a
+    // task while a runnable task of a more urgent band was available to the same
+    // core — is reachable on a fairness pick and on no other kind, so inversions
+    // can never exceed fairness picks. The two are counted by different code: the
+    // fairness picks by the picker, the inversions by a separate scan of the same
+    // table that asks the question the picker has already answered. Take the band
+    // loop out of `class::choose` and the second number leaves the first behind
+    // immediately, on every machine in the matrix and with no C program in the
+    // image to notice.
+    let (band_picks, declared, held, fair, inversions) = sched::class_stats();
+    let mut bands = alloc::string::String::new();
+    for (i, &n) in band_picks.iter().enumerate() {
+        let name = staros_abi::class::Class::from_raw(i as u64 + 1)
+            .map_or("?", staros_abi::class::Class::name);
+        let sep = if i == 0 { "" } else { "," };
+        let _ = core::fmt::Write::write_fmt(&mut bands, format_args!("{sep} {name} {n}"));
+    }
+    let verdict = if inversions <= fair {
+        "within the fairness budget"
+    } else {
+        "PICKED BELOW A WAITING HIGHER CLASS"
+    };
+    let _ = writeln!(
+        console,
+        "classes: {declared} declaration(s) —{bands}; {held} preempt(s) declined, \
+         {fair} fair pick(s), {inversions} inversion(s) — {verdict}",
+    );
+
     // Affinity, and the one number in it that can fail. The mask a task asked for
     // reads back exactly as written whether or not the picker ever consults it; the
     // cores it *ran on* since asking is what changes the moment the affinity test

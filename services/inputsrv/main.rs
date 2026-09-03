@@ -92,6 +92,17 @@ const SYS_CREATE_DMA: usize = 16;
 const SYS_MAP_DMA: usize = 17;
 const SYS_WAIT_ANY: usize = 24;
 const SYS_DMA_PHYS: usize = 27;
+const SYS_SET_CLASS: usize = 38;
+
+/// The scheduling class this driver asks for.
+///
+/// The same argument the display server makes, at the other end of the same round
+/// trip: a keystroke is in a virtqueue with a deadline attached, and the time
+/// between the interrupt and the event reaching a client is time nobody can get
+/// back. The work is short — drain a ring, forward a message, wait again — which
+/// is precisely the shape the top band is for, and precisely why declaring it
+/// costs the machine almost nothing.
+const CLASS_LATENCY: u64 = 1;
 
 /// The endpoint the device manager delegates our devices and interrupts on.
 const EP_MANAGER: u64 = 1;
@@ -208,6 +219,12 @@ extern "C" fn _start() -> ! {
 }
 
 extern "C" fn main() -> ! {
+    // Declared first, so it is in force for the whole of setup rather than only
+    // once there is something to drain. See [`CLASS_LATENCY`].
+    // SAFETY: `SetClass` reads one integer and touches no memory of ours.
+    unsafe {
+        let _ = syscall1(SYS_SET_CLASS, CLASS_LATENCY);
+    }
     // The queues for every device, in one contiguous non-cacheable run. Allocated
     // before we know how many devices there are, because the allocation is what
     // must not be repeated: a second `CreateDma` would map on top of this one.

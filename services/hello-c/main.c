@@ -1500,6 +1500,138 @@ static void check_affinity(void)
            cores, target, count_cores(stayed), spawned, distinct_cores);
 }
 
+/* Scheduling classes: two threads that will not yield, on one core, and the share
+ * of that core each of them got.
+ *
+ * Affinity is proved by *where* a task ran, which is a fact with a yes and a no.
+ * A class has no such fact behind it — "this thread was latency-class" is a claim
+ * about a field, and a field reads back as written whether or not the picker ever
+ * looks at it. What can be wrong is the division of a core, so that is what this
+ * measures, and it measures it the only honest way: put two threads on one core,
+ * give them nothing to block on, and count.
+ *
+ * Both spinners are pinned to core 0, which is what makes the numbers comparable.
+ * Unpinned on a four-core machine they would get a core each and split it evenly
+ * no matter what the classes said — a passing result that measured the machine
+ * rather than the kernel. Pinned together they are competing for one core by
+ * construction, on every machine in the matrix including the single-core one.
+ *
+ * Two assertions, each falsified by removing a different half of the policy:
+ *
+ *   - the latency thread got most of the core. Take the band ordering out of
+ *     `class::choose` and the two threads become round-robin peers at roughly one
+ *     to one, which is nowhere near the margin below.
+ *   - the bulk thread got *some* of it. Take the fairness pick out and strict
+ *     priority means the bulk thread never runs at all while the latency one is
+ *     runnable, which is this counter reading exactly zero.
+ *
+ * The ratio itself is not asserted, because how many times the timer fired inside
+ * the window is a property of the host. Only a margin is, and the margin was set
+ * by breaking the kernel three ways and measuring each. */
+
+/* How long the two spinners run. At a 10 Hz tick this is at least twelve picks on
+ * core 0, so the fairness pick — one in every eight — is reached at least once by
+ * arithmetic rather than by luck, which is what makes "the bulk thread ran" a
+ * guarantee and not a flake. */
+#define CLASS_SPIN_MS 1200
+
+/* Volatile because the whole point of these loops is the side effect a compiler
+ * would otherwise be entitled to delete: nothing in the program reads the counter
+ * until the threads have joined. */
+static volatile int class_stop;
+static volatile unsigned long class_latency_turns;
+static volatile unsigned long class_bulk_turns;
+static int class_worker_band[2];
+
+static void *class_spinner(void *arg)
+{
+    long bulk = (long)arg;
+    /* One core, so that "share of a core" is a question with an answer. Pinned
+     * before the class is declared, because a thread that declared itself latency
+     * and then migrated would be measuring two cores' worth of picks. */
+    if (staros_set_affinity(1ull) < 0)
+        return 0;
+    int band = bulk ? STAROS_CLASS_BULK : STAROS_CLASS_LATENCY;
+    class_worker_band[bulk] = staros_set_class(band);
+
+    volatile unsigned long *turns = bulk ? &class_bulk_turns : &class_latency_turns;
+    while (!class_stop)
+        (*turns)++;
+    return 0;
+}
+
+static void check_classes(void)
+{
+    /* The query form, before anything has declared: every thread starts in the
+     * middle band, and a kernel that started them anywhere else would make every
+     * number below mean something different. */
+    check(staros_set_class(STAROS_CLASS_QUERY) == STAROS_CLASS_NORMAL,
+          "a thread starts in the normal band");
+    /* A value that names no band must be refused rather than rounded. A thread
+     * quietly placed in a band it did not ask for is a scheduling defect with no
+     * error anywhere to find it by. */
+    check(staros_set_class(4) < 0, "a class that does not exist was refused");
+    check(staros_set_class(-1) < 0, "a negative class was refused");
+    check(staros_set_class(STAROS_CLASS_QUERY) == STAROS_CLASS_NORMAL,
+          "the refused classes left us where we were");
+
+    class_stop = 0;
+    class_latency_turns = 0;
+    class_bulk_turns = 0;
+
+    pthread_t spinners[2];
+    for (long i = 0; i < 2; i++)
+        check(pthread_create(&spinners[i], 0, class_spinner, (void *)i) == 0,
+              "pthread_create for a class spinner");
+
+    /* The main thread parks, so it is not a third competitor for core 0. A
+     * sleeping task is not runnable, which is the difference between measuring two
+     * threads and measuring three. */
+    struct timespec window;
+    window.tv_sec = CLASS_SPIN_MS / 1000;
+    window.tv_nsec = (long)(CLASS_SPIN_MS % 1000) * 1000000L;
+    check(nanosleep(&window, 0) == 0, "the measurement window elapsed");
+    class_stop = 1;
+
+    for (int i = 0; i < 2; i++)
+        check(pthread_join(spinners[i], 0) == 0, "pthread_join for a class spinner");
+
+    /* Each spinner reports the band it *left*, which is the normal band — the
+     * proof that a class is not inherited. A thread born into its creator's class
+     * would report latency here for the second spinner, since main declared
+     * nothing but the first spinner did. */
+    check(class_worker_band[0] == STAROS_CLASS_NORMAL
+              && class_worker_band[1] == STAROS_CLASS_NORMAL,
+          "each spinner was born in the normal band, not its creator's");
+
+    unsigned long latency = class_latency_turns;
+    unsigned long bulk = class_bulk_turns;
+
+    check(latency > 0, "the latency thread ran");
+    /* The starvation half. Strict priority with no escape reads exactly zero here,
+     * and a zero would mean this kernel can be stopped by any thread that declares
+     * itself urgent and then loops. */
+    check(bulk > 0, "the bulk thread was not starved out of the core");
+    /* The priority half, and the margin is measured rather than picked. The whole
+     * policy gives about twelve to one here. Removing the refusal to switch down
+     * gives one to one. Removing only the band ordering — leaving the refusal in —
+     * gives 102389556 against 45225767, which is 2.26 to one: a threshold of two
+     * would have let that through, and did, until the falsification run said so.
+     * Four is under a third of the real figure and well clear of both breakages. */
+    check(latency > 4 * bulk, "the latency thread got most of the shared core");
+
+    /* Main declared nothing and pinned nothing — only the spinners did, and they
+     * have exited. Asserting that is the last piece of "per thread, not per
+     * process": a class that leaked to the address space would read back here as
+     * whichever band the spinners left behind. */
+    check(staros_set_class(STAROS_CLASS_QUERY) == STAROS_CLASS_NORMAL,
+          "main is still in the normal band its threads never touched");
+
+    printf("[hello-c] classes: over %d ms on one core, latency took %lu turn(s) and "
+           "bulk %lu - %lux, and neither was starved\n",
+           CLASS_SPIN_MS, latency, bulk, bulk ? latency / bulk : latency);
+}
+
 /* A capability minted after a thread started must be usable *by that thread*.
  *
  * The kernel used to give each thread a copy of its creator's capability table, so
@@ -2401,6 +2533,7 @@ int main(void)
     check_process();
     check_threads();
     check_affinity();
+    check_classes();
     check_late_capability();
     check_poll();
     check_endpoint();

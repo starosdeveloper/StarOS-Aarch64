@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod affinity;
+pub mod class;
 pub mod error;
 pub mod fsproto;
 pub mod syscall;

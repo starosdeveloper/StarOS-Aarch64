@@ -1166,6 +1166,93 @@ Done:
   whether or not anything consults it; the set of cores a task *ran on* is the only
   number here that can be wrong.
 
+- **Scheduling classes: three bands, and the two things a band has to do.**
+  Affinity says *where* a task may run; until `SetClass` (syscall 38) there was no way to say
+  *in what order*. Every runnable task was equal, the timer preempted them all at
+  the same interval, and the display server — the one process that turns a client's
+  `Commit` into pixels, with everything else in the image waiting on a round trip
+  through it — was picked in round-robin order among memory tests and worker
+  threads. `staros_abi::class` is the policy, host-tested like `affinity` beside
+  it: `Latency`, `Normal`, `Bulk`, lower picked first, `Normal` unless a task says
+  otherwise. `class::choose` is `affinity::choose` run once per band, so
+  round-robin order, the sticky pass and the `from` exclusion are all inherited
+  rather than re-derived — the only thing added is which slots the scan may see.
+  Per task and not per address space, and not inherited by a thread, for the reason
+  affinity is not: a program with a render thread and a worker thread is exactly the
+  program whose threads want different answers.
+
+  **Ordering the candidates is only half of a priority, and the first measurement
+  was the thing that said so.** Two threads on one core, one latency and one bulk,
+  neither ever blocking: the split came out `68490073` turns against `61142525`,
+  which is one to one. The picker was obeying its bands perfectly and it made no
+  difference, because a timer preempt asks "who *else* may run" and the scan
+  excludes the task being switched away from — so on that core the only candidate
+  was the bulk thread, every single tick. A priority is as much about not switching
+  as about which task is picked next, and that half is `class::should_switch`: an
+  involuntary preempt that would hand the core to a strictly less urgent task is
+  declined and the incumbent keeps its slice. `Yield` never consults it; a task that
+  asks to be switched away from has said something the scheduler has no business
+  overruling.
+
+  **The escape, and the starvation it moved before it fixed it.** Strict bands with
+  no way out is a way to hang: a latency task that never blocks would own its core,
+  and everything below it would stop in a way indistinguishable from a deadlock in
+  every log this kernel prints. So one decision in `class::FAIRNESS_EVERY`, per
+  core, reverses the ordering. The first version always started that pick at the
+  *bottom* band — and hung a boot. With a latency thread spinning, every fairness
+  pick went to the bulk thread and the middle band never ran at all; the
+  normal-class thread waiting to stop the measurement never woke, so the spinner
+  never stopped. An escape that always serves the bottom does not prevent
+  starvation, it moves it one band up where it is harder to see. Fairness rounds now
+  alternate between the middle and bottom bands, each falling through to the other
+  and to the top band last. The bound that follows is arithmetic rather than
+  permission, which is why `SetClass` needs no capability: whatever a task declares,
+  every band below it is reached within two fairness periods of every core.
+
+  Counted at two different places on purpose. The fairness phase advances on
+  *decisions*, because a core declining every preempt must still arrive at the one
+  it cannot decline — count claims instead and the escape written to stop a spinning
+  task never fires for the task it was written for. Inversions are counted at
+  *claims*, because a declined preempt moved nothing and stepped over nothing.
+
+  The claim is falsifiable and is checked from both sides. The kernel's own verdict
+  is printed on every machine in the matrix, including hosts without clang where the
+  C program is not in the image:
+
+  ```
+  classes: 4 declaration(s) — latency 353, normal 4944, bulk 1; 102 preempt(s) declined, 675 fair pick(s), 16 inversion(s) — within the fairness budget
+  ```
+
+  An *inversion* is a claim that took a task while a runnable task of a more urgent
+  band was available to the same core — counted by `class::outranked`, a separate
+  scan over the same table, written to answer the question the picker has already
+  answered by construction. That is exactly what makes it worth running: on the
+  ordered path it must find nothing, on a fairness pick it may, so inversions can
+  never exceed fairness picks. Take the band loop out of `class::choose` and the
+  second number leaves the first behind on the first boot.
+
+  From EL0 the fact is not a field but a share of a core, and `hello-c` measures it
+  the only honest way — two threads pinned to core 0 that never block, one latency
+  and one bulk:
+
+  ```
+  [hello-c] classes: over 1200 ms on one core, latency took 175546573 turn(s) and bulk 13588380 - 12x, and neither was starved
+  ```
+
+  Two assertions and two different defects: a picker with strict bands and no escape
+  reads exactly zero for the bulk thread, and a picker that will not hold the core
+  lands near one to one.
+
+  The margin in the second assertion is measured and not chosen, and setting it
+  found a weak check. Removing the band loop *while leaving the refusal in* gives
+  `102389556` against `45225767` — 2.26 to one, which a threshold of two to one
+  admits. It admitted it, until the falsification run said so. The threshold is four
+  now: under a third of the twelve the working kernel gives, and clear of every
+  breakage above. The kernel-side inversion count is what catches that particular
+  removal outright — 728 inversions against 671 fairness picks, and the verdict line
+  reading `PICKED BELOW A WAITING HIGHER CLASS` — which is the division of labour
+  these two halves are for.
+
 Not yet implemented:
 
 - **CPU errata and the bootloader's watchdog are untestable here and are not
@@ -1183,11 +1270,14 @@ Not yet implemented:
   cost — at a few dozen slots it is not. Cross-core TLB shootdown for unmapping uses
   the broadcast `tlbi ...is` variants (hardware agrees), which is enough for what
   unmaps today.
-- No *scheduling classes*: affinity says where a task may run and nothing says in
-  what order. Every runnable task is equal, the timer preempts them all at the same
-  interval, and a display server has no way to say it matters more than a memory
-  test. On a board this is what stands between a smooth frame and a merely average
-  one, and it is a policy question the shared ready set makes easy to answer later
-  and pointless to guess at now.
+- No *priority inheritance*, and no ceiling on the class a task may declare.
+  `SetClass` (see above) is unguarded: a task naming itself latency-class is making
+  a claim nothing verifies, and what bounds the damage is the fairness escape
+  rather than any permission. The other half of the same gap is that a
+  latency-class task blocked on a lock a bulk-class task holds has no way to lend
+  it the band — classic priority inversion, and this kernel's locks are spinlocks
+  held across nothing that sleeps, so it is a gap in the design rather than in the
+  behaviour today. Both want a capability that names "scheduling authority over
+  someone else", which is the piece this kernel does not have.
 - The ECAM enumerator is bus-0, single-function, no bridges.
 - A second arch backend to validate the HAL boundary.

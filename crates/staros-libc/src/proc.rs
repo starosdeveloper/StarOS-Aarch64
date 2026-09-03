@@ -644,6 +644,35 @@ pub mod exports {
         }
     }
 
+    // -------------------------------------------------------- scheduling classes
+
+    /// Put this thread in a scheduling class and return the class it was in.
+    ///
+    /// `1` is latency, `2` normal, `3` bulk; lower is picked first when several
+    /// runnable threads want the same core. `0` changes nothing and only reports,
+    /// the same convention [`staros_set_affinity`] follows for a zero mask.
+    ///
+    /// Returns `-1` for any other value, leaving the class unchanged. An
+    /// unrecognised class is refused rather than rounded to the nearest one,
+    /// because a thread quietly placed in a band it did not ask for is a
+    /// scheduling bug with no error anywhere to find it by.
+    ///
+    /// Affinity says *where* this thread may run; this says *in what order* it is
+    /// picked once it is there. Per thread, like affinity and unlike almost
+    /// everything else in this library, and not inherited by threads it creates.
+    #[no_mangle]
+    pub extern "C" fn staros_set_class(band: c_int) -> c_int {
+        if band < 0 {
+            return -1;
+        }
+        let rc = crate::sys::set_class(band as u64);
+        if rc < 0 {
+            -1
+        } else {
+            rc as c_int
+        }
+    }
+
     // --------------------------------------------------------------------- system
 
     /// `struct utsname`, in glibc's layout: six 65-byte fields.

@@ -550,6 +550,21 @@ pub extern "Rust" fn staros_syscall_dispatch(req: &SyscallRequest) -> isize {
         // no capability that names it.
         Some(Syscall::SetAffinity) => sched::set_affinity(req.args[0]),
 
+        // Which band the caller is picked in, and the band it was in before. A
+        // value of zero only reports, exactly as a zero mask does above.
+        //
+        // No capability, and for a reason that is *not* the one `SetAffinity` has.
+        // Giving up cores is authority nobody needs protecting from; claiming to be
+        // latency-sensitive is a claim about oneself that nothing here verifies,
+        // and a task making it in bad faith is taking time from its neighbours.
+        // What bounds that is arithmetic rather than permission: one pick in every
+        // `class::FAIRNESS_EVERY`, per core, serves the lowest runnable band
+        // regardless of what anything has declared, so the bottom band keeps a
+        // guaranteed share of every core. A capability naming "may raise its own
+        // priority" would be the better answer and is not one this kernel has; a
+        // bound that holds against a hostile caller is one it can have now.
+        Some(Syscall::SetClass) => sched::set_class(req.args[0]),
+
         // Bind the notification named by `x1` to the endpoint named by `x0`, so a
         // message arriving there also signals it. Both handles are the caller's, and
         // the endpoint one must carry receive rights: this grants the authority to

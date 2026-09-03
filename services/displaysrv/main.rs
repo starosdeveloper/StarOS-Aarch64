@@ -174,6 +174,23 @@ const SYS_ENDPOINT_BIND: usize = 30;
 const SYS_ENDPOINT_PENDING: usize = 31;
 const SYS_SEND_NOWAIT: usize = 33;
 const SYS_CLOCK_NOW: usize = 20;
+const SYS_SET_CLASS: usize = 38;
+
+/// The scheduling class this server asks for: picked before ordinary work when
+/// both are runnable on a core.
+///
+/// This is the process that turns a client's `Commit` into pixels, and the only
+/// one that can: everything behind it — a Qt frame, a keystroke's echo — is
+/// waiting on a round trip through here. Left in the middle band it was picked in
+/// round-robin order among every memory test and worker thread in the image, which
+/// is fair and is the wrong kind of fair. The frame has a deadline and a memory
+/// walk does not.
+///
+/// A claim about itself that nothing verifies, and the kernel says so; what keeps
+/// it from being a way to stop the machine is the fairness pick, which serves the
+/// lowest runnable band once in every eight picks per core no matter what this
+/// server has declared.
+const CLASS_LATENCY: u64 = 1;
 
 /// How long to sleep when an event is held and there is nothing else to do.
 ///
@@ -671,6 +688,12 @@ extern "C" fn _start() -> ! {
 }
 
 extern "C" fn main() -> ! {
+    // Before anything else, because everything else is a client waiting. See
+    // [`CLASS_LATENCY`].
+    // SAFETY: `SetClass` reads one integer and touches no memory of ours.
+    unsafe {
+        let _ = syscall1(SYS_SET_CLASS, CLASS_LATENCY);
+    }
     let Some(mut screen) = Screen::from_seed() else {
         puts("[displaysrv] the kernel gave me no screen; nothing to serve\n");
         exit();

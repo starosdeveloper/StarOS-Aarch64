@@ -223,6 +223,35 @@ int staros_cpu_id(void);
  * have. MAX_CPUS here is eight, so the mask is one integer. */
 long long staros_set_affinity(unsigned long long mask);
 
+/* ---- Scheduling classes ------------------------------------------------- */
+
+/* Which band this thread is picked in when several runnable threads want the same
+ * core. Affinity says WHERE a thread may run; this says IN WHAT ORDER. */
+#define STAROS_CLASS_QUERY   0  /* change nothing, report the current class */
+#define STAROS_CLASS_LATENCY 1  /* picked first: a compositor, an input drain */
+#define STAROS_CLASS_NORMAL  2  /* the default, and where anything unsure belongs */
+#define STAROS_CLASS_BULK    3  /* picked when nothing above wants the core */
+
+/* Put this thread in `band` and return the class it was in, or -1 for a value
+ * that names no class (the class is then unchanged). STAROS_CLASS_QUERY only
+ * reports, the way a zero mask does in staros_set_affinity.
+ *
+ * Strict bands with one exception: a latency thread that is runnable is picked
+ * before a normal one on the same core, every time, EXCEPT on one pick in every
+ * eight per core, which serves the lowest band that has anything runnable. That
+ * exception is why a thread that declares itself latency-class and then never
+ * blocks cannot stop the machine — the bottom band keeps an eighth of every core
+ * no matter what anything above it claims.
+ *
+ * Per thread, not per process, and not inherited: a program with a render thread
+ * and a worker thread is exactly the program whose threads want different
+ * answers.
+ *
+ * The parameter is spelled `band` and not `class` on purpose: this header is
+ * included from C++ too, where `class` is a keyword and a declaration using it
+ * does not compile. */
+int staros_set_class(int band);
+
 /* ---- Measurements ------------------------------------------------------- */
 
 /* Bytes that munmap and mremap accounted for and the kernel still has mapped.

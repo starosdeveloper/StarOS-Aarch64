@@ -255,6 +255,15 @@ pub(crate) fn set_affinity(mask: u64) -> isize {
     unsafe { syscall1(Syscall::SetAffinity, mask) }
 }
 
+/// Put this thread in scheduling class `raw` and return the class it was in — or a
+/// negative error for a value that names no class. A `raw` of zero changes nothing
+/// and only reports.
+pub(crate) fn set_class(raw: u64) -> isize {
+    // SAFETY: `SetClass` reads one integer, touches no caller memory and returns
+    // on the same core it was called on.
+    unsafe { syscall1(Syscall::SetClass, raw) }
+}
+
 /// Give up the rest of this timeslice.
 pub(crate) fn yield_now() {
     // SAFETY: `Yield` reschedules and returns.

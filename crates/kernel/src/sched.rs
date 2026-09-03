@@ -49,6 +49,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use staros_abi::affinity;
+use staros_abi::class::{self, Class};
 use staros_abi::error::KError;
 use staros_arch_aarch64::addrspace::AddressSpace;
 use staros_arch_aarch64::context::{context_switch, CpuContext};
@@ -206,6 +207,21 @@ struct Task {
     /// fall-through pass, and [`affinity::homed_here`] for why a task that has never
     /// run is at home on every core rather than on none.
     last_cpu: usize,
+    /// Which band this task is picked in when several want the same core. Set by
+    /// [`set_class`]; [`Class::Normal`] until a task says otherwise.
+    ///
+    /// Per task and not per address space, and not inherited by a thread, for the
+    /// reason given at [`Task::affinity`] — a program with a render thread and a
+    /// worker thread is exactly the program whose threads want different answers.
+    ///
+    /// A field with no `ran_on` beside it, and the asymmetry is deliberate: the
+    /// evidence for a class is not per task at all. "This task was latency-class"
+    /// is a claim about a field, and a field reads back as written whether or not
+    /// the picker consults it; the claim that can fail is about *the core* — how
+    /// many picks each band got, and how often a pick stepped over a runnable
+    /// higher band. Those are counted globally, in [`PICKS_BY_CLASS`] and
+    /// [`INVERSIONS`].
+    class: Class,
     /// Every core this task has run on since its affinity was last set: bit `n` =
     /// core `n`.
     ///
@@ -386,6 +402,17 @@ struct Scheduler {
     /// The task each core is running. Per-core: "which task am I in" must never
     /// be answerable with another core's task.
     current: [usize; boot::MAX_CPUS],
+    /// How many tasks each core has claimed. Per-core, because the fairness
+    /// escape it drives is a promise about *a core*: one pick in every
+    /// [`class::FAIRNESS_EVERY`] on this core serves the lowest runnable band, and
+    /// a shared counter would let a busy core spend another core's turn.
+    ///
+    /// Inside the scheduler and not an atomic, unlike the reporting counters
+    /// below, because it is read and written on the picking path with the lock
+    /// already held — and because it must not drift from the claims themselves.
+    /// A counter that advanced on decisions that did not become claims would slide
+    /// the fairness phase out from under the guarantee.
+    picks: [u64; boot::MAX_CPUS],
 }
 
 impl Scheduler {
@@ -395,6 +422,7 @@ impl Scheduler {
             bootstrap: [const { CpuContext::empty() }; boot::MAX_CPUS],
             bootstrap_ttbr0: [0; boot::MAX_CPUS],
             current: [usize::MAX; boot::MAX_CPUS],
+            picks: [0; boot::MAX_CPUS],
         }
     }
 
@@ -427,28 +455,110 @@ impl Scheduler {
     }
 
     /// The slot core `cpu` should take next, scanning round-robin from just after
-    /// `from` and preferring one it ran before. Never returns `from`.
+    /// `from`, preferring the most urgent band that has anything runnable and,
+    /// inside that band, one this core ran before. Never returns `from`.
     ///
-    /// The policy itself lives in [`affinity::choose`], where it is host-tested; all
-    /// that happens here is supplying it with this scheduler's two predicates.
-    fn pick(&self, cpu: usize, from: usize) -> Option<usize> {
-        affinity::choose(
+    /// The policy itself lives in [`class::choose`] — which is [`affinity::choose`]
+    /// run once per band — where it is host-tested; all that happens here is
+    /// supplying it with this scheduler's three predicates and this core's pick
+    /// number, which is what selects the fairness phase.
+    /// Returns the slot and whether this decision was the fairness one, which the
+    /// preemption path needs in order to know whether it may decline the switch.
+    fn pick(&mut self, cpu: usize, from: usize) -> Option<(usize, bool)> {
+        let fair = self.decide(cpu);
+        let next = class::choose(
             self.tasks.len(),
             from,
+            self.picks[cpu],
             |i| self.pickable(i, cpu),
             |i| self.sticky(i, cpu),
-        )
+            |i| self.tasks[i].class,
+        );
+        self.advance(cpu, next.is_some());
+        next.map(|n| (n, fair))
+    }
+
+    /// Whether the decision this core is about to make is the fairness one, read
+    /// before [`Scheduler::advance`] moves the phase on.
+    fn decide(&self, cpu: usize) -> bool {
+        class::is_fair(self.picks[cpu])
+    }
+
+    /// Move this core's fairness phase on by one decision.
+    ///
+    /// **Decisions and not claims, and the difference is the whole guarantee.** A
+    /// core running a latency-class task that never blocks makes a decision on
+    /// every timer tick and *declines* almost all of them — see
+    /// [`class::should_switch`]. If the phase only advanced when a task was
+    /// actually claimed, that core's phase would stand still, the fairness pick
+    /// would never come round, and the escape written to stop exactly that task
+    /// from owning the core would never fire. The first version counted claims,
+    /// and this is the shape of what it would have done.
+    ///
+    /// A decision with no candidate at all does not count: there was nothing to be
+    /// fair *about*, and an idle core spinning through empty scans would otherwise
+    /// burn the phase and hand its first real candidate a fairness pick.
+    fn advance(&mut self, cpu: usize, had_candidate: bool) {
+        if !had_candidate {
+            return;
+        }
+        if class::is_fair(self.picks[cpu]) {
+            FAIR_PICKS.fetch_add(1, Ordering::Relaxed);
+        }
+        self.picks[cpu] = self.picks[cpu].wrapping_add(1);
     }
 
     /// The slot core `cpu` should take when it is running nothing at all — a
     /// bootstrap or idle loop, which has no `from` to scan away from and must be
     /// able to reach slot 0.
-    fn pick_idle(&self, cpu: usize) -> Option<usize> {
-        affinity::choose_first(
+    fn pick_idle(&mut self, cpu: usize) -> Option<usize> {
+        let next = class::choose_first(
             self.tasks.len(),
+            self.picks[cpu],
             |i| self.pickable(i, cpu),
             |i| self.sticky(i, cpu),
-        )
+            |i| self.tasks[i].class,
+        );
+        self.advance(cpu, next.is_some());
+        next
+    }
+
+    /// Record what a claim stepped over, for the report that can contradict the
+    /// picker.
+    ///
+    /// [`class::outranked`] is a second scan over the same table, written to answer
+    /// the question the picker has just answered by construction — and that is why
+    /// it is worth running. On the ordered path it must find nothing: `choose`
+    /// reaches a band only after every band above it came up empty. On a fairness
+    /// pick it may find something, and should, since serving the bottom band while
+    /// the top band waits is the entire escape. So over a boot the inversions can
+    /// never exceed the fairness picks, and that inequality is checked by code
+    /// that does not share a line with the code it is checking.
+    ///
+    /// Counted at the *claim* and not at the decision, unlike the fairness phase
+    /// above. A preempt that was declined moved no task onto a core, so it stepped
+    /// over nothing; counting it would put phantom inversions on the left of an
+    /// inequality whose whole value is being tight.
+    ///
+    /// The scan is skipped for a [`Class::Latency`] pick, which is not frugality
+    /// but the definition: nothing outranks the top band, so there is no question
+    /// to ask.
+    ///
+    /// `from` is excluded from the scan. It is runnable — [`migrate_off`] leaves it
+    /// `Ready` on purpose — and it is still not a candidate, so counting it would
+    /// make `choose` obeying its own contract look like a violation of it.
+    fn account(&self, cpu: usize, from: Option<usize>, next: usize) {
+        let chosen = self.tasks[next].class;
+        if chosen != Class::Latency
+            && class::outranked(
+                self.tasks.len(),
+                chosen,
+                |i| Some(i) != from && self.pickable(i, cpu),
+                |i| self.tasks[i].class,
+            )
+        {
+            INVERSIONS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Claim slot `next` for core `cpu`: mark it `Running` and on-cpu, make it this
@@ -463,7 +573,8 @@ impl Scheduler {
     ///
     /// Must be called with the scheduler lock held and before it is dropped: the
     /// claim is what stops a peer core from picking the same slot.
-    fn take(&mut self, cpu: usize, next: usize) {
+    fn take(&mut self, cpu: usize, from: Option<usize>, next: usize) {
+        self.account(cpu, from, next);
         self.tasks[next].state = State::Running;
         self.tasks[next].on_cpu.store(true, Ordering::Relaxed);
         self.tasks[next].last_cpu = cpu;
@@ -471,6 +582,7 @@ impl Scheduler {
             self.tasks[next].ran_on |= 1 << cpu;
         }
         self.current[cpu] = next;
+        PICKS_BY_CLASS[self.tasks[next].class.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether any task is `Ready`, already `Running` on some core, or `Sleeping`.
@@ -705,6 +817,12 @@ pub fn spawn_thread(entry: u64, stack_pages: u64, tls: u64, arg: u64) -> isize {
         // can be somewhere else. A thread born pinned where its creator is pinned
         // would make that impossible to ask for.
         affinity: affinity::ALL,
+        // Not inherited either, and by the same argument: a worker thread created
+        // by a latency-class render thread is the bulk half of that program, and a
+        // class copied from the creator would be the one thing a program cannot
+        // undo from inside the new thread without first being scheduled — which is
+        // exactly what its class decides.
+        class: Class::Normal,
         last_cpu: affinity::NO_HOME,
         ran_on: 0,
         // A *copy* of the creator's placements, exactly like the capability table
@@ -796,6 +914,10 @@ pub fn spawn_user(entry: extern "C" fn(), space: AddressSpace, caps: CapTable) -
         // program should run would be making a policy choice on behalf of one that
         // has not expressed a preference.
         affinity: affinity::ALL,
+        // The middle band, for the same reason every core is permitted above: a
+        // kernel that decided a program mattered more than its neighbours would be
+        // making a policy choice for a program that has not made one.
+        class: Class::Normal,
         last_cpu: affinity::NO_HOME,
         ran_on: 0,
         shared: Placements::new(staros_arch_aarch64::addrspace::USER_SHARED_VA),
@@ -845,7 +967,7 @@ pub fn start() {
             sched.pick_idle(cpu).map(|first| {
                 // Claimed before the guard drops — `take` marks it `Running` and
                 // on-cpu, so no peer core can select it too.
-                sched.take(cpu, first);
+                sched.take(cpu, None, first);
                 // Switching *from* the bootstrap context, which is not a task —
                 // nothing to settle when the successor resumes here.
                 PREV[cpu].store(usize::MAX, Ordering::Relaxed);
@@ -903,7 +1025,7 @@ pub fn run_secondary() -> ! {
             sched.pick_idle(cpu).map(|first| {
                 // Claimed before the guard drops — `take` marks it `Running` and
                 // on-cpu, so no peer core can select it too.
-                sched.take(cpu, first);
+                sched.take(cpu, None, first);
                 // Switching *from* the bootstrap context (not a task): nothing to
                 // settle when the successor returns here.
                 PREV[cpu].store(usize::MAX, Ordering::Relaxed);
@@ -931,18 +1053,25 @@ pub fn run_secondary() -> ! {
 }
 
 /// Voluntarily yield the CPU to the next ready task.
+/// A task asking to be switched away from is believed whatever its class: `Yield`
+/// means "take the core from me", and a latency-class task that says so has said
+/// something the scheduler has no business overruling. Only the *involuntary*
+/// path consults [`class::should_switch`].
 pub fn yield_now() {
     // SAFETY: reschedule inside an IRQ-masked critical section.
     let saved = unsafe { exceptions::irq_save() };
-    reschedule();
+    reschedule(false);
     // SAFETY: matching restore (runs when this task is switched back in).
     unsafe { exceptions::irq_restore(saved) };
 }
 
 /// Preempt the current task from the timer IRQ epilogue. IRQs are already masked
 /// by exception entry, so no save/restore is needed here.
+///
+/// The one path that may *decline*: a tick that would hand the core to a less
+/// urgent task leaves the incumbent where it is.
 pub fn preempt() {
-    reschedule();
+    reschedule(true);
 }
 
 /// Request a reschedule at the next IRQ epilogue (called from the timer tick).
@@ -964,7 +1093,11 @@ pub fn on_irq_epilogue() {
 
 /// Core switch: move from the current task to the next ready one, if any. Must
 /// be called with IRQs masked. Returns immediately if nothing else is runnable.
-fn reschedule() {
+/// `honour_class` is set on the involuntary path only. See
+/// [`class::should_switch`]: ordering the *candidates* is half of a priority and
+/// declining to leave at all is the other half, because the incumbent is never one
+/// of the candidates.
+fn reschedule(honour_class: bool) {
     let prev_ptr: *mut CpuContext;
     let next_ptr: *const CpuContext;
     let next_ttbr0: u64;
@@ -977,14 +1110,24 @@ fn reschedule() {
         if prev == usize::MAX {
             return;
         }
-        let Some(next) = sched.pick(cpu, prev) else {
+        let Some((next, fair)) = sched.pick(cpu, prev) else {
             return;
         };
+        // Declined *after* the pick and not before, so that the fairness phase has
+        // already moved on: a core that keeps refusing must still arrive at the
+        // pick where it cannot refuse. Nothing has been mutated yet at this point,
+        // so returning here leaves the incumbent exactly as it was.
+        if honour_class
+            && !class::should_switch(sched.tasks[prev].class, sched.tasks[next].class, fair)
+        {
+            HELD.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if sched.tasks[prev].state == State::Running {
             sched.tasks[prev].state = State::Ready;
         }
         // Claimed before the guard drops, so no other core can pick it too.
-        sched.take(cpu, next);
+        sched.take(cpu, Some(prev), next);
         // Counted per core, because "there is no load balancing" was written down
         // as a limitation and is not one: the ready set is a single array every
         // core scans, so any core picks any runnable task and there is nobody to
@@ -1069,9 +1212,9 @@ pub fn exit() -> ! {
             .any(|(i, t)| i != prev && t.state != State::Dead && t.ttbr0 == ttbr0);
         dead_space = if shared { None } else { space };
         prev_ptr = &mut sched.tasks[prev].ctx;
-        match sched.pick(cpu, prev) {
+        match sched.pick(cpu, prev).map(|(next, _fair)| next) {
             Some(next) => {
-                sched.take(cpu, next);
+                sched.take(cpu, Some(prev), next);
                 next_ttbr0 = sched.tasks[next].ttbr0;
                 next_ptr = &sched.tasks[next].ctx;
             }
@@ -1275,9 +1418,9 @@ fn migrate_off() {
         sched.tasks[prev].state = State::Ready;
         PREV[cpu].store(prev, Ordering::Relaxed);
         prev_ptr = &mut sched.tasks[prev].ctx;
-        match sched.pick(cpu, prev) {
+        match sched.pick(cpu, prev).map(|(next, _fair)| next) {
             Some(next) => {
-                sched.take(cpu, next);
+                sched.take(cpu, Some(prev), next);
                 next_ttbr0 = sched.tasks[next].ttbr0;
                 next_ptr = &sched.tasks[next].ctx;
             }
@@ -1301,6 +1444,90 @@ fn migrate_off() {
 
     // SAFETY: matching restore for the save above.
     unsafe { exceptions::irq_restore(saved) };
+}
+
+/// Picks made in each band, indexed by [`Class::index`]. Written by
+/// [`Scheduler::take`], which is the only place a task is put on a core.
+static PICKS_BY_CLASS: [AtomicU64; class::COUNT] =
+    [const { AtomicU64::new(0) }; class::COUNT];
+/// Tasks that declared a class other than [`Class::Normal`]. Zero means the
+/// syscall was never exercised, and everything below it is a statement about a
+/// machine where every task was in the same band.
+static DECLARED: AtomicU64 = AtomicU64::new(0);
+/// Picks on which the band order was reversed to serve the lowest runnable band.
+static FAIR_PICKS: AtomicU64 = AtomicU64::new(0);
+/// Picks that took a task while a runnable task of a more urgent band was
+/// available to the same core — counted by a scan that does not share a line with
+/// the picker. See [`Scheduler::account`].
+static INVERSIONS: AtomicU64 = AtomicU64::new(0);
+/// Timer preempts declined because the only candidate was less urgent than the
+/// task already on the core.
+///
+/// The other half of the policy, and the half the first measurement had to find
+/// the hard way: with this at zero a latency task and a bulk task on one core
+/// split it evenly no matter how carefully the bands are ordered. See
+/// [`class::should_switch`].
+static HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Put the current task in the band named by `raw`, and answer with the band it
+/// was in. Backs the `SetClass` syscall.
+///
+/// `raw` of [`class::QUERY`] changes nothing and only reports, the convention a
+/// zero mask already follows in [`set_affinity`]: the call that consumes a value is
+/// the call that hands back the current one, so a caller never has to set something
+/// in order to find out what it had.
+///
+/// An unrecognised value is [`KError::InvalidArgument`] rather than a nearest
+/// match. Rounding it would put a task in a band it did not ask for with no error
+/// anywhere and no later call able to tell — the same failure shape as a mask that
+/// silently admitted a core that does not exist.
+///
+/// **Takes effect at the next pick, not at this instruction, and that is the
+/// honest contract.** A task promoting itself to [`Class::Latency`] already holds
+/// the core, so there is nothing to do; a task demoting itself to [`Class::Bulk`]
+/// keeps the core until the timer or a block takes it away. Forcing a switch here
+/// would be a task giving up a slice it was entitled to, and the one caller who
+/// wants that already has `Yield`.
+pub fn set_class(raw: u64) -> isize {
+    let mut sched = SCHED.lock();
+    let cur = sched.current[me()];
+    let prev = sched.tasks[cur].class;
+    if raw == class::QUERY {
+        return prev.as_raw() as isize;
+    }
+    let Some(new) = Class::from_raw(raw) else {
+        return KError::InvalidArgument.as_raw();
+    };
+    sched.tasks[cur].class = new;
+    if new != Class::Normal {
+        DECLARED.fetch_add(1, Ordering::Relaxed);
+    }
+    prev.as_raw() as isize
+}
+
+/// Picks per band, how many tasks declared a band, how many timer preempts were
+/// declined because the incumbent outranked the candidate, how many decisions were
+/// fairness picks, and how many claims stepped over a runnable higher band.
+///
+/// The last two are the claim and the rest is context. A per-band pick count says
+/// the bands were *used*; only the relation between the last two says they were
+/// *obeyed*, since an inversion is reachable on a fairness pick and on no other
+/// kind. The held count is the number that would have made the first measurement
+/// of this feature obviously wrong instead of subtly wrong: it was zero, and an
+/// even split of one core between a latency task and a bulk task followed.
+#[must_use]
+pub fn class_stats() -> ([u64; class::COUNT], u64, u64, u64, u64) {
+    let mut picks = [0; class::COUNT];
+    for (slot, counter) in picks.iter_mut().zip(PICKS_BY_CLASS.iter()) {
+        *slot = counter.load(Ordering::Relaxed);
+    }
+    (
+        picks,
+        DECLARED.load(Ordering::Relaxed),
+        HELD.load(Ordering::Relaxed),
+        FAIR_PICKS.load(Ordering::Relaxed),
+        INVERSIONS.load(Ordering::Relaxed),
+    )
 }
 
 /// How many tasks narrowed their affinity, and how many were forced off a core by
@@ -1444,9 +1671,9 @@ fn park_and_switch(parked: State) {
         // peer from loading `prev` before its context is safely saved.
         PREV[cpu].store(prev, Ordering::Relaxed);
         prev_ptr = &mut sched.tasks[prev].ctx;
-        match sched.pick(cpu, prev) {
+        match sched.pick(cpu, prev).map(|(next, _fair)| next) {
             Some(next) => {
-                sched.take(cpu, next);
+                sched.take(cpu, Some(prev), next);
                 next_ttbr0 = sched.tasks[next].ttbr0;
                 next_ptr = &sched.tasks[next].ctx;
             }

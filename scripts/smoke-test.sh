@@ -185,6 +185,16 @@ run() {
     # program is in the image to notice.
     req "affinity: "
     forbid "RAN OUTSIDE ITS MASK"
+    # Scheduling classes, and the same division of labour as affinity above: the
+    # kernel's verdict is printed on every machine, so it holds on a host without
+    # clang where `hello-c` — the half that *declares* a class and measures what it
+    # got — is not in the image at all. An inversion is a pick that took a task
+    # while a runnable task of a more urgent band was available to the same core,
+    # counted by a scan that does not share a line with the picker. It is reachable
+    # on a fairness pick and on no other kind, so it can never exceed them; take
+    # the band loop out of `class::choose` and this line says so.
+    req "classes: "
+    forbid "PICKED BELOW A WAITING HIGHER CLASS"
     forbid "did not initialise"                    # no half-configured device
     # IPC under contention: three senders and one receiver on a two-slot endpoint.
     # The receiver checks the sum of every sequence number it drained, so a message
@@ -398,6 +408,26 @@ if [ -n "$INITRAMFS" ]; then
     # working": SetAffinity does not return until the caller is on a permitted core.
     forbid "[hello-c] FAIL: SetAffinity returned with us already on the core it was given"
     forbid "[hello-c] FAIL: across 64 reschedules the pinned thread was never seen anywhere else"
+    # Scheduling classes from the side that can be wrong about them. Two threads
+    # that never block, pinned to one core, one latency-class and one bulk: the
+    # share each got is the only fact here, since a class field reads back exactly
+    # as written whether or not the picker consults it. The counts in the line are
+    # measured, so only the fixed ends are asserted and the claims are carried by
+    # the forbids.
+    req "[hello-c] classes: over "
+    req "and neither was starved"
+    # The priority half. Round-robin between the two — a picker that never looks at
+    # the band, or one that looks and still hands the core over on every tick —
+    # lands near one to one, well under the margin this asks for.
+    forbid "[hello-c] FAIL: the latency thread got most of the shared core"
+    # The starvation half. Strict priority with no fairness escape reads exactly
+    # zero here, which is a kernel any thread can stop by declaring itself urgent
+    # and then looping.
+    forbid "[hello-c] FAIL: the bulk thread was not starved out of the core"
+    # And the ABI's own edges: an unknown band is refused rather than rounded into
+    # a silent promotion, and a class is per thread rather than inherited.
+    forbid "[hello-c] FAIL: a class that does not exist was refused"
+    forbid "[hello-c] FAIL: each spinner was born in the normal band, not its creator's"
     # The event-loop layer: a thread blocked in poll until another thread wrote to
     # an eventfd, a pipe carried bytes between them, and a timeout was waited out
     # rather than returned from. The number in the line is measured, so only the
